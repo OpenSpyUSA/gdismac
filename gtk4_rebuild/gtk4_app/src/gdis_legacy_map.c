@@ -1,3 +1,5 @@
+#include <stddef.h>
+
 #include "gdis_legacy_map.h"
 
 const char *const gdis_legacy_sidebar_pages[] = {
@@ -37,9 +39,10 @@ const char *const gdis_legacy_toolbar_actions[][2] = {
 };
 
 const char *const gdis_legacy_model_samples[] = {
-  "examples/water.xyz",
-  "examples/benzene.xyz",
-  "examples/rocksalt_demo.cif",
-  "models/deoxy.pdb",
+  "../../examples/water.xyz",
+  "../../examples/benzene.xyz",
+  "../../examples/rocksalt_demo.cif",
+  "../../models/deoxy.pdb",
+  "../../models/1_C2H4_HOOH_Tifer.arc",
   NULL
 };

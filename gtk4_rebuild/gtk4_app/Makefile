@@ -4,12 +4,15 @@ SRC_DIR := src
 SOURCES := \
 	$(SRC_DIR)/main.c \
 	$(SRC_DIR)/gdis_gtk4_window.c \
+	$(SRC_DIR)/gdis_model.c \
+	$(SRC_DIR)/gdis_reports.c \
 	$(SRC_DIR)/gdis_legacy_map.c
 
 GTK4_CFLAGS := $(shell pkg-config --cflags gtk4 2>/dev/null)
 GTK4_LIBS := $(shell pkg-config --libs gtk4 2>/dev/null)
 
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -g
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wno-extra-semi -g
+ARGS ?=
 
 .PHONY: all clean run doctor
 
@@ -32,7 +35,7 @@ $(BUILD_DIR)/$(APP): $(SOURCES)
 	$(CC) $(CFLAGS) $(GTK4_CFLAGS) $(SOURCES) -o $@ $(GTK4_LIBS)
 
 run: all
-	./$(BUILD_DIR)/$(APP)
+	./$(BUILD_DIR)/$(APP) $(ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)

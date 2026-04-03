@@ -26,3 +26,27 @@ Current scaffold boundary:
 - UI shell only
 - no chemistry/model engine integration yet
 - no legacy OpenGL path reused yet
+
+Legacy code map for the next porting pass:
+- file opening pipeline:
+  - `../legacy_snapshot/src/file.c`
+  - `../legacy_snapshot/src/model.c`
+- first practical parsers:
+  - `../legacy_snapshot/src/file_xyz.c`
+  - `../legacy_snapshot/src/file_cif.c`
+  - `../legacy_snapshot/src/file_pdb.c`
+- legacy model tree / active selection:
+  - `../legacy_snapshot/src/gui_tree.c`
+  - `../legacy_snapshot/src/gui_main.c`
+- iso-surface and surface tools:
+  - `../legacy_snapshot/src/gui_molsurf.c`
+  - `../legacy_snapshot/src/molsurf.c`
+  - `../legacy_snapshot/src/gui_surface.c`
+  - `../legacy_snapshot/src/surface.c`
+
+Recommended port order:
+1. Port `model.c` + `file.c` core model lifecycle and generic loader.
+2. Bring over `read_xyz()`, `read_cif()`, and `read_pdb()` for real file loading.
+3. Replace the placeholder GTK4 model list with real model objects and selection propagation.
+4. Hook the active selection to real refresh/render callbacks.
+5. Port the iso-surface and surface dialogs after the active model bridge exists.
