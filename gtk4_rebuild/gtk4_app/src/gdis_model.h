@@ -30,6 +30,7 @@ typedef struct
   gchar *ff_type;
   gdouble position[3];
   gdouble occupancy;
+  gint region;
 } GdisAtom;
 
 typedef struct
@@ -71,6 +72,10 @@ GQuark gdis_model_error_quark(void);
 
 GdisModel *gdis_model_create_empty(const char *path, GdisModelFormat format);
 GdisModel *gdis_model_load(const char *path, GError **error);
+GdisModel *gdis_model_clone(const GdisModel *model);
+gboolean gdis_model_copy_from(GdisModel *dest,
+                              const GdisModel *src,
+                              GError **error);
 void gdis_model_free(GdisModel *model);
 gboolean gdis_model_save(GdisModel *model, const char *path, GError **error);
 gboolean gdis_model_delete_atoms(GdisModel *model,
@@ -80,6 +85,8 @@ gboolean gdis_model_delete_atoms(GdisModel *model,
 gboolean gdis_model_add_atom(GdisModel *model,
                              const char *label,
                              const char *element,
+                             const char *ff_type,
+                             gint region,
                              gdouble x,
                              gdouble y,
                              gdouble z,
@@ -88,6 +95,8 @@ gboolean gdis_model_update_atom(GdisModel *model,
                                 guint atom_index,
                                 const char *label,
                                 const char *element,
+                                const char *ff_type,
+                                gint region,
                                 gdouble x,
                                 gdouble y,
                                 gdouble z,
@@ -116,6 +125,19 @@ gboolean gdis_model_make_supercell(GdisModel *model,
                                    GError **error);
 gboolean gdis_model_make_supercell_from_image_limits(GdisModel *model,
                                                      GError **error);
+gboolean gdis_model_build_surface_slab(const GdisModel *source,
+                                       gint h,
+                                       gint k,
+                                       gint l,
+                                       gdouble shift,
+                                       guint region_a,
+                                       guint region_b,
+                                       guint repeat_a,
+                                       guint repeat_b,
+                                       gdouble vacuum,
+                                       GdisModel **surface_out,
+                                       gchar **summary_out,
+                                       GError **error);
 
 GdisModelFormat gdis_model_format_from_path(const char *path);
 const char *gdis_model_format_label(GdisModelFormat format);

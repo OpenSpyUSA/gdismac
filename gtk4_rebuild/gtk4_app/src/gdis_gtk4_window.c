@@ -32,6 +32,7 @@ typedef struct _GdisMeasureTool
   struct _GdisGtk4Window *owner;
   GtkWidget *window;
   GtkTextBuffer *buffer;
+  GtkWidget *capture_toggle;
   GdisMeasureMode mode;
 } GdisMeasureTool;
 
@@ -42,11 +43,23 @@ typedef struct _GdisEditTool
   GtkTextBuffer *buffer;
   GtkWidget *label_entry;
   GtkWidget *element_entry;
+  GtkWidget *ff_type_entry;
+  GtkWidget *region_entry;
   GtkWidget *x_entry;
   GtkWidget *y_entry;
   GtkWidget *z_entry;
   GtkWidget *bond_order_entry;
 } GdisEditTool;
+
+typedef struct _GdisDisplayTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *atoms_toggle;
+  GtkWidget *bonds_toggle;
+  GtkWidget *cell_toggle;
+  GtkWidget *labels_toggle;
+} GdisDisplayTool;
 
 typedef struct _GdisDiffractionTool
 {
@@ -71,6 +84,23 @@ typedef struct _GdisDiffractionTool
   gchar *plot_title;
   gchar *last_export_path;
 } GdisDiffractionTool;
+
+typedef struct _GdisSurfaceTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *h_spin;
+  GtkWidget *k_spin;
+  GtkWidget *l_spin;
+  GtkWidget *shift_spin;
+  GtkWidget *region_a_spin;
+  GtkWidget *region_b_spin;
+  GtkWidget *repeat_a_spin;
+  GtkWidget *repeat_b_spin;
+  GtkWidget *vacuum_spin;
+  GtkWidget *execute_button;
+  GtkTextBuffer *report_buffer;
+} GdisSurfaceTool;
 
 typedef struct
 {
@@ -97,6 +127,30 @@ typedef enum
   GDIS_CLICK_MODE_REMOVE_BOND
 } GdisClickMode;
 
+typedef enum
+{
+  GDIS_DRAG_MODE_NONE = 0,
+  GDIS_DRAG_MODE_ROTATE,
+  GDIS_DRAG_MODE_BOX_SELECT
+} GdisDragMode;
+
+typedef struct
+{
+  GdisMeasureMode mode;
+  guint atom_count;
+  guint atom_indices[4];
+} GdisMeasurementRecord;
+
+typedef struct
+{
+  GdisModel *model_snapshot;
+  GArray *selected_atoms;
+  GArray *picked_atoms;
+  GPtrArray *measurement_records;
+  guint selected_atom_index;
+  guint fragment_anchor_index;
+} GdisUndoEntry;
+
 struct _GdisGtk4Window
 {
   GtkApplication *app;
@@ -122,20 +176,28 @@ struct _GdisGtk4Window
   guint selected_atom_index;
   GArray *selected_atoms;
   GArray *picked_atoms;
+  GHashTable *measurement_records;
+  GHashTable *undo_stacks;
+  GdisDisplayTool *display_tool;
   GdisMeasureTool *measure_tool;
   GdisEditTool *edit_tool;
   GdisDiffractionTool *diffraction_tool;
+  GdisSurfaceTool *surface_tool;
   GdisSelectionMode selection_mode;
   GdisClickMode click_mode;
   guint fragment_anchor_index;
   guint untitled_counter;
   guint layout_restore_tick_id;
+  GdkModifierType press_modifiers;
+  GdisDragMode drag_mode;
   gdouble rotation_x;
   gdouble rotation_y;
   gdouble drag_origin_x;
   gdouble drag_origin_y;
   gdouble press_x;
   gdouble press_y;
+  gdouble drag_current_x;
+  gdouble drag_current_y;
   gdouble zoom;
 };
 
@@ -170,6 +232,8 @@ static void gdis_gtk4_window_remember_atom_pick(GdisGtk4Window *self, guint atom
 static void gdis_gtk4_window_clear_atom_picks(GdisGtk4Window *self);
 static void gdis_gtk4_window_clear_selected_atoms(GdisGtk4Window *self);
 static void gdis_gtk4_window_apply_selection_mode(GdisGtk4Window *self, guint atom_index);
+static void gdis_gtk4_window_select_all_atoms(GdisGtk4Window *self);
+static void gdis_gtk4_window_invert_selected_atoms(GdisGtk4Window *self);
 static void gdis_gtk4_window_set_click_mode(GdisGtk4Window *self,
                                             GdisClickMode click_mode);
 static void gdis_gtk4_window_collect_connected_atoms(const GdisModel *model,
@@ -187,12 +251,16 @@ static void gdis_gtk4_window_refresh_model_buttons(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_measure_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_edit_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_diffraction_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_surface_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_sync_display_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
                                                       gboolean refresh_model_buttons);
 static void gdis_gtk4_window_restore_layout(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_display_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_measure_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_diffraction_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_surface_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_report(GdisGtk4Window *self,
                                             const char *title,
                                             const char *body);
@@ -206,6 +274,9 @@ static gboolean gdis_gtk4_window_parse_entry_uint(GtkWidget *entry,
                                                   const char *field_name,
                                                   guint *value_out,
                                                   GError **error);
+static gboolean gdis_gtk4_window_parse_region_entry(GtkWidget *entry,
+                                                    gint *value_out,
+                                                    GError **error);
 static void gdis_gtk4_window_configure_button_label(GtkWidget *button);
 static gboolean gdis_gtk4_window_restore_layout_tick(GtkWidget *widget,
                                                      GdkFrameClock *frame_clock,
@@ -216,6 +287,40 @@ static gboolean gdis_gtk4_window_get_last_two_picks(GdisGtk4Window *self,
                                                     GError **error);
 static gboolean gdis_gtk4_window_atom_array_contains(const GArray *array,
                                                      guint atom_index);
+static GArray *gdis_gtk4_window_copy_atom_array(const GArray *array);
+static void gdis_gtk4_window_toggle_atom_in_array(GArray *array, guint atom_index);
+static GPtrArray *gdis_measurement_record_array_clone(const GPtrArray *records);
+static GPtrArray *gdis_gtk4_window_get_undo_stack(GdisGtk4Window *self,
+                                                  GdisModel *model,
+                                                  gboolean create);
+static void gdis_gtk4_window_update_undo_action(GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_push_undo_snapshot(GdisGtk4Window *self,
+                                                    const char *reason);
+static void gdis_gtk4_window_discard_undo_snapshot(GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_perform_undo(GdisGtk4Window *self);
+static guint gdis_gtk4_window_hit_test_atom_at(GdisGtk4Window *self,
+                                               gdouble x,
+                                               gdouble y,
+                                               GdisProjectedAtom *projected_out);
+static gboolean gdis_gtk4_window_apply_box_selection(GdisGtk4Window *self,
+                                                     gdouble x0,
+                                                     gdouble y0,
+                                                     gdouble x1,
+                                                     gdouble y1,
+                                                     gboolean toggle_existing);
+static gboolean gdis_gtk4_window_should_capture_measure_picks(const GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_should_record_viewer_picks(const GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_set_picks_from_array(GdisGtk4Window *self,
+                                                      const GArray *atoms,
+                                                      guint limit,
+                                                      const char *log_message);
+static GPtrArray *gdis_gtk4_window_get_measurement_records(GdisGtk4Window *self,
+                                                           GdisModel *model,
+                                                           gboolean create);
+static void gdis_gtk4_window_clear_saved_measurements(GdisGtk4Window *self,
+                                                      GdisModel *model,
+                                                      const char *reason);
+static char *gdis_gtk4_window_build_measurement_tool_report(GdisGtk4Window *self);
 static const char *gdis_gtk4_window_selection_mode_label(GdisSelectionMode mode);
 static const char *gdis_gtk4_window_click_mode_label(GdisClickMode mode);
 static const GdisAtom *gdis_gtk4_window_get_selected_atom(const GdisGtk4Window *self);
@@ -223,6 +328,7 @@ static void gdis_gtk4_window_clear_status_log(GdisGtk4Window *self);
 static void on_model_button_clicked(GtkButton *button, gpointer user_data);
 static void on_selection_button_clicked(GtkButton *button, gpointer user_data);
 static void on_view_toggle_toggled(GtkToggleButton *button, gpointer user_data);
+static void on_display_tool_toggle_toggled(GtkToggleButton *button, gpointer user_data);
 static void on_reset_view_clicked(GtkButton *button, gpointer user_data);
 static void on_view_x_clicked(GtkButton *button, gpointer user_data);
 static void on_view_y_clicked(GtkButton *button, gpointer user_data);
@@ -237,10 +343,26 @@ static void on_viewer_drag_begin(GtkGestureDrag *gesture,
                                  gdouble start_x,
                                  gdouble start_y,
                                  gpointer user_data);
+static void on_viewer_secondary_drag_begin(GtkGestureDrag *gesture,
+                                           gdouble start_x,
+                                           gdouble start_y,
+                                           gpointer user_data);
 static void on_viewer_drag_update(GtkGestureDrag *gesture,
                                   gdouble offset_x,
                                   gdouble offset_y,
                                   gpointer user_data);
+static void on_viewer_secondary_drag_update(GtkGestureDrag *gesture,
+                                            gdouble offset_x,
+                                            gdouble offset_y,
+                                            gpointer user_data);
+static void on_viewer_drag_end(GtkGestureDrag *gesture,
+                               gdouble offset_x,
+                               gdouble offset_y,
+                               gpointer user_data);
+static void on_viewer_secondary_drag_end(GtkGestureDrag *gesture,
+                                         gdouble offset_x,
+                                         gdouble offset_y,
+                                         gpointer user_data);
 static gboolean on_viewer_scroll(GtkEventControllerScroll *controller,
                                  gdouble dx,
                                  gdouble dy,
@@ -255,11 +377,20 @@ static void on_viewer_click_released(GtkGestureClick *gesture,
                                      gdouble x,
                                      gdouble y,
                                      gpointer user_data);
+static GtkWidget *new_section_button(const char *text);
 static GtkWidget *new_toggle_button(const char *label, gboolean active);
 static void present_save_dialog(GdisGtk4Window *self, GdisModel *model);
 static void on_save_dialog_complete(GObject *source_object,
                                     GAsyncResult *result,
                                     gpointer user_data);
+static void on_measure_capture_toggled(GtkToggleButton *button, gpointer user_data);
+static void on_measure_use_selection_clicked(GtkButton *button, gpointer user_data);
+static void on_measure_add_current_clicked(GtkButton *button, gpointer user_data);
+static void on_measure_delete_last_clicked(GtkButton *button, gpointer user_data);
+static void on_measure_clear_saved_clicked(GtkButton *button, gpointer user_data);
+static void on_edit_apply_region_clicked(GtkButton *button, gpointer user_data);
+static void on_use_selection_as_picks_clicked(GtkButton *button, gpointer user_data);
+static void on_clear_selection_clicked(GtkButton *button, gpointer user_data);
 
 static void
 gdis_gtk4_window_install_css(GtkWidget *widget)
@@ -352,12 +483,20 @@ gdis_gtk4_window_free(gpointer data)
     g_array_free(self->selected_atoms, TRUE);
   if (self->picked_atoms)
     g_array_free(self->picked_atoms, TRUE);
+  if (self->measurement_records)
+    g_hash_table_unref(self->measurement_records);
+  if (self->undo_stacks)
+    g_hash_table_unref(self->undo_stacks);
   if (self->measure_tool)
     self->measure_tool->owner = NULL;
   if (self->edit_tool)
     self->edit_tool->owner = NULL;
+  if (self->display_tool)
+    self->display_tool->owner = NULL;
   if (self->diffraction_tool)
     self->diffraction_tool->owner = NULL;
+  if (self->surface_tool)
+    self->surface_tool->owner = NULL;
   g_free(self);
 }
 
@@ -468,11 +607,14 @@ gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
 
   if (refresh_model_buttons)
     gdis_gtk4_window_refresh_model_buttons(self);
+  gdis_gtk4_window_sync_display_tool(self);
   gdis_gtk4_window_update_details(self);
   gdis_gtk4_window_refresh_viewer(self);
   gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_diffraction_tool(self);
+  gdis_gtk4_window_refresh_surface_tool(self);
+  gdis_gtk4_window_update_undo_action(self);
 }
 
 static void
@@ -512,6 +654,189 @@ gdis_gtk4_window_present_report(GdisGtk4Window *self,
   gtk_text_buffer_set_text(buffer, body, -1);
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
 
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+gdis_gtk4_window_sync_display_tool(GdisGtk4Window *self)
+{
+  GdisDisplayTool *tool;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->display_tool;
+  if (!tool)
+    return;
+
+  if (tool->atoms_toggle && self->show_atoms_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->atoms_toggle),
+                                 gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_atoms_toggle)));
+  if (tool->bonds_toggle && self->show_bonds_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->bonds_toggle),
+                                 gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_bonds_toggle)));
+  if (tool->cell_toggle && self->show_cell_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->cell_toggle),
+                                 gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_cell_toggle)));
+  if (tool->labels_toggle && self->show_labels_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->labels_toggle),
+                                 gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_labels_toggle)));
+}
+
+static void
+on_display_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisDisplayTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->display_tool = NULL;
+
+  g_free(tool);
+}
+
+static void
+on_display_tool_toggle_toggled(GtkToggleButton *button, gpointer user_data)
+{
+  GdisDisplayTool *tool;
+  GdisGtk4Window *self;
+  const char *toggle_name;
+  gboolean active;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  self = tool->owner;
+  toggle_name = g_object_get_data(G_OBJECT(button), "display-toggle");
+  active = gtk_toggle_button_get_active(button);
+  if (!toggle_name)
+    return;
+
+  if (g_strcmp0(toggle_name, "atoms") == 0 && self->show_atoms_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->show_atoms_toggle), active);
+  else if (g_strcmp0(toggle_name, "bonds") == 0 && self->show_bonds_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->show_bonds_toggle), active);
+  else if (g_strcmp0(toggle_name, "cell") == 0 && self->show_cell_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->show_cell_toggle), active);
+  else if (g_strcmp0(toggle_name, "labels") == 0 && self->show_labels_toggle)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->show_labels_toggle), active);
+}
+
+static void
+gdis_gtk4_window_present_display_tool(GdisGtk4Window *self)
+{
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *button;
+  GtkWidget *label;
+  GdisDisplayTool *tool;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->display_tool && GTK_IS_WINDOW(self->display_tool->window))
+    {
+      gdis_gtk4_window_sync_display_tool(self);
+      gtk_window_present(GTK_WINDOW(self->display_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisDisplayTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Display Properties");
+  gtk_window_set_default_size(GTK_WINDOW(window), 560, 360);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  gtk_box_append(GTK_BOX(root), new_section_button("Viewer Toggles"));
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+
+  tool->atoms_toggle = new_toggle_button("Atoms", TRUE);
+  tool->bonds_toggle = new_toggle_button("Bonds", TRUE);
+  tool->cell_toggle = new_toggle_button("Cell", TRUE);
+  tool->labels_toggle = new_toggle_button("Labels", FALSE);
+
+  g_object_set_data(G_OBJECT(tool->atoms_toggle), "display-toggle", "atoms");
+  g_object_set_data(G_OBJECT(tool->bonds_toggle), "display-toggle", "bonds");
+  g_object_set_data(G_OBJECT(tool->cell_toggle), "display-toggle", "cell");
+  g_object_set_data(G_OBJECT(tool->labels_toggle), "display-toggle", "labels");
+
+  g_signal_connect(tool->atoms_toggle, "toggled", G_CALLBACK(on_display_tool_toggle_toggled), tool);
+  g_signal_connect(tool->bonds_toggle, "toggled", G_CALLBACK(on_display_tool_toggle_toggled), tool);
+  g_signal_connect(tool->cell_toggle, "toggled", G_CALLBACK(on_display_tool_toggle_toggled), tool);
+  g_signal_connect(tool->labels_toggle, "toggled", G_CALLBACK(on_display_tool_toggle_toggled), tool);
+
+  gtk_widget_set_hexpand(tool->atoms_toggle, TRUE);
+  gtk_widget_set_hexpand(tool->bonds_toggle, TRUE);
+  gtk_widget_set_hexpand(tool->cell_toggle, TRUE);
+  gtk_widget_set_hexpand(tool->labels_toggle, TRUE);
+
+  gtk_grid_attach(GTK_GRID(grid), tool->atoms_toggle, 0, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), tool->bonds_toggle, 1, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), tool->cell_toggle, 0, 1, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), tool->labels_toggle, 1, 1, 1, 1);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  gtk_box_append(GTK_BOX(root), new_section_button("View Presets"));
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+
+  button = gtk_button_new_with_label("Reset View");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_reset_view_clicked), self);
+  gtk_widget_set_hexpand(button, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), button, 0, 0, 1, 1);
+
+  button = gtk_button_new_with_label("View X");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_view_x_clicked), self);
+  gtk_widget_set_hexpand(button, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), button, 1, 0, 1, 1);
+
+  button = gtk_button_new_with_label("View Y");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_view_y_clicked), self);
+  gtk_widget_set_hexpand(button, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), button, 0, 1, 1, 1);
+
+  button = gtk_button_new_with_label("View Z");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_view_z_clicked), self);
+  gtk_widget_set_hexpand(button, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), button, 1, 1, 1, 1);
+
+  button = gtk_button_new_with_label("Reset Model Images");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_reset_image_limits_clicked), self);
+  gtk_widget_set_hexpand(button, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), button, 0, 2, 2, 1);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  label = gtk_label_new("This GTK4 window restores the legacy everyday display subset: viewer toggles, view presets, and model-image reset. The deeper camera, lights, colours, OpenGL, and POVRay pages are still pending.");
+  gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+  gtk_widget_add_css_class(label, "gdis-muted");
+  gtk_box_append(GTK_BOX(root), label);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_display_tool_destroy), tool);
+
+  self->display_tool = tool;
+  gdis_gtk4_window_sync_display_tool(self);
   gtk_window_present(GTK_WINDOW(window));
 }
 
@@ -666,6 +991,314 @@ gdis_gtk4_window_atom_array_contains(const GArray *array, guint atom_index)
   return FALSE;
 }
 
+static GArray *
+gdis_gtk4_window_copy_atom_array(const GArray *array)
+{
+  GArray *copy;
+
+  copy = g_array_new(FALSE, FALSE, sizeof(guint));
+  if (array && array->len > 0)
+    g_array_append_vals(copy, array->data, array->len);
+
+  return copy;
+}
+
+static void
+gdis_gtk4_window_toggle_atom_in_array(GArray *array, guint atom_index)
+{
+  g_return_if_fail(array != NULL);
+
+  for (guint i = 0; i < array->len; i++)
+    {
+      if (g_array_index(array, guint, i) == atom_index)
+        {
+          g_array_remove_index(array, i);
+          return;
+        }
+    }
+
+  g_array_append_val(array, atom_index);
+}
+
+static void
+gdis_measurement_record_free(gpointer data)
+{
+  g_free(data);
+}
+
+static void
+gdis_uint_array_free(gpointer data)
+{
+  GArray *array;
+
+  array = data;
+  if (array)
+    g_array_free(array, TRUE);
+}
+
+static void
+gdis_measurement_record_array_free(gpointer data)
+{
+  GPtrArray *records;
+
+  records = data;
+  if (!records)
+    return;
+
+  g_ptr_array_free(records, TRUE);
+}
+
+static GPtrArray *
+gdis_measurement_record_array_clone(const GPtrArray *records)
+{
+  GPtrArray *copy;
+
+  copy = g_ptr_array_new_with_free_func(gdis_measurement_record_free);
+  if (!records)
+    return copy;
+
+  for (guint i = 0; i < records->len; i++)
+    {
+      const GdisMeasurementRecord *record;
+      GdisMeasurementRecord *record_copy;
+
+      record = g_ptr_array_index((GPtrArray *) records, i);
+      record_copy = g_new(GdisMeasurementRecord, 1);
+      *record_copy = *record;
+      g_ptr_array_add(copy, record_copy);
+    }
+
+  return copy;
+}
+
+static void
+gdis_undo_entry_free(gpointer data)
+{
+  GdisUndoEntry *entry;
+
+  entry = data;
+  if (!entry)
+    return;
+
+  g_clear_pointer(&entry->model_snapshot, gdis_model_free);
+  g_clear_pointer(&entry->selected_atoms, gdis_uint_array_free);
+  g_clear_pointer(&entry->picked_atoms, gdis_uint_array_free);
+  g_clear_pointer(&entry->measurement_records, g_ptr_array_unref);
+  g_free(entry);
+}
+
+static GPtrArray *
+gdis_gtk4_window_get_undo_stack(GdisGtk4Window *self,
+                                GdisModel *model,
+                                gboolean create)
+{
+  GPtrArray *stack;
+
+  g_return_val_if_fail(self != NULL, NULL);
+
+  if (!self->undo_stacks || !model)
+    return NULL;
+
+  stack = g_hash_table_lookup(self->undo_stacks, model);
+  if (!stack && create)
+    {
+      stack = g_ptr_array_new_with_free_func(gdis_undo_entry_free);
+      g_hash_table_insert(self->undo_stacks, model, stack);
+    }
+
+  return stack;
+}
+
+static void
+gdis_gtk4_window_update_undo_action(GdisGtk4Window *self)
+{
+  GAction *action;
+  GPtrArray *stack;
+  gboolean enabled;
+
+  g_return_if_fail(self != NULL);
+
+  action = g_action_map_lookup_action(G_ACTION_MAP(self->app), "undo");
+  if (!action || !G_IS_SIMPLE_ACTION(action))
+    return;
+
+  stack = gdis_gtk4_window_get_undo_stack(self, self->active_model, FALSE);
+  enabled = (stack != NULL && stack->len > 0);
+  g_simple_action_set_enabled(G_SIMPLE_ACTION(action), enabled);
+}
+
+static gboolean
+gdis_gtk4_window_push_undo_snapshot(GdisGtk4Window *self, const char *reason)
+{
+  GPtrArray *stack;
+  GPtrArray *records;
+  GdisUndoEntry *entry;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  if (!self->active_model)
+    return FALSE;
+
+  stack = gdis_gtk4_window_get_undo_stack(self, self->active_model, TRUE);
+  if (!stack)
+    return FALSE;
+
+  entry = g_new0(GdisUndoEntry, 1);
+  entry->model_snapshot = gdis_model_clone(self->active_model);
+  entry->selected_atoms = gdis_gtk4_window_copy_atom_array(self->selected_atoms);
+  entry->picked_atoms = gdis_gtk4_window_copy_atom_array(self->picked_atoms);
+  records = gdis_gtk4_window_get_measurement_records(self, self->active_model, FALSE);
+  entry->measurement_records = gdis_measurement_record_array_clone(records);
+  entry->selected_atom_index = self->selected_atom_index;
+  entry->fragment_anchor_index = self->fragment_anchor_index;
+  g_ptr_array_add(stack, entry);
+  while (stack->len > 32)
+    g_ptr_array_remove_index(stack, 0);
+
+  if (reason)
+    gdis_gtk4_window_log(self, "%s", reason);
+
+  gdis_gtk4_window_update_undo_action(self);
+  return TRUE;
+}
+
+static void
+gdis_gtk4_window_discard_undo_snapshot(GdisGtk4Window *self)
+{
+  GPtrArray *stack;
+
+  g_return_if_fail(self != NULL);
+
+  stack = gdis_gtk4_window_get_undo_stack(self, self->active_model, FALSE);
+  if (stack && stack->len > 0)
+    g_ptr_array_remove_index(stack, stack->len - 1);
+
+  gdis_gtk4_window_update_undo_action(self);
+}
+
+static gboolean
+gdis_gtk4_window_perform_undo(GdisGtk4Window *self)
+{
+  GPtrArray *stack;
+  GdisUndoEntry *entry;
+  GError *error;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  if (!self->active_model)
+    return FALSE;
+
+  stack = gdis_gtk4_window_get_undo_stack(self, self->active_model, FALSE);
+  if (!stack || stack->len == 0)
+    return FALSE;
+
+  entry = g_ptr_array_index(stack, stack->len - 1);
+  error = NULL;
+  if (!gdis_model_copy_from(self->active_model, entry->model_snapshot, &error))
+    {
+      gdis_gtk4_window_log(self, "Undo failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return FALSE;
+    }
+
+  if (self->measurement_records)
+    {
+      GPtrArray *records_copy;
+
+      records_copy = gdis_measurement_record_array_clone(entry->measurement_records);
+      g_hash_table_insert(self->measurement_records, self->active_model, records_copy);
+    }
+
+  gdis_gtk4_window_clear_selected_atoms(self);
+  if (entry->selected_atoms && entry->selected_atoms->len > 0)
+    g_array_append_vals(self->selected_atoms,
+                        entry->selected_atoms->data,
+                        entry->selected_atoms->len);
+
+  gdis_gtk4_window_clear_atom_picks(self);
+  if (entry->picked_atoms && entry->picked_atoms->len > 0)
+    g_array_append_vals(self->picked_atoms,
+                        entry->picked_atoms->data,
+                        entry->picked_atoms->len);
+
+  self->selected_atom_index = entry->selected_atom_index;
+  self->fragment_anchor_index = entry->fragment_anchor_index;
+  if (self->active_model->atoms &&
+      self->selected_atom_index >= self->active_model->atoms->len)
+    self->selected_atom_index = INVALID_ATOM_INDEX;
+  if (self->fragment_anchor_index != INVALID_ATOM_INDEX &&
+      (!self->active_model->atoms ||
+       self->fragment_anchor_index >= self->active_model->atoms->len))
+    self->fragment_anchor_index = INVALID_ATOM_INDEX;
+
+  g_ptr_array_remove_index(stack, stack->len - 1);
+  gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
+  gdis_gtk4_window_log(self, "Undid the most recent model edit.\n");
+  gdis_gtk4_window_update_undo_action(self);
+  return TRUE;
+}
+
+static GPtrArray *
+gdis_gtk4_window_get_measurement_records(GdisGtk4Window *self,
+                                         GdisModel *model,
+                                         gboolean create)
+{
+  GPtrArray *records;
+
+  g_return_val_if_fail(self != NULL, NULL);
+
+  if (!self->measurement_records || !model)
+    return NULL;
+
+  records = g_hash_table_lookup(self->measurement_records, model);
+  if (!records && create)
+    {
+      records = g_ptr_array_new_with_free_func(gdis_measurement_record_free);
+      g_hash_table_insert(self->measurement_records, model, records);
+    }
+
+  return records;
+}
+
+static void
+gdis_gtk4_window_clear_saved_measurements(GdisGtk4Window *self,
+                                          GdisModel *model,
+                                          const char *reason)
+{
+  GPtrArray *records;
+
+  g_return_if_fail(self != NULL);
+
+  records = gdis_gtk4_window_get_measurement_records(self, model, FALSE);
+  if (records)
+    g_ptr_array_set_size(records, 0);
+
+  if (reason)
+    gdis_gtk4_window_log(self, "%s", reason);
+}
+
+static gboolean
+gdis_gtk4_window_should_capture_measure_picks(const GdisGtk4Window *self)
+{
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  return self->measure_tool &&
+         self->measure_tool->capture_toggle &&
+         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->measure_tool->capture_toggle));
+}
+
+static gboolean
+gdis_gtk4_window_should_record_viewer_picks(const GdisGtk4Window *self)
+{
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  if (self->click_mode != GDIS_CLICK_MODE_SELECT)
+    return TRUE;
+
+  return gdis_gtk4_window_should_capture_measure_picks(self);
+}
+
 static void
 gdis_gtk4_window_configure_button_label(GtkWidget *button)
 {
@@ -690,6 +1323,103 @@ gdis_gtk4_window_add_selected_atom(GdisGtk4Window *self, guint atom_index)
 
   if (!gdis_gtk4_window_atom_array_contains(self->selected_atoms, atom_index))
     g_array_append_val(self->selected_atoms, atom_index);
+}
+
+static void
+gdis_gtk4_window_finish_selection_change(GdisGtk4Window *self, const char *log_message)
+{
+  g_return_if_fail(self != NULL);
+
+  self->fragment_anchor_index = INVALID_ATOM_INDEX;
+
+  if (!self->active_model || !self->selected_atoms || self->selected_atoms->len == 0)
+    {
+      self->selected_atom_index = INVALID_ATOM_INDEX;
+    }
+  else if (self->selected_atom_index == INVALID_ATOM_INDEX ||
+           self->selected_atom_index >= self->active_model->atoms->len ||
+           !gdis_gtk4_window_atom_array_contains(self->selected_atoms, self->selected_atom_index))
+    {
+      self->selected_atom_index = g_array_index(self->selected_atoms, guint, 0);
+    }
+
+  gdis_gtk4_window_update_details(self);
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_refresh_edit_tool(self);
+
+  if (log_message)
+    gdis_gtk4_window_log(self, "%s", log_message);
+}
+
+static void
+gdis_gtk4_window_select_all_atoms(GdisGtk4Window *self)
+{
+  guint i;
+
+  g_return_if_fail(self != NULL);
+
+  if (!self->active_model)
+    {
+      gdis_gtk4_window_log(self, "Select all requested, but no active model is loaded.\n");
+      return;
+    }
+
+  if (!self->active_model->atoms || self->active_model->atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Select all requested, but the active model has no atoms.\n");
+      return;
+    }
+
+  gdis_gtk4_window_clear_selected_atoms(self);
+  for (i = 0; i < self->active_model->atoms->len; i++)
+    gdis_gtk4_window_add_selected_atom(self, i);
+
+  gdis_gtk4_window_finish_selection_change(self, "Selected all atoms in the active model.\n");
+}
+
+static void
+gdis_gtk4_window_invert_selected_atoms(GdisGtk4Window *self)
+{
+  gboolean *selected_mask;
+  guint atom_count;
+  guint i;
+
+  g_return_if_fail(self != NULL);
+
+  if (!self->active_model)
+    {
+      gdis_gtk4_window_log(self, "Invert selection requested, but no active model is loaded.\n");
+      return;
+    }
+
+  if (!self->active_model->atoms || self->active_model->atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Invert selection requested, but the active model has no atoms.\n");
+      return;
+    }
+
+  atom_count = self->active_model->atoms->len;
+  selected_mask = g_new0(gboolean, atom_count);
+
+  for (i = 0; self->selected_atoms && i < self->selected_atoms->len; i++)
+    {
+      guint atom_index;
+
+      atom_index = g_array_index(self->selected_atoms, guint, i);
+      if (atom_index < atom_count)
+        selected_mask[atom_index] = TRUE;
+    }
+
+  gdis_gtk4_window_clear_selected_atoms(self);
+  for (i = 0; i < atom_count; i++)
+    {
+      if (!selected_mask[i])
+        gdis_gtk4_window_add_selected_atom(self, i);
+    }
+  g_free(selected_mask);
+
+  gdis_gtk4_window_finish_selection_change(self, "Inverted the current atom selection.\n");
 }
 
 static const char *
@@ -999,7 +1729,23 @@ gdis_gtk4_window_apply_selection_mode(GdisGtk4Window *self, guint atom_index)
       break;
 
     case GDIS_SELECTION_MODE_REGIONS:
-      gdis_gtk4_window_add_selected_atom(self, atom_index);
+      if (clicked_atom->region < 0)
+        {
+          gdis_gtk4_window_add_selected_atom(self, atom_index);
+          gdis_gtk4_window_log(self,
+                               "The clicked atom has no legacy region label, so region selection fell back to that atom only.\n");
+        }
+      else
+        {
+          for (i = 0; i < self->active_model->atoms->len; i++)
+            {
+              const GdisAtom *atom;
+
+              atom = g_ptr_array_index(self->active_model->atoms, i);
+              if (atom->region == clicked_atom->region)
+                gdis_gtk4_window_add_selected_atom(self, i);
+            }
+        }
       break;
 
     case GDIS_SELECTION_MODE_ATOMS:
@@ -1533,6 +2279,186 @@ on_diffraction_execute_clicked(GtkButton *button, gpointer user_data)
 }
 
 static void
+gdis_gtk4_window_append_measurement_line(GString *report,
+                                         const GdisModel *model,
+                                         GdisMeasureMode mode,
+                                         const guint *atom_indices,
+                                         guint count,
+                                         const char *prefix)
+{
+  guint used_indices[4] = {0, 0, 0, 0};
+  guint used_count;
+  GdisMeasureMode resolved_mode;
+  gdouble value;
+  GError *error;
+
+  g_return_if_fail(report != NULL);
+
+  error = NULL;
+  if (!gdis_measure_calculate(model,
+                              mode,
+                              atom_indices,
+                              count,
+                              used_indices,
+                              &used_count,
+                              &resolved_mode,
+                              &value,
+                              &error))
+    {
+      g_string_append_printf(report,
+                             "%s%s\n",
+                             prefix ? prefix : "",
+                             error ? error->message : "Measurement unavailable.");
+      g_clear_error(&error);
+      return;
+    }
+
+  g_string_append_printf(report, "%s", prefix ? prefix : "");
+  switch (resolved_mode)
+    {
+    case GDIS_MEASURE_MODE_DISTANCE:
+      g_string_append_printf(report,
+                             "Distance %s-%s = %.5f A\n",
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[0]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[1]))->label,
+                             value);
+      break;
+    case GDIS_MEASURE_MODE_ANGLE:
+      g_string_append_printf(report,
+                             "Angle %s-%s-%s = %.3f deg\n",
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[0]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[1]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[2]))->label,
+                             value);
+      break;
+    case GDIS_MEASURE_MODE_TORSION:
+      g_string_append_printf(report,
+                             "Torsion %s-%s-%s-%s = %.3f deg\n",
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[0]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[1]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[2]))->label,
+                             ((GdisAtom *) g_ptr_array_index(model->atoms, used_indices[3]))->label,
+                             value);
+      break;
+    case GDIS_MEASURE_MODE_AUTO:
+    default:
+      break;
+    }
+}
+
+static char *
+gdis_gtk4_window_build_measurement_tool_report(GdisGtk4Window *self)
+{
+  GString *report;
+  const GArray *source_atoms;
+  const char *source_name;
+  GPtrArray *records;
+
+  g_return_val_if_fail(self != NULL, g_strdup("Measurement tool unavailable."));
+
+  report = g_string_new("");
+  if (!self->active_model)
+    {
+      g_string_append(report, "No active model loaded.");
+      return g_string_free(report, FALSE);
+    }
+
+  source_atoms = NULL;
+  source_name = "none";
+  if (self->picked_atoms && self->picked_atoms->len > 0)
+    {
+      source_atoms = self->picked_atoms;
+      source_name = "viewer picks";
+    }
+  else if (self->selected_atoms && self->selected_atoms->len > 0)
+    {
+      source_atoms = self->selected_atoms;
+      source_name = "current selection";
+    }
+
+  g_string_append_printf(report,
+                         "Measurements\nModel: %s\nMode: %s\nCapture Viewer Picks: %s\nCurrent source: %s\n\n",
+                         self->active_model->basename,
+                         self->measure_tool->mode == GDIS_MEASURE_MODE_DISTANCE ? "Distance" :
+                         self->measure_tool->mode == GDIS_MEASURE_MODE_ANGLE ? "Angle" :
+                         self->measure_tool->mode == GDIS_MEASURE_MODE_TORSION ? "Torsion" : "Auto",
+                         gdis_gtk4_window_should_capture_measure_picks(self) ? "on" : "off",
+                         source_name);
+
+  if (source_atoms && source_atoms->len > 0)
+    {
+      guint start_index;
+
+      start_index = source_atoms->len > 4 ? source_atoms->len - 4 : 0;
+      for (guint i = start_index; i < source_atoms->len; i++)
+        {
+          guint atom_index;
+          const GdisAtom *atom;
+
+          atom_index = g_array_index(source_atoms, guint, i);
+          if (atom_index >= self->active_model->atoms->len)
+            continue;
+          atom = g_ptr_array_index(self->active_model->atoms, atom_index);
+          g_string_append_printf(report,
+                                 "Atom %u: %s [%s] #%u  %.5f %.5f %.5f\n",
+                                 i - start_index + 1,
+                                 atom->label,
+                                 atom->element,
+                                 atom->serial,
+                                 atom->position[0],
+                                 atom->position[1],
+                                 atom->position[2]);
+        }
+      g_string_append(report, "\nCurrent result:\n");
+      gdis_gtk4_window_append_measurement_line(report,
+                                               self->active_model,
+                                               self->measure_tool->mode,
+                                               (const guint *) source_atoms->data,
+                                               source_atoms->len,
+                                               "  ");
+    }
+  else
+    {
+      g_string_append(report,
+                      "No measurement atoms are active yet.\n"
+                      "Use Shift+click or box selection, or enable Capture Viewer Picks.\n\n");
+    }
+
+  g_string_append(report, "\nSaved measurements:\n");
+  records = gdis_gtk4_window_get_measurement_records(self, self->active_model, FALSE);
+  if (!records || records->len == 0)
+    {
+      g_string_append(report, "  none\n");
+    }
+  else
+    {
+      for (guint i = 0; i < records->len; i++)
+        {
+          const GdisMeasurementRecord *record;
+          g_autofree gchar *prefix = NULL;
+
+          record = g_ptr_array_index(records, i);
+          prefix = g_strdup_printf("  %u. ", i + 1);
+          gdis_gtk4_window_append_measurement_line(report,
+                                                   self->active_model,
+                                                   record->mode,
+                                                   record->atom_indices,
+                                                   record->atom_count,
+                                                   prefix);
+        }
+    }
+
+  g_string_append(report,
+                  "\nActions:\n"
+                  "  - Capture Viewer Picks: click atoms without disturbing the selection set.\n"
+                  "  - Use Selection: load the current selection into the pick list.\n"
+                  "  - Add Current: store the current distance/angle/torsion.\n"
+                  "  - Delete Last / Clear Saved: manage the stored list.\n");
+
+  return g_string_free(report, FALSE);
+}
+
+static void
 gdis_gtk4_window_refresh_measure_tool(GdisGtk4Window *self)
 {
   g_autofree char *report = NULL;
@@ -1542,10 +2468,7 @@ gdis_gtk4_window_refresh_measure_tool(GdisGtk4Window *self)
   if (!self->measure_tool || !self->measure_tool->buffer)
     return;
 
-  report = gdis_report_measurements(self->active_model,
-                                    self->picked_atoms ? (const guint *) self->picked_atoms->data : NULL,
-                                    self->picked_atoms ? self->picked_atoms->len : 0,
-                                    self->measure_tool->mode);
+  report = gdis_gtk4_window_build_measurement_tool_report(self);
   gtk_text_buffer_set_text(self->measure_tool->buffer, report, -1);
 }
 
@@ -1580,12 +2503,27 @@ gdis_gtk4_window_refresh_edit_tool(GdisGtk4Window *self)
                             selected_atom->label ? selected_atom->label : "");
       gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->element_entry),
                             selected_atom->element ? selected_atom->element : "");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->ff_type_entry),
+                            selected_atom->ff_type ? selected_atom->ff_type : "");
+      g_snprintf(number, sizeof(number), "%d", selected_atom->region);
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->region_entry),
+                            selected_atom->region >= 0 ? number : "");
       g_snprintf(number, sizeof(number), "%.6f", selected_atom->position[0]);
       gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->x_entry), number);
       g_snprintf(number, sizeof(number), "%.6f", selected_atom->position[1]);
       gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->y_entry), number);
       g_snprintf(number, sizeof(number), "%.6f", selected_atom->position[2]);
       gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->z_entry), number);
+    }
+  else
+    {
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->label_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->element_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->ff_type_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->region_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->x_entry), "0.0");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->y_entry), "0.0");
+      gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->z_entry), "0.0");
     }
 
   g_string_append_printf(report,
@@ -1602,15 +2540,17 @@ gdis_gtk4_window_refresh_edit_tool(GdisGtk4Window *self)
                   "Actions:\n"
                   "  Apply To Selected Atom: updates the selected atom from the fields above.\n"
                   "  Add Atom From Fields: creates a new atom using the current fields.\n"
+                  "  Apply Region To Selected Set: writes the Region field onto every selected atom.\n"
                   "  Delete Selected Atom: removes the current yellow-highlighted atom.\n"
                   "  Delete Selected Set: removes the blue highlighted selection group.\n"
                   "  Delete Picked Atoms: removes the atoms in the current pick history.\n"
                   "  Add Bond Between Last 2 Picks: creates or updates an explicit bond.\n"
                   "  Remove Bond Between Last 2 Picks: removes that bond.\n"
                   "  Pick Add Bond / Pick Remove Bond: use the next 2 viewer picks as a bond edit command.\n"
+                  "  Use Selection As Picks: copies up to the last 4 selected atoms into the pick list.\n"
                   "  Clear Picks: clears the measurement/edit pick set.\n\n");
   g_string_append(report, "Flags: S = selected atom, G = selected group, P = picked atom\n\n");
-  g_string_append(report, "Flg  Serial  Elem  FFType     Label                X           Y           Z\n");
+  g_string_append(report, "Flg  Serial  Elem  FFType     Region  Label                X           Y           Z\n");
 
   for (i = 0; i < self->active_model->atoms->len && i < 200; i++)
     {
@@ -1634,11 +2574,12 @@ gdis_gtk4_window_refresh_edit_tool(GdisGtk4Window *self)
         flags[1] = 'G';
 
       g_string_append_printf(report,
-                             " %3s   %5u   %-3s   %-10s %-16s %10.4f %10.4f %10.4f\n",
+                             " %3s   %5u   %-3s   %-10s %6d  %-16s %10.4f %10.4f %10.4f\n",
                              flags,
                              atom->serial,
                              atom->element,
                              atom->ff_type ? atom->ff_type : "",
+                             atom->region,
                              atom->label,
                              atom->position[0],
                              atom->position[1],
@@ -1775,6 +2716,39 @@ gdis_gtk4_window_parse_entry_uint(GtkWidget *entry,
 }
 
 static gboolean
+gdis_gtk4_window_parse_region_entry(GtkWidget *entry,
+                                    gint *value_out,
+                                    GError **error)
+{
+  const char *text;
+  gchar *endptr;
+  glong value;
+
+  g_return_val_if_fail(GTK_IS_EDITABLE(entry), FALSE);
+  g_return_val_if_fail(value_out != NULL, FALSE);
+
+  text = gtk_editable_get_text(GTK_EDITABLE(entry));
+  if (!text || text[0] == '\0')
+    {
+      *value_out = -1;
+      return TRUE;
+    }
+
+  value = g_ascii_strtoll(text, &endptr, 10);
+  if (!endptr || *endptr != '\0' || value < -1 || value > 3)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Region must be blank or an integer between -1 and 3.");
+      return FALSE;
+    }
+
+  *value_out = (gint) value;
+  return TRUE;
+}
+
+static gboolean
 gdis_gtk4_window_get_last_two_picks(GdisGtk4Window *self,
                                     guint *atom_index_a,
                                     guint *atom_index_b,
@@ -1786,15 +2760,59 @@ gdis_gtk4_window_get_last_two_picks(GdisGtk4Window *self,
 
   if (!self->picked_atoms || self->picked_atoms->len < 2)
     {
+      if (self->selected_atoms && self->selected_atoms->len == 2)
+        {
+          *atom_index_a = g_array_index(self->selected_atoms, guint, 0);
+          *atom_index_b = g_array_index(self->selected_atoms, guint, 1);
+          return TRUE;
+        }
+
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_FAILED,
-                  "Pick 2 atoms in the viewer first.");
+                  "Pick 2 atoms in the viewer first, or select exactly 2 atoms.");
       return FALSE;
     }
 
   *atom_index_a = g_array_index(self->picked_atoms, guint, self->picked_atoms->len - 2);
   *atom_index_b = g_array_index(self->picked_atoms, guint, self->picked_atoms->len - 1);
+  return TRUE;
+}
+
+static gboolean
+gdis_gtk4_window_set_picks_from_array(GdisGtk4Window *self,
+                                      const GArray *atoms,
+                                      guint limit,
+                                      const char *log_message)
+{
+  guint start_index;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  if (!atoms || atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "No atoms are available for picking.\n");
+      return FALSE;
+    }
+
+  gdis_gtk4_window_clear_atom_picks(self);
+  start_index = atoms->len > limit ? atoms->len - limit : 0;
+  for (guint i = start_index; i < atoms->len; i++)
+    {
+      guint atom_index;
+
+      atom_index = g_array_index(atoms, guint, i);
+      if (self->active_model && atom_index < self->active_model->atoms->len)
+        g_array_append_val(self->picked_atoms, atom_index);
+    }
+
+  if (log_message)
+    gdis_gtk4_window_log(self, "%s", log_message);
+
+  gdis_gtk4_window_update_details(self);
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_refresh_edit_tool(self);
   return TRUE;
 }
 
@@ -1822,6 +2840,145 @@ on_measure_mode_clicked(GtkButton *button, gpointer user_data)
 }
 
 static void
+on_measure_capture_toggled(GtkToggleButton *button, gpointer user_data)
+{
+  GdisMeasureTool *tool;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  gdis_gtk4_window_log(tool->owner,
+                       "Measurement viewer-pick capture %s.\n",
+                       gtk_toggle_button_get_active(button) ? "enabled" : "disabled");
+  gdis_gtk4_window_refresh_measure_tool(tool->owner);
+}
+
+static void
+on_measure_use_selection_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  if (!self->selected_atoms || self->selected_atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Use Selection failed: no atoms are selected.\n");
+      return;
+    }
+
+  gdis_gtk4_window_set_picks_from_array(self,
+                                        self->selected_atoms,
+                                        4,
+                                        "Loaded the current selection into the measurement pick list.\n");
+}
+
+static void
+on_measure_add_current_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  const GArray *source_atoms;
+  GdisMeasurementRecord *record;
+  guint used_indices[4] = {0, 0, 0, 0};
+  guint used_count;
+  GdisMeasureMode resolved_mode;
+  gdouble value;
+  GError *error;
+  GPtrArray *records;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model || !self->measure_tool)
+    return;
+
+  source_atoms = NULL;
+  if (self->picked_atoms && self->picked_atoms->len > 0)
+    source_atoms = self->picked_atoms;
+  else if (self->selected_atoms && self->selected_atoms->len > 0)
+    source_atoms = self->selected_atoms;
+
+  if (!source_atoms)
+    {
+      gdis_gtk4_window_log(self, "Add Current failed: no picked or selected atoms are available.\n");
+      return;
+    }
+
+  error = NULL;
+  if (!gdis_measure_calculate(self->active_model,
+                              self->measure_tool->mode,
+                              (const guint *) source_atoms->data,
+                              source_atoms->len,
+                              used_indices,
+                              &used_count,
+                              &resolved_mode,
+                              &value,
+                              &error))
+    {
+      gdis_gtk4_window_log(self, "Add Current failed: %s\n",
+                           error ? error->message : "measurement unavailable");
+      g_clear_error(&error);
+      return;
+    }
+  (void) value;
+
+  records = gdis_gtk4_window_get_measurement_records(self, self->active_model, TRUE);
+  record = g_new0(GdisMeasurementRecord, 1);
+  record->mode = resolved_mode;
+  record->atom_count = used_count;
+  memcpy(record->atom_indices, used_indices, sizeof(used_indices));
+  g_ptr_array_add(records, record);
+
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_log(self, "Saved the current measurement.\n");
+}
+
+static void
+on_measure_delete_last_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GPtrArray *records;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model)
+    return;
+
+  records = gdis_gtk4_window_get_measurement_records(self, self->active_model, FALSE);
+  if (!records || records->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Delete Last failed: there are no saved measurements.\n");
+      return;
+    }
+
+  g_ptr_array_remove_index(records, records->len - 1);
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_log(self, "Removed the last saved measurement.\n");
+}
+
+static void
+on_measure_clear_saved_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model)
+    return;
+
+  gdis_gtk4_window_clear_saved_measurements(self,
+                                            self->active_model,
+                                            "Cleared the saved measurement list for the active model.\n");
+  gdis_gtk4_window_refresh_measure_tool(self);
+}
+
+static void
 on_clear_picks_clicked(GtkButton *button, gpointer user_data)
 {
   GdisGtk4Window *self;
@@ -1832,15 +2989,56 @@ on_clear_picks_clicked(GtkButton *button, gpointer user_data)
   if (!self)
     return;
 
-  self->selected_atom_index = INVALID_ATOM_INDEX;
   gdis_gtk4_window_clear_atom_picks(self);
-  gdis_gtk4_window_clear_selected_atoms(self);
   gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_SELECT);
   gdis_gtk4_window_update_details(self);
   gdis_gtk4_window_refresh_viewer(self);
   gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_log(self, "Pick history cleared.\n");
+}
+
+static void
+on_use_selection_as_picks_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  if (!self->selected_atoms || self->selected_atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Use Selection As Picks failed: no atoms are selected.\n");
+      return;
+    }
+
+  gdis_gtk4_window_set_picks_from_array(self,
+                                        self->selected_atoms,
+                                        4,
+                                        "Loaded the current selection into the shared pick list.\n");
+}
+
+static void
+on_clear_selection_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  self->selected_atom_index = INVALID_ATOM_INDEX;
+  gdis_gtk4_window_clear_selected_atoms(self);
+  gdis_gtk4_window_update_details(self);
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_refresh_edit_tool(self);
+  gdis_gtk4_window_log(self, "Selection cleared.\n");
 }
 
 static void
@@ -1865,8 +3063,10 @@ on_delete_selected_atom_clicked(GtkButton *button, gpointer user_data)
 
   index = self->selected_atom_index;
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_delete_atoms(self->active_model, &index, 1, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Delete failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -1875,6 +3075,9 @@ on_delete_selected_atom_clicked(GtkButton *button, gpointer user_data)
   self->selected_atom_index = INVALID_ATOM_INDEX;
   gdis_gtk4_window_clear_selected_atoms(self);
   gdis_gtk4_window_clear_atom_picks(self);
+  gdis_gtk4_window_clear_saved_measurements(self,
+                                            self->active_model,
+                                            "Saved measurements were cleared because atom indices changed.\n");
   gdis_gtk4_window_refresh_model_buttons(self);
   gdis_gtk4_window_update_details(self);
   gdis_gtk4_window_refresh_viewer(self);
@@ -1902,11 +3105,13 @@ on_delete_picked_atoms_clicked(GtkButton *button, gpointer user_data)
     }
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_delete_atoms(self->active_model,
                                (const guint *) self->picked_atoms->data,
                                self->picked_atoms->len,
                                &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Delete failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -1915,6 +3120,9 @@ on_delete_picked_atoms_clicked(GtkButton *button, gpointer user_data)
   self->selected_atom_index = INVALID_ATOM_INDEX;
   gdis_gtk4_window_clear_selected_atoms(self);
   gdis_gtk4_window_clear_atom_picks(self);
+  gdis_gtk4_window_clear_saved_measurements(self,
+                                            self->active_model,
+                                            "Saved measurements were cleared because atom indices changed.\n");
   gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
   gdis_gtk4_window_log(self, "Deleted atoms from the current pick history.\n");
 }
@@ -1938,11 +3146,13 @@ on_delete_selected_group_clicked(GtkButton *button, gpointer user_data)
     }
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_delete_atoms(self->active_model,
                                (const guint *) self->selected_atoms->data,
                                self->selected_atoms->len,
                                &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Delete selected set failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -1952,6 +3162,9 @@ on_delete_selected_group_clicked(GtkButton *button, gpointer user_data)
   self->selected_atom_index = INVALID_ATOM_INDEX;
   gdis_gtk4_window_clear_selected_atoms(self);
   gdis_gtk4_window_clear_atom_picks(self);
+  gdis_gtk4_window_clear_saved_measurements(self,
+                                            self->active_model,
+                                            "Saved measurements were cleared because atom indices changed.\n");
   gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
   gdis_gtk4_window_log(self, "Deleted the selected atom set.\n");
 }
@@ -1961,6 +3174,7 @@ on_edit_apply_selected_clicked(GtkButton *button, gpointer user_data)
 {
   GdisGtk4Window *self;
   GError *error;
+  gint region;
   gdouble x;
   gdouble y;
   gdouble z;
@@ -1981,22 +3195,27 @@ on_edit_apply_selected_clicked(GtkButton *button, gpointer user_data)
   error = NULL;
   if (!gdis_gtk4_window_parse_entry_double(self->edit_tool->x_entry, "X", &x, &error) ||
       !gdis_gtk4_window_parse_entry_double(self->edit_tool->y_entry, "Y", &y, &error) ||
-      !gdis_gtk4_window_parse_entry_double(self->edit_tool->z_entry, "Z", &z, &error))
+      !gdis_gtk4_window_parse_entry_double(self->edit_tool->z_entry, "Z", &z, &error) ||
+      !gdis_gtk4_window_parse_region_entry(self->edit_tool->region_entry, &region, &error))
     {
       gdis_gtk4_window_log(self, "Edit failed: %s\n", error ? error->message : "invalid coordinates");
       g_clear_error(&error);
       return;
     }
 
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_update_atom(self->active_model,
                               self->selected_atom_index,
                               gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->label_entry)),
                               gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->element_entry)),
+                              gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->ff_type_entry)),
+                              region,
                               x,
                               y,
                               z,
                               &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Edit failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -2012,6 +3231,7 @@ on_edit_add_atom_clicked(GtkButton *button, gpointer user_data)
 {
   GdisGtk4Window *self;
   GError *error;
+  gint region;
   gdouble x;
   gdouble y;
   gdouble z;
@@ -2025,21 +3245,26 @@ on_edit_add_atom_clicked(GtkButton *button, gpointer user_data)
   error = NULL;
   if (!gdis_gtk4_window_parse_entry_double(self->edit_tool->x_entry, "X", &x, &error) ||
       !gdis_gtk4_window_parse_entry_double(self->edit_tool->y_entry, "Y", &y, &error) ||
-      !gdis_gtk4_window_parse_entry_double(self->edit_tool->z_entry, "Z", &z, &error))
+      !gdis_gtk4_window_parse_entry_double(self->edit_tool->z_entry, "Z", &z, &error) ||
+      !gdis_gtk4_window_parse_region_entry(self->edit_tool->region_entry, &region, &error))
     {
       gdis_gtk4_window_log(self, "Add atom failed: %s\n", error ? error->message : "invalid coordinates");
       g_clear_error(&error);
       return;
     }
 
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_add_atom(self->active_model,
                            gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->label_entry)),
                            gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->element_entry)),
+                           gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->ff_type_entry)),
+                           region,
                            x,
                            y,
                            z,
                            &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Add atom failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -2051,6 +3276,52 @@ on_edit_add_atom_clicked(GtkButton *button, gpointer user_data)
   gdis_gtk4_window_clear_atom_picks(self);
   gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
   gdis_gtk4_window_log(self, "Added a new atom to the model.\n");
+}
+
+static void
+on_edit_apply_region_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GError *error;
+  gint region;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model || !self->edit_tool)
+    return;
+
+  if (!self->selected_atoms || self->selected_atoms->len == 0)
+    {
+      gdis_gtk4_window_log(self, "Apply Region failed: no atoms are selected.\n");
+      return;
+    }
+
+  error = NULL;
+  if (!gdis_gtk4_window_parse_region_entry(self->edit_tool->region_entry, &region, &error))
+    {
+      gdis_gtk4_window_log(self, "Apply Region failed: %s\n",
+                           error ? error->message : "invalid region");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
+  for (guint i = 0; i < self->selected_atoms->len; i++)
+    {
+      guint atom_index;
+      GdisAtom *atom;
+
+      atom_index = g_array_index(self->selected_atoms, guint, i);
+      if (atom_index >= self->active_model->atoms->len)
+        continue;
+
+      atom = g_ptr_array_index(self->active_model->atoms, atom_index);
+      atom->region = region;
+    }
+
+  gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
+  gdis_gtk4_window_log(self, "Updated the region for the selected atom set.\n");
 }
 
 static void
@@ -2077,12 +3348,14 @@ on_edit_add_bond_clicked(GtkButton *button, gpointer user_data)
       return;
     }
 
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_add_explicit_bond(self->active_model,
                                     atom_index_a,
                                     atom_index_b,
                                     (guint8) order,
                                     &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Add bond failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -2114,8 +3387,10 @@ on_edit_remove_bond_clicked(GtkButton *button, gpointer user_data)
       return;
     }
 
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_remove_bond(self->active_model, atom_index_a, atom_index_b, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Remove bond failed: %s\n", error ? error->message : "unknown error");
       g_clear_error(&error);
       return;
@@ -2136,7 +3411,10 @@ on_pick_add_bond_mode_clicked(GtkButton *button, gpointer user_data)
   if (!self)
     return;
 
+  gdis_gtk4_window_clear_atom_picks(self);
   gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_ADD_BOND);
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_log(self, "Click mode set to Pick Add Bond. Pick 2 atoms in the viewer.\n");
 }
@@ -2152,7 +3430,10 @@ on_pick_remove_bond_mode_clicked(GtkButton *button, gpointer user_data)
   if (!self)
     return;
 
+  gdis_gtk4_window_clear_atom_picks(self);
   gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_REMOVE_BOND);
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_log(self, "Click mode set to Pick Remove Bond. Pick 2 atoms in the viewer.\n");
 }
@@ -2216,6 +3497,29 @@ gdis_gtk4_window_present_measure_tool(GdisGtk4Window *self)
   button = gtk_button_new_with_label("Torsion");
   g_object_set_data(G_OBJECT(button), "measure-mode", "torsion");
   g_signal_connect(button, "clicked", G_CALLBACK(on_measure_mode_clicked), tool);
+  gtk_box_append(GTK_BOX(row), button);
+
+  tool->capture_toggle = gtk_toggle_button_new_with_label("Capture Viewer Picks");
+  g_signal_connect(tool->capture_toggle, "toggled", G_CALLBACK(on_measure_capture_toggled), tool);
+  gtk_box_append(GTK_BOX(row), tool->capture_toggle);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(root), row);
+
+  button = gtk_button_new_with_label("Use Selection");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_measure_use_selection_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Add Current");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_measure_add_current_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Delete Last");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_measure_delete_last_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Clear Saved");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_measure_clear_saved_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   button = gtk_button_new_with_label("Clear Picks");
@@ -2304,6 +3608,20 @@ gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self)
   gtk_widget_set_hexpand(tool->element_entry, TRUE);
   gtk_grid_attach(GTK_GRID(grid), tool->element_entry, 3, 0, 1, 1);
 
+  label = gtk_label_new("FF Type");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 4, 0, 1, 1);
+  tool->ff_type_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->ff_type_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->ff_type_entry, 5, 0, 1, 1);
+
+  label = gtk_label_new("Region");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 6, 0, 1, 1);
+  tool->region_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->region_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->region_entry, 7, 0, 1, 1);
+
   label = gtk_label_new("X");
   gtk_widget_set_halign(label, GTK_ALIGN_START);
   gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
@@ -2327,11 +3645,11 @@ gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self)
 
   label = gtk_label_new("Bond Order");
   gtk_widget_set_halign(label, GTK_ALIGN_START);
-  gtk_grid_attach(GTK_GRID(grid), label, 4, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), label, 6, 1, 1, 1);
   tool->bond_order_entry = gtk_entry_new();
   gtk_editable_set_text(GTK_EDITABLE(tool->bond_order_entry), "1");
   gtk_widget_set_hexpand(tool->bond_order_entry, TRUE);
-  gtk_grid_attach(GTK_GRID(grid), tool->bond_order_entry, 5, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), tool->bond_order_entry, 7, 1, 1, 1);
 
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   gtk_box_append(GTK_BOX(root), row);
@@ -2356,6 +3674,10 @@ gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self)
   g_signal_connect(button, "clicked", G_CALLBACK(on_delete_picked_atoms_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
+  button = gtk_button_new_with_label("Apply Region To Selected Set");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_edit_apply_region_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   gtk_box_append(GTK_BOX(root), row);
 
@@ -2375,8 +3697,16 @@ gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self)
   g_signal_connect(button, "clicked", G_CALLBACK(on_pick_remove_bond_mode_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
+  button = gtk_button_new_with_label("Use Selection As Picks");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_use_selection_as_picks_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
   button = gtk_button_new_with_label("Clear Picks");
   g_signal_connect(button, "clicked", G_CALLBACK(on_clear_picks_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Clear Selection");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_clear_selection_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   scroller = gtk_scrolled_window_new();
@@ -2643,6 +3973,258 @@ gdis_gtk4_window_present_diffraction_tool(GdisGtk4Window *self)
 }
 
 static void
+on_surface_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisSurfaceTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->surface_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_surface_tool(GdisGtk4Window *self)
+{
+  GdisSurfaceTool *tool;
+  gboolean enabled;
+  g_autofree gchar *report = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->surface_tool;
+  if (!tool)
+    return;
+
+  enabled = (self->active_model != NULL &&
+             self->active_model->periodic &&
+             self->active_model->periodicity >= 3);
+  if (tool->execute_button)
+    gtk_widget_set_sensitive(tool->execute_button, enabled);
+
+  report = gdis_report_surface(self->active_model);
+  if (tool->report_buffer)
+    gtk_text_buffer_set_text(tool->report_buffer, report ? report : "Surface tool unavailable.", -1);
+}
+
+static void
+on_surface_execute_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisSurfaceTool *tool;
+  GdisGtk4Window *self;
+  GdisModel *surface_model;
+  GError *error;
+  gchar *summary;
+  gint h;
+  gint k;
+  gint l;
+  gdouble shift;
+  guint region_a;
+  guint region_b;
+  guint repeat_a;
+  guint repeat_b;
+  gdouble vacuum;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self || !self->active_model || !tool)
+    return;
+
+  h = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->h_spin));
+  k = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->k_spin));
+  l = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->l_spin));
+  shift = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->shift_spin));
+  region_a = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->region_a_spin));
+  region_b = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->region_b_spin));
+  repeat_a = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->repeat_a_spin));
+  repeat_b = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->repeat_b_spin));
+  vacuum = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->vacuum_spin));
+
+  surface_model = NULL;
+  summary = NULL;
+  error = NULL;
+  if (!gdis_model_build_surface_slab(self->active_model,
+                                     h,
+                                     k,
+                                     l,
+                                     shift,
+                                     region_a,
+                                     region_b,
+                                     repeat_a,
+                                     repeat_b,
+                                     vacuum,
+                                     &surface_model,
+                                     &summary,
+                                     &error))
+    {
+      const char *message;
+
+      message = error ? error->message : "unknown error";
+      gdis_gtk4_window_log(self, "Surface build failed: %s\n", message);
+      if (tool->report_buffer)
+        gtk_text_buffer_set_text(tool->report_buffer, message, -1);
+      g_clear_error(&error);
+      g_free(summary);
+      return;
+    }
+
+  gdis_gtk4_window_add_loaded_model(self, surface_model, TRUE);
+  if (summary && tool->report_buffer)
+    gtk_text_buffer_set_text(tool->report_buffer, summary, -1);
+  gdis_gtk4_window_log(self,
+                       "Built a surface slab: (%d %d %d), layers %u + %u, repeats %u x %u, vacuum %.2f A.\n",
+                       h,
+                       k,
+                       l,
+                       region_a,
+                       region_b,
+                       repeat_a,
+                       repeat_b,
+                       vacuum);
+  g_free(summary);
+}
+
+static void
+gdis_gtk4_window_present_surface_tool(GdisGtk4Window *self)
+{
+  GdisSurfaceTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *row;
+  GtkWidget *label;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->surface_tool && GTK_IS_WINDOW(self->surface_tool->window))
+    {
+      gdis_gtk4_window_refresh_surface_tool(self);
+      gtk_window_present(GTK_WINDOW(self->surface_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisSurfaceTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Surface Builder");
+  gtk_window_set_default_size(GTK_WINDOW(window), 760, 560);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 10);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  label = gtk_label_new("Miller h k l");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_grid_attach(GTK_GRID(grid), row, 1, 0, 1, 1);
+  tool->h_spin = gtk_spin_button_new_with_range(-9.0, 9.0, 1.0);
+  tool->k_spin = gtk_spin_button_new_with_range(-9.0, 9.0, 1.0);
+  tool->l_spin = gtk_spin_button_new_with_range(-9.0, 9.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->h_spin), 1.0);
+  gtk_box_append(GTK_BOX(row), tool->h_spin);
+  gtk_box_append(GTK_BOX(row), tool->k_spin);
+  gtk_box_append(GTK_BOX(row), tool->l_spin);
+
+  label = gtk_label_new("Shift (Dhkl units)");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+  tool->shift_spin = gtk_spin_button_new_with_range(-4.0, 4.0, 0.05);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(tool->shift_spin), 2);
+  gtk_grid_attach(GTK_GRID(grid), tool->shift_spin, 1, 1, 1, 1);
+
+  label = gtk_label_new("Region layers A / B");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_grid_attach(GTK_GRID(grid), row, 1, 2, 1, 1);
+  tool->region_a_spin = gtk_spin_button_new_with_range(0.0, 48.0, 1.0);
+  tool->region_b_spin = gtk_spin_button_new_with_range(0.0, 48.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->region_a_spin), 4.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->region_b_spin), 4.0);
+  gtk_box_append(GTK_BOX(row), tool->region_a_spin);
+  gtk_box_append(GTK_BOX(row), tool->region_b_spin);
+
+  label = gtk_label_new("In-plane repeats A / B");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 3, 1, 1);
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_grid_attach(GTK_GRID(grid), row, 1, 3, 1, 1);
+  tool->repeat_a_spin = gtk_spin_button_new_with_range(1.0, 24.0, 1.0);
+  tool->repeat_b_spin = gtk_spin_button_new_with_range(1.0, 24.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->repeat_a_spin), 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->repeat_b_spin), 1.0);
+  gtk_box_append(GTK_BOX(row), tool->repeat_a_spin);
+  gtk_box_append(GTK_BOX(row), tool->repeat_b_spin);
+
+  label = gtk_label_new("Vacuum thickness");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 4, 1, 1);
+  tool->vacuum_spin = gtk_spin_button_new_with_range(0.0, 80.0, 0.5);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(tool->vacuum_spin), 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->vacuum_spin), 12.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->vacuum_spin, 1, 4, 1, 1);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->report_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), row);
+
+  button = gtk_button_new_with_label("Build Surface");
+  tool->execute_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_surface_execute_clicked), tool);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(row), button);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_surface_tool_destroy), tool);
+
+  self->surface_tool = tool;
+  gdis_gtk4_window_refresh_surface_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
 gdis_gtk4_window_update_details(GdisGtk4Window *self)
 {
   GString *summary;
@@ -2764,10 +4346,11 @@ gdis_gtk4_window_update_details(GdisGtk4Window *self)
   if (selected_atom)
     {
       g_string_append_printf(content,
-                             "\nSelected atom:\n  Label: %s\n  Element: %s\n  FF Type: %s\n  Serial: %u\n  Position: %.4f %.4f %.4f\n",
+                             "\nSelected atom:\n  Label: %s\n  Element: %s\n  FF Type: %s\n  Region: %d\n  Serial: %u\n  Position: %.4f %.4f %.4f\n",
                              selected_atom->label,
                              selected_atom->element,
                              selected_atom->ff_type ? selected_atom->ff_type : "",
+                             selected_atom->region,
                              selected_atom->serial,
                              selected_atom->position[0],
                              selected_atom->position[1],
@@ -2777,7 +4360,7 @@ gdis_gtk4_window_update_details(GdisGtk4Window *self)
     gdis_text_buffer_set(self->content_buffer, "%s", content->str);
   g_string_free(content, TRUE);
 
-  editing = g_string_new(" Sel  Serial  Elem  FFType     Label                X           Y           Z\n");
+  editing = g_string_new(" Sel  Serial  Elem  FFType     Region  Label                X           Y           Z\n");
   for (i = 0; i < self->active_model->atoms->len && i < 32; i++)
     {
       GdisAtom *atom;
@@ -2791,11 +4374,12 @@ gdis_gtk4_window_update_details(GdisGtk4Window *self)
       else
         marker = " ";
       g_string_append_printf(editing,
-                             "  %s   %5u   %-3s   %-10s %-16s %10.4f %10.4f %10.4f\n",
+                             "  %s   %5u   %-3s   %-10s %6d  %-16s %10.4f %10.4f %10.4f\n",
                              marker,
                              atom->serial,
                              atom->element,
                              atom->ff_type ? atom->ff_type : "",
+                             atom->region,
                              atom->label,
                              atom->position[0],
                              atom->position[1],
@@ -2986,6 +4570,7 @@ gdis_gtk4_window_set_active_model(GdisGtk4Window *self, GdisModel *model)
   gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_SELECT);
   gdis_gtk4_window_reset_view(self);
   gdis_gtk4_window_clear_status_log(self);
+  gdis_gtk4_window_sync_display_tool(self);
 
   for (button = gtk_widget_get_first_child(self->model_list);
        button != NULL;
@@ -3018,6 +4603,8 @@ gdis_gtk4_window_set_active_model(GdisGtk4Window *self, GdisModel *model)
   gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_diffraction_tool(self);
+  gdis_gtk4_window_refresh_surface_tool(self);
+  gdis_gtk4_window_update_undo_action(self);
 }
 
 static gboolean
@@ -3269,6 +4856,11 @@ gdis_gtk4_window_remove_model(GdisGtk4Window *self, GdisModel *model)
 
   if (self->active_model == model)
     self->active_model = NULL;
+
+  if (self->measurement_records)
+    g_hash_table_remove(self->measurement_records, model);
+  if (self->undo_stacks)
+    g_hash_table_remove(self->undo_stacks, model);
 
   g_ptr_array_remove_index(self->models, index);
   gdis_gtk4_window_set_active_model(self, replacement);
@@ -3763,7 +5355,7 @@ gdis_draw_placeholder(GdisGtk4Window *self, cairo_t *cr, int width, int height)
   const char *line_two;
 
   line_one = "Open a sample model or use File > Open to load a structure.";
-  line_two = "Drag to rotate, scroll to zoom, and click atoms once a model is loaded.";
+  line_two = "Left-drag atom or Alt-drag anywhere to rotate, left-drag empty space to box select, right-drag anywhere to rotate, and scroll to zoom.";
   if (self && self->active_model && self->active_model->atom_count == 0)
     {
       line_one = "This model is empty. Open Edit > Edit Structure to add atoms.";
@@ -3913,7 +5505,7 @@ gdis_draw_overlay(GdisGtk4Window *self, cairo_t *cr, int width, int height)
                              self->active_model->bond_count,
                              displayed_cells,
                              displayed_cells == 1 ? "" : "s");
-  bottom_left = g_strdup_printf("Drag: rotate    Scroll: zoom    Click: select atom    Zoom %.2fx",
+  bottom_left = g_strdup_printf("Drag atom or Alt/Right-drag: rotate    Drag empty space: box select    Shift+Click/Box: add-toggle    Scroll: zoom    Zoom %.2fx",
                                 self->zoom);
 
   cairo_save(cr);
@@ -3939,6 +5531,26 @@ gdis_draw_overlay(GdisGtk4Window *self, cairo_t *cr, int width, int height)
       cairo_set_source_rgba(cr, 0.86, 0.45, 0.40, 0.95);
       cairo_move_to(cr, width - 76.0, 24.0);
       cairo_show_text(cr, "Z");
+    }
+
+  if (self->drag_mode == GDIS_DRAG_MODE_BOX_SELECT)
+    {
+      gdouble rect_x;
+      gdouble rect_y;
+      gdouble rect_w;
+      gdouble rect_h;
+
+      rect_x = MIN(self->press_x, self->drag_current_x);
+      rect_y = MIN(self->press_y, self->drag_current_y);
+      rect_w = fabs(self->drag_current_x - self->press_x);
+      rect_h = fabs(self->drag_current_y - self->press_y);
+
+      cairo_set_source_rgba(cr, 0.42, 0.74, 0.95, 0.16);
+      cairo_rectangle(cr, rect_x, rect_y, rect_w, rect_h);
+      cairo_fill_preserve(cr);
+      cairo_set_source_rgba(cr, 0.42, 0.74, 0.95, 0.95);
+      cairo_set_line_width(cr, 1.4);
+      cairo_stroke(cr);
     }
   cairo_restore(cr);
 
@@ -4054,12 +5666,15 @@ viewer_draw(GtkDrawingArea *area,
           const GdisAtom *atom;
           gboolean selected;
           gboolean group_selected;
+          gboolean picked;
           gdouble ring_radius;
 
           atom = g_ptr_array_index(self->active_model->atoms, draw_order[i].atom_index);
           selected = (draw_order[i].atom_index == self->selected_atom_index);
           group_selected = gdis_gtk4_window_atom_array_contains(self->selected_atoms,
                                                                 draw_order[i].atom_index);
+          picked = gdis_gtk4_window_atom_array_contains(self->picked_atoms,
+                                                        draw_order[i].atom_index);
 
           cairo_save(cr);
           cairo_arc(cr,
@@ -4085,6 +5700,20 @@ viewer_draw(GtkDrawingArea *area,
                         2.0 * G_PI);
               cairo_set_source_rgba(cr, 0.43, 0.76, 0.97, 0.92);
               cairo_set_line_width(cr, 1.6);
+              cairo_stroke(cr);
+            }
+
+          if (picked)
+            {
+              ring_radius = draw_order[i].radius + (selected ? 5.5 : 2.8);
+              cairo_arc(cr,
+                        draw_order[i].screen_x,
+                        draw_order[i].screen_y,
+                        ring_radius,
+                        0.0,
+                        2.0 * G_PI);
+              cairo_set_source_rgba(cr, 0.58, 0.95, 0.74, 0.92);
+              cairo_set_line_width(cr, 1.5);
               cairo_stroke(cr);
             }
 
@@ -4137,19 +5766,100 @@ viewer_draw(GtkDrawingArea *area,
 }
 
 static void
-gdis_gtk4_window_select_atom_at(GdisGtk4Window *self, gdouble x, gdouble y)
+gdis_gtk4_window_handle_completed_pick_mode(GdisGtk4Window *self)
+{
+  GError *error;
+  guint atom_index_a;
+  guint atom_index_b;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->click_mode == GDIS_CLICK_MODE_SELECT ||
+      !self->picked_atoms ||
+      self->picked_atoms->len < 2)
+    return;
+
+  error = NULL;
+  if (gdis_gtk4_window_get_last_two_picks(self, &atom_index_a, &atom_index_b, &error))
+    {
+      if (self->click_mode == GDIS_CLICK_MODE_ADD_BOND)
+        {
+          guint order;
+
+          order = 1;
+          if (self->edit_tool && self->edit_tool->bond_order_entry)
+            {
+              GError *parse_error;
+
+              parse_error = NULL;
+              if (!gdis_gtk4_window_parse_entry_uint(self->edit_tool->bond_order_entry,
+                                                    "Bond order",
+                                                    &order,
+                                                    &parse_error))
+                {
+                  g_clear_error(&parse_error);
+                  order = 1;
+                }
+            }
+
+          gdis_gtk4_window_push_undo_snapshot(self, NULL);
+          if (!gdis_model_add_explicit_bond(self->active_model,
+                                            atom_index_a,
+                                            atom_index_b,
+                                            (guint8) order,
+                                            &error))
+            {
+              gdis_gtk4_window_discard_undo_snapshot(self);
+              gdis_gtk4_window_log(self, "Pick Add Bond failed: %s\n",
+                                   error ? error->message : "unknown error");
+            }
+          else
+            {
+              gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
+              gdis_gtk4_window_log(self, "Pick Add Bond completed.\n");
+            }
+        }
+      else
+        {
+          gdis_gtk4_window_push_undo_snapshot(self, NULL);
+          if (!gdis_model_remove_bond(self->active_model,
+                                      atom_index_a,
+                                      atom_index_b,
+                                      &error))
+            {
+              gdis_gtk4_window_discard_undo_snapshot(self);
+              gdis_gtk4_window_log(self, "Pick Remove Bond failed: %s\n",
+                                   error ? error->message : "unknown error");
+            }
+          else
+            {
+              gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
+              gdis_gtk4_window_log(self, "Pick Remove Bond completed.\n");
+            }
+        }
+    }
+
+  g_clear_error(&error);
+  gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_SELECT);
+  gdis_gtk4_window_log(self, "Click mode returned to Select.\n");
+}
+
+static guint
+gdis_gtk4_window_hit_test_atom_at(GdisGtk4Window *self,
+                                  gdouble x,
+                                  gdouble y,
+                                  GdisProjectedAtom *projected_out)
 {
   GdisProjectedAtom *projected;
   gdouble center[3];
   gdouble scale;
   guint atom_count;
   guint cell_count;
-  guint i;
   guint best_index;
   guint best_projected_index;
   gdouble best_distance2;
 
-  g_return_if_fail(self != NULL);
+  g_return_val_if_fail(self != NULL, INVALID_ATOM_INDEX);
 
   projected = NULL;
   atom_count = 0;
@@ -4159,7 +5869,7 @@ gdis_gtk4_window_select_atom_at(GdisGtk4Window *self, gdouble x, gdouble y)
   best_distance2 = G_MAXDOUBLE;
 
   if (!self->active_model || !self->viewer_area)
-    return;
+    return INVALID_ATOM_INDEX;
 
   if (!gdis_prepare_projection(self,
                                gtk_widget_get_width(self->viewer_area),
@@ -4169,10 +5879,10 @@ gdis_gtk4_window_select_atom_at(GdisGtk4Window *self, gdouble x, gdouble y)
                                &cell_count,
                                center,
                                &scale))
-    return;
+    return INVALID_ATOM_INDEX;
   (void) cell_count;
 
-  for (i = 0; i < atom_count; i++)
+  for (guint i = 0; i < atom_count; i++)
     {
       gdouble dx;
       gdouble dy;
@@ -4192,110 +5902,214 @@ gdis_gtk4_window_select_atom_at(GdisGtk4Window *self, gdouble x, gdouble y)
         }
     }
 
+  if (best_index != INVALID_ATOM_INDEX && projected_out)
+    *projected_out = projected[best_projected_index];
+
+  g_free(projected);
+  return best_index;
+}
+
+static gboolean
+gdis_gtk4_window_apply_box_selection(GdisGtk4Window *self,
+                                     gdouble x0,
+                                     gdouble y0,
+                                     gdouble x1,
+                                     gdouble y1,
+                                     gboolean toggle_existing)
+{
+  GdisProjectedAtom *projected;
+  GArray *boxed_atoms;
+  GArray *base_selection;
+  gdouble center[3];
+  gdouble scale;
+  gdouble min_x;
+  gdouble min_y;
+  gdouble max_x;
+  gdouble max_y;
+  guint atom_count;
+  guint cell_count;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  projected = NULL;
+  boxed_atoms = NULL;
+  base_selection = NULL;
+  atom_count = 0;
+  cell_count = 0;
+
+  if (!self->active_model || !self->viewer_area)
+    return FALSE;
+
+  if (!gdis_prepare_projection(self,
+                               gtk_widget_get_width(self->viewer_area),
+                               gtk_widget_get_height(self->viewer_area),
+                               &projected,
+                               &atom_count,
+                               &cell_count,
+                               center,
+                               &scale))
+    return FALSE;
+  (void) center;
+  (void) scale;
+  (void) cell_count;
+
+  min_x = MIN(x0, x1);
+  min_y = MIN(y0, y1);
+  max_x = MAX(x0, x1);
+  max_y = MAX(y0, y1);
+  boxed_atoms = g_array_new(FALSE, FALSE, sizeof(guint));
+
+  for (guint i = 0; i < atom_count; i++)
+    {
+      gdouble radius;
+
+      radius = projected[i].radius;
+      if (projected[i].screen_x + radius < min_x ||
+          projected[i].screen_x - radius > max_x ||
+          projected[i].screen_y + radius < min_y ||
+          projected[i].screen_y - radius > max_y)
+        continue;
+
+      if (!gdis_gtk4_window_atom_array_contains(boxed_atoms, projected[i].atom_index))
+        g_array_append_val(boxed_atoms, projected[i].atom_index);
+    }
+
+  g_free(projected);
+
+  if (boxed_atoms->len == 0)
+    {
+      g_array_free(boxed_atoms, TRUE);
+      if (!toggle_existing)
+        {
+          self->selected_atom_index = INVALID_ATOM_INDEX;
+          gdis_gtk4_window_clear_selected_atoms(self);
+          gdis_gtk4_window_finish_selection_change(self, "Selection cleared.\n");
+        }
+      return FALSE;
+    }
+
+  base_selection = toggle_existing ? gdis_gtk4_window_copy_atom_array(self->selected_atoms)
+                                   : g_array_new(FALSE, FALSE, sizeof(guint));
+
+  for (guint i = 0; i < boxed_atoms->len; i++)
+    {
+      guint atom_index;
+
+      atom_index = g_array_index(boxed_atoms, guint, i);
+      if (toggle_existing)
+        gdis_gtk4_window_toggle_atom_in_array(base_selection, atom_index);
+      else if (!gdis_gtk4_window_atom_array_contains(base_selection, atom_index))
+        g_array_append_val(base_selection, atom_index);
+    }
+
+  gdis_gtk4_window_clear_selected_atoms(self);
+  if (base_selection->len > 0)
+    g_array_append_vals(self->selected_atoms, base_selection->data, base_selection->len);
+  self->selected_atom_index = (self->selected_atoms && self->selected_atoms->len > 0)
+                              ? g_array_index(self->selected_atoms, guint, 0)
+                              : INVALID_ATOM_INDEX;
+  gdis_gtk4_window_finish_selection_change(self,
+                                           toggle_existing ?
+                                           "Shift box-selection toggled atoms in the current selection.\n" :
+                                           "Box-selected atoms in the viewer.\n");
+
+  g_array_free(base_selection, TRUE);
+  g_array_free(boxed_atoms, TRUE);
+  return TRUE;
+}
+
+static void
+gdis_gtk4_window_select_atom_at(GdisGtk4Window *self,
+                                gdouble x,
+                                gdouble y,
+                                GdkModifierType modifiers)
+{
+  GdisProjectedAtom projected_hit;
+  guint best_index;
+
+  g_return_if_fail(self != NULL);
+
+  best_index = gdis_gtk4_window_hit_test_atom_at(self, x, y, &projected_hit);
   if (best_index != INVALID_ATOM_INDEX)
     {
       const GdisAtom *atom;
 
-      self->selected_atom_index = best_index;
-      gdis_gtk4_window_apply_selection_mode(self, best_index);
-      gdis_gtk4_window_remember_atom_pick(self, best_index);
       atom = g_ptr_array_index(self->active_model->atoms, best_index);
-      gdis_gtk4_window_log(self,
-                           "Selected atom in %s: %s [%s] #%u at %.4f %.4f %.4f (image offset: %d %d %d, mode: %s, selected set: %u, pick set: %u)\n",
-                           self->active_model->basename,
-                           atom->label,
-                           atom->element,
-                           atom->serial,
-                           atom->position[0],
-                           atom->position[1],
-                           atom->position[2],
-                           projected[best_projected_index].image_offset[0],
-                           projected[best_projected_index].image_offset[1],
-                           projected[best_projected_index].image_offset[2],
-                           gdis_gtk4_window_selection_mode_label(self->selection_mode),
-                           self->selected_atoms ? self->selected_atoms->len : 0,
-                           self->picked_atoms ? self->picked_atoms->len : 0);
-
-      if (self->click_mode != GDIS_CLICK_MODE_SELECT &&
-          self->picked_atoms &&
-          self->picked_atoms->len >= 2)
+      if (gdis_gtk4_window_should_record_viewer_picks(self))
         {
-          GError *error;
-          guint atom_index_a;
-          guint atom_index_b;
+          gdis_gtk4_window_remember_atom_pick(self, best_index);
+          gdis_gtk4_window_log(self,
+                               "Picked atom in %s: %s [%s] #%u at %.4f %.4f %.4f (image offset: %d %d %d, pick set: %u)\n",
+                               self->active_model->basename,
+                               atom->label,
+                               atom->element,
+                               atom->serial,
+                               atom->position[0],
+                               atom->position[1],
+                               atom->position[2],
+                               projected_hit.image_offset[0],
+                               projected_hit.image_offset[1],
+                               projected_hit.image_offset[2],
+                               self->picked_atoms ? self->picked_atoms->len : 0);
+          gdis_gtk4_window_handle_completed_pick_mode(self);
+          gdis_gtk4_window_update_details(self);
+          gdis_gtk4_window_refresh_viewer(self);
+          gdis_gtk4_window_refresh_measure_tool(self);
+          gdis_gtk4_window_refresh_edit_tool(self);
+          return;
+        }
 
-          error = NULL;
-          if (gdis_gtk4_window_get_last_two_picks(self, &atom_index_a, &atom_index_b, &error))
-            {
-              if (self->click_mode == GDIS_CLICK_MODE_ADD_BOND)
-                {
-                  guint order;
+      self->selected_atom_index = best_index;
+      if ((modifiers & GDK_SHIFT_MASK) != 0)
+        {
+          GArray *previous_selection;
+          GArray *clicked_group;
 
-                  order = 1;
-                  if (self->edit_tool && self->edit_tool->bond_order_entry)
-                    {
-                      GError *parse_error;
+          previous_selection = gdis_gtk4_window_copy_atom_array(self->selected_atoms);
+          gdis_gtk4_window_apply_selection_mode(self, best_index);
+          clicked_group = gdis_gtk4_window_copy_atom_array(self->selected_atoms);
+          gdis_gtk4_window_clear_selected_atoms(self);
+          if (previous_selection->len > 0)
+            g_array_append_vals(self->selected_atoms,
+                                previous_selection->data,
+                                previous_selection->len);
+          for (guint i = 0; i < clicked_group->len; i++)
+            gdis_gtk4_window_toggle_atom_in_array(self->selected_atoms,
+                                                  g_array_index(clicked_group, guint, i));
+          g_array_free(previous_selection, TRUE);
+          g_array_free(clicked_group, TRUE);
+          gdis_gtk4_window_finish_selection_change(self,
+                                                   "Shift-toggled the clicked atoms into the current selection.\n");
+        }
+      else
+        {
+          g_autofree gchar *message = NULL;
 
-                      parse_error = NULL;
-                      if (gdis_gtk4_window_parse_entry_uint(self->edit_tool->bond_order_entry,
-                                                            "Bond order",
-                                                            &order,
-                                                            &parse_error))
-                        {
-                          (void) parse_error;
-                        }
-                      else
-                        {
-                          g_clear_error(&parse_error);
-                          order = 1;
-                        }
-                    }
-
-                  if (!gdis_model_add_explicit_bond(self->active_model,
-                                                    atom_index_a,
-                                                    atom_index_b,
-                                                    (guint8) order,
-                                                    &error))
-                    gdis_gtk4_window_log(self, "Pick Add Bond failed: %s\n",
-                                         error ? error->message : "unknown error");
-                  else
-                    {
-                      gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
-                      gdis_gtk4_window_log(self, "Pick Add Bond completed.\n");
-                    }
-                }
-              else if (!gdis_model_remove_bond(self->active_model,
-                                               atom_index_a,
-                                               atom_index_b,
-                                               &error))
-                {
-                  gdis_gtk4_window_log(self, "Pick Remove Bond failed: %s\n",
-                                       error ? error->message : "unknown error");
-                }
-              else
-                {
-                  gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
-                  gdis_gtk4_window_log(self, "Pick Remove Bond completed.\n");
-                }
-            }
-
-          g_clear_error(&error);
-          gdis_gtk4_window_set_click_mode(self, GDIS_CLICK_MODE_SELECT);
-          gdis_gtk4_window_log(self, "Click mode returned to Select.\n");
+          gdis_gtk4_window_apply_selection_mode(self, best_index);
+          message = g_strdup_printf("Selected atom in %s: %s [%s] #%u at %.4f %.4f %.4f (image offset: %d %d %d, mode: %s, selected set: %u)\n",
+                                    self->active_model->basename,
+                                    atom->label,
+                                    atom->element,
+                                    atom->serial,
+                                    atom->position[0],
+                                    atom->position[1],
+                                    atom->position[2],
+                                    projected_hit.image_offset[0],
+                                    projected_hit.image_offset[1],
+                                    projected_hit.image_offset[2],
+                                    gdis_gtk4_window_selection_mode_label(self->selection_mode),
+                                    self->selected_atoms ? self->selected_atoms->len : 0);
+          gdis_gtk4_window_finish_selection_change(self, message);
         }
     }
-  else if (self->selected_atom_index != INVALID_ATOM_INDEX)
+  else if ((modifiers & GDK_SHIFT_MASK) == 0 &&
+           !gdis_gtk4_window_should_record_viewer_picks(self) &&
+           self->selected_atom_index != INVALID_ATOM_INDEX)
     {
       self->selected_atom_index = INVALID_ATOM_INDEX;
       gdis_gtk4_window_clear_selected_atoms(self);
-      gdis_gtk4_window_log(self, "Selection cleared.\n");
+      gdis_gtk4_window_finish_selection_change(self, "Selection cleared.\n");
     }
-
-  g_free(projected);
-  gdis_gtk4_window_update_details(self);
-  gdis_gtk4_window_refresh_viewer(self);
-  gdis_gtk4_window_refresh_measure_tool(self);
-  gdis_gtk4_window_refresh_edit_tool(self);
 }
 
 static GtkWidget *
@@ -4671,6 +6485,7 @@ on_view_toggle_toggled(GtkToggleButton *button, gpointer user_data)
   self = user_data;
   gdis_gtk4_window_update_details(self);
   gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_sync_display_tool(self);
 }
 
 static void
@@ -4745,8 +6560,10 @@ on_apply_image_limits_clicked(GtkButton *button, gpointer user_data)
     }
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_set_image_limits(self->active_model, limits, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Image range update failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4773,8 +6590,10 @@ on_reset_image_limits_clicked(GtkButton *button, gpointer user_data)
     return;
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_set_image_limits(self->active_model, limits, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Image range reset failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4800,8 +6619,10 @@ on_confine_to_cell_clicked(GtkButton *button, gpointer user_data)
     return;
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_confine_atoms_to_cell(self->active_model, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Confine to cell failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4825,8 +6646,10 @@ on_confine_molecules_clicked(GtkButton *button, gpointer user_data)
     return;
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_confine_molecules_to_cell(self->active_model, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Confine molecules failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4850,8 +6673,10 @@ on_force_p1_clicked(GtkButton *button, gpointer user_data)
     return;
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_force_p1(self->active_model, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Force to P1 failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4882,8 +6707,10 @@ on_make_supercell_clicked(GtkButton *button, gpointer user_data)
   repeat_c = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->supercell_repeat_spin[2]));
 
   error = NULL;
+  gdis_gtk4_window_push_undo_snapshot(self, NULL);
   if (!gdis_model_make_supercell(self->active_model, repeat_a, repeat_b, repeat_c, &error))
     {
+      gdis_gtk4_window_discard_undo_snapshot(self);
       gdis_gtk4_window_log(self, "Make supercell failed: %s\n",
                            error ? error->message : "unknown error");
       g_clear_error(&error);
@@ -4894,6 +6721,9 @@ on_make_supercell_clicked(GtkButton *button, gpointer user_data)
   self->fragment_anchor_index = INVALID_ATOM_INDEX;
   gdis_gtk4_window_clear_selected_atoms(self);
   gdis_gtk4_window_clear_atom_picks(self);
+  gdis_gtk4_window_clear_saved_measurements(self,
+                                            self->active_model,
+                                            "Saved measurements were cleared because the supercell rebuild changed atom indices.\n");
   for (guint axis = 0; axis < 3; axis++)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->supercell_repeat_spin[axis]), 1.0);
   gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
@@ -4911,14 +6741,49 @@ on_viewer_drag_begin(GtkGestureDrag *gesture,
                      gpointer user_data)
 {
   GdisGtk4Window *self;
-
-  (void) gesture;
-  (void) start_x;
-  (void) start_y;
+  GdkModifierType modifiers;
 
   self = user_data;
+  modifiers = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+  self->press_modifiers = modifiers;
+  self->press_x = start_x;
+  self->press_y = start_y;
+  self->drag_current_x = start_x;
+  self->drag_current_y = start_y;
   self->drag_origin_x = self->rotation_x;
   self->drag_origin_y = self->rotation_y;
+  if (gdis_gtk4_window_should_record_viewer_picks(self))
+    {
+      self->drag_mode = GDIS_DRAG_MODE_NONE;
+      return;
+    }
+
+  if ((modifiers & GDK_ALT_MASK) != 0 ||
+      gdis_gtk4_window_hit_test_atom_at(self, start_x, start_y, NULL) != INVALID_ATOM_INDEX)
+    self->drag_mode = GDIS_DRAG_MODE_ROTATE;
+  else
+    self->drag_mode = GDIS_DRAG_MODE_BOX_SELECT;
+}
+
+static void
+on_viewer_secondary_drag_begin(GtkGestureDrag *gesture,
+                               gdouble start_x,
+                               gdouble start_y,
+                               gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  self = user_data;
+  self->press_modifiers = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+  self->press_x = start_x;
+  self->press_y = start_y;
+  self->drag_current_x = start_x;
+  self->drag_current_y = start_y;
+  self->drag_origin_x = self->rotation_x;
+  self->drag_origin_y = self->rotation_y;
+  self->drag_mode = gdis_gtk4_window_should_record_viewer_picks(self)
+                      ? GDIS_DRAG_MODE_NONE
+                      : GDIS_DRAG_MODE_ROTATE;
 }
 
 static void
@@ -4932,9 +6797,66 @@ on_viewer_drag_update(GtkGestureDrag *gesture,
   (void) gesture;
 
   self = user_data;
-  self->rotation_y = self->drag_origin_y + offset_x * 0.010;
-  self->rotation_x = self->drag_origin_x + offset_y * 0.010;
+  if (self->drag_mode == GDIS_DRAG_MODE_ROTATE)
+    {
+      self->rotation_y = self->drag_origin_y + offset_x * 0.010;
+      self->rotation_x = self->drag_origin_x + offset_y * 0.010;
+      gdis_gtk4_window_refresh_viewer(self);
+    }
+  else if (self->drag_mode == GDIS_DRAG_MODE_BOX_SELECT)
+    {
+      self->drag_current_x = self->press_x + offset_x;
+      self->drag_current_y = self->press_y + offset_y;
+      gdis_gtk4_window_refresh_viewer(self);
+    }
+}
+
+static void
+on_viewer_secondary_drag_update(GtkGestureDrag *gesture,
+                                gdouble offset_x,
+                                gdouble offset_y,
+                                gpointer user_data)
+{
+  on_viewer_drag_update(gesture, offset_x, offset_y, user_data);
+}
+
+static void
+on_viewer_drag_end(GtkGestureDrag *gesture,
+                   gdouble offset_x,
+                   gdouble offset_y,
+                   gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) gesture;
+
+  self = user_data;
+  if (self->drag_mode == GDIS_DRAG_MODE_BOX_SELECT &&
+      (fabs(offset_x) > 5.0 || fabs(offset_y) > 5.0))
+    {
+      self->drag_current_x = self->press_x + offset_x;
+      self->drag_current_y = self->press_y + offset_y;
+      gdis_gtk4_window_apply_box_selection(self,
+                                           self->press_x,
+                                           self->press_y,
+                                           self->drag_current_x,
+                                           self->drag_current_y,
+                                           (self->press_modifiers & GDK_SHIFT_MASK) != 0);
+    }
+
+  self->drag_mode = GDIS_DRAG_MODE_NONE;
+  self->drag_current_x = self->press_x;
+  self->drag_current_y = self->press_y;
   gdis_gtk4_window_refresh_viewer(self);
+}
+
+static void
+on_viewer_secondary_drag_end(GtkGestureDrag *gesture,
+                             gdouble offset_x,
+                             gdouble offset_y,
+                             gpointer user_data)
+{
+  on_viewer_drag_end(gesture, offset_x, offset_y, user_data);
 }
 
 static gboolean
@@ -4976,6 +6898,9 @@ on_viewer_click_pressed(GtkGestureClick *gesture,
   self = user_data;
   self->press_x = x;
   self->press_y = y;
+  self->drag_current_x = x;
+  self->drag_current_y = y;
+  self->press_modifiers = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
 }
 
 static void
@@ -4992,7 +6917,7 @@ on_viewer_click_released(GtkGestureClick *gesture,
 
   self = user_data;
   if (fabs(x - self->press_x) <= 5.0 && fabs(y - self->press_y) <= 5.0)
-    gdis_gtk4_window_select_atom_at(self, x, y);
+    gdis_gtk4_window_select_atom_at(self, x, y, self->press_modifiers);
 }
 
 static void
@@ -5269,12 +7194,6 @@ build_sidebar(GdisGtk4Window *self)
       gtk_widget_set_tooltip_text(button, gdis_legacy_selection_modes[i]);
       gtk_widget_set_hexpand(button, TRUE);
       gdis_gtk4_window_configure_button_label(button);
-      if (g_strcmp0(gdis_legacy_selection_modes[i], "Select : Regions") == 0)
-        {
-          gtk_widget_set_sensitive(button, FALSE);
-          gtk_widget_set_tooltip_text(button,
-                                      "Region selection needs region-labelled model data, which is not loaded by the current GTK4 bridge yet.");
-        }
       gtk_grid_attach(GTK_GRID(mode_grid), button, i % 2, i / 2, 1, 1);
     }
   gtk_box_append(GTK_BOX(box), mode_grid);
@@ -5294,6 +7213,7 @@ build_viewer_area(GdisGtk4Window *self)
   GtkWidget *frame;
   GtkWidget *drawing_area;
   GtkGesture *drag;
+  GtkGesture *secondary_drag;
   GtkGesture *click;
   GtkEventController *scroll;
 
@@ -5316,7 +7236,15 @@ build_viewer_area(GdisGtk4Window *self)
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(drag), GDK_BUTTON_PRIMARY);
   g_signal_connect(drag, "drag-begin", G_CALLBACK(on_viewer_drag_begin), self);
   g_signal_connect(drag, "drag-update", G_CALLBACK(on_viewer_drag_update), self);
+  g_signal_connect(drag, "drag-end", G_CALLBACK(on_viewer_drag_end), self);
   gtk_widget_add_controller(drawing_area, GTK_EVENT_CONTROLLER(drag));
+
+  secondary_drag = gtk_gesture_drag_new();
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(secondary_drag), GDK_BUTTON_SECONDARY);
+  g_signal_connect(secondary_drag, "drag-begin", G_CALLBACK(on_viewer_secondary_drag_begin), self);
+  g_signal_connect(secondary_drag, "drag-update", G_CALLBACK(on_viewer_secondary_drag_update), self);
+  g_signal_connect(secondary_drag, "drag-end", G_CALLBACK(on_viewer_secondary_drag_end), self);
+  gtk_widget_add_controller(drawing_area, GTK_EVENT_CONTROLLER(secondary_drag));
 
   click = gtk_gesture_click_new();
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), GDK_BUTTON_PRIMARY);
@@ -5497,12 +7425,17 @@ build_menu_bar_model(void)
   GMenu *file_menu;
   GMenu *edit_menu;
   GMenu *tools_menu;
+  GMenu *visualization_menu;
+  GMenu *building_menu;
+  GMenu *computation_menu;
+  GMenu *analysis_menu;
   GMenu *view_menu;
   GMenu *help_menu;
 
   root = g_menu_new();
 
   file_menu = g_menu_new();
+  g_menu_append(file_menu, "New", "app.new-model");
   g_menu_append(file_menu, "Open", "app.open");
   g_menu_append(file_menu, "Save", "app.save");
   g_menu_append(file_menu, "Save As", "app.save-as");
@@ -5511,29 +7444,50 @@ build_menu_bar_model(void)
   g_menu_append_submenu(root, "File", G_MENU_MODEL(file_menu));
 
   edit_menu = g_menu_new();
-  g_menu_append(edit_menu, "New Model", "app.new-model");
-  g_menu_append(edit_menu, "Edit Structure", "app.edit");
+  g_menu_append(edit_menu, "Undo", "app.undo");
+  g_menu_append(edit_menu, "Select All", "app.select-all");
+  g_menu_append(edit_menu, "Invert Selection", "app.invert-selection");
+  g_menu_append(edit_menu, "Delete Selected", "app.delete-selected");
   g_menu_append_submenu(root, "Edit", G_MENU_MODEL(edit_menu));
 
   tools_menu = g_menu_new();
-  g_menu_append(tools_menu, "Render", "app.render");
-  g_menu_append(tools_menu, "Measure", "app.measure");
-  g_menu_append(tools_menu, "Iso-surfaces", "app.isosurface");
-  g_menu_append(tools_menu, "Surface", "app.surface");
-  g_menu_append(tools_menu, "Diffraction", "app.diffraction");
+  visualization_menu = g_menu_new();
+  g_menu_append(visualization_menu, "Iso-surfaces", "app.isosurface");
+  g_menu_append_submenu(tools_menu, "Visualization", G_MENU_MODEL(visualization_menu));
+
+  building_menu = g_menu_new();
+  g_menu_append(building_menu, "Editing", "app.edit");
+  g_menu_append(building_menu, "Surfaces", "app.surface");
+  g_menu_append_submenu(tools_menu, "Building", G_MENU_MODEL(building_menu));
+
+  computation_menu = g_menu_new();
+  g_menu_append(computation_menu, "Diffraction", "app.diffraction");
+  g_menu_append_submenu(tools_menu, "Computation", G_MENU_MODEL(computation_menu));
+
+  analysis_menu = g_menu_new();
+  g_menu_append(analysis_menu, "Measurements", "app.measure");
+  g_menu_append_submenu(tools_menu, "Analysis", G_MENU_MODEL(analysis_menu));
+
   g_menu_append_submenu(root, "Tools", G_MENU_MODEL(tools_menu));
 
   view_menu = g_menu_new();
+  g_menu_append(view_menu, "Display Properties", "app.render");
+  g_menu_append(view_menu, "Reset Model Images", "app.reset-images");
   g_menu_append(view_menu, "Reset View", "app.reset-view");
   g_menu_append_submenu(root, "View", G_MENU_MODEL(view_menu));
 
   help_menu = g_menu_new();
   g_menu_append(help_menu, "About", "app.about");
+  g_menu_append(help_menu, "Manual", "app.manual");
   g_menu_append_submenu(root, "Help", G_MENU_MODEL(help_menu));
 
   g_object_unref(file_menu);
   g_object_unref(edit_menu);
   g_object_unref(tools_menu);
+  g_object_unref(visualization_menu);
+  g_object_unref(building_menu);
+  g_object_unref(computation_menu);
+  g_object_unref(analysis_menu);
   g_object_unref(view_menu);
   g_object_unref(help_menu);
 
@@ -5603,6 +7557,13 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
       return;
     }
 
+  if (g_strcmp0(name, "undo") == 0)
+    {
+      if (!gdis_gtk4_window_perform_undo(self))
+        gdis_gtk4_window_log(self, "Undo requested, but no saved model edit is available.\n");
+      return;
+    }
+
   if (g_strcmp0(name, "close-model") == 0)
     {
       if (!self->active_model)
@@ -5625,11 +7586,56 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
       return;
     }
 
+  if (g_strcmp0(name, "reset-images") == 0)
+    {
+      on_reset_image_limits_clicked(NULL, self);
+      return;
+    }
+
   if (g_strcmp0(name, "about") == 0)
     {
-      gdis_gtk4_window_log(self,
-                           "GTK4 rebuild for GDIS.\n"
-                           "Legacy-derived loaders now support XYZ, PDB, ARC/CAR, and CIF metadata.\n");
+      g_autofree char *report = NULL;
+
+      report = g_strdup(
+        "GDIS GTK4 Rebuild\n\n"
+        "Current restored core:\n"
+        "  - native GTK4 viewer with rotate / zoom / atom picking\n"
+        "  - legacy-derived loaders for XYZ, PDB, ARC/CAR, and CIF\n"
+        "  - structure editing, bond editing, measurements, and undo\n"
+        "  - periodic image controls, slab surface builder, and powder diffraction tool\n\n"
+        "Important docs in this repo:\n"
+        "  - gtk4_rebuild/gtk4_app/README.md\n"
+        "  - gtk4_rebuild/RESTORATION_AUDIT.md\n"
+        "  - gtk4_rebuild/legacy_snapshot/src/gui_main.c");
+      gdis_gtk4_window_present_report(self, "About GDIS GTK4", report);
+      gdis_gtk4_window_log(self, "Opened GTK4 rebuild summary.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "manual") == 0)
+    {
+      g_autofree char *report = NULL;
+
+      report = g_strdup(
+        "GTK4 Usage Guide\n\n"
+        "Basic workflow:\n"
+        "  1. File > Open to load a structure.\n"
+        "  2. Drag an atom to rotate, or use Alt-drag / right-drag anywhere to rotate, and scroll to zoom.\n"
+        "  3. Click atoms to build the current selection and pick history.\n"
+        "  4. Use Tools > Building > Editing for atom edits, add atom, and bond editing.\n"
+        "  5. Use Tools > Analysis > Measurements for distance / angle / torsion.\n"
+        "  6. Use View > Reset Model Images for periodic image cleanup.\n\n"
+        "Current GTK4-native tools:\n"
+        "  - Editing\n"
+        "  - Measurements\n"
+        "  - Surface Builder\n"
+        "  - Powder Diffraction\n\n"
+        "Detailed parity audit:\n"
+        "  gtk4_rebuild/RESTORATION_AUDIT.md\n\n"
+        "Legacy reference:\n"
+        "  gtk4_rebuild/legacy_snapshot/src/gui_main.c");
+      gdis_gtk4_window_present_report(self, "GTK4 Manual", report);
+      gdis_gtk4_window_log(self, "Opened GTK4 usage guide.\n");
       return;
     }
 
@@ -5642,11 +7648,8 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 
   if (g_strcmp0(name, "surface") == 0)
     {
-      g_autofree char *report = NULL;
-
-      report = gdis_report_surface(self->active_model);
-      gdis_gtk4_window_present_report(self, "Surface Explorer", report);
-      gdis_gtk4_window_log(self, "Opened surface explorer.\n");
+      gdis_gtk4_window_present_surface_tool(self);
+      gdis_gtk4_window_log(self, "Opened surface builder.\n");
       return;
     }
 
@@ -5683,27 +7686,8 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 
   if (g_strcmp0(name, "render") == 0)
     {
-      g_autofree char *report = NULL;
-
-      report = g_strdup_printf("Render Controls\n\n"
-                               "Viewer toggles:\n"
-                               "  Atoms: %s\n"
-                               "  Bonds: %s\n"
-                               "  Cell: %s\n"
-                               "  Labels: %s\n\n"
-                               "Controls:\n"
-                               "  Drag: rotate\n"
-                               "  Scroll: zoom\n"
-                               "  Click: pick atom\n"
-                               "  View X / Y / Z: preset orientations\n\n"
-                               "This GTK4 rebuild currently uses a lightweight native renderer.\n"
-                               "The full legacy display/render property dialog is a separate port.",
-                               gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_atoms_toggle)) ? "on" : "off",
-                               gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_bonds_toggle)) ? "on" : "off",
-                               gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_cell_toggle)) ? "on" : "off",
-                               gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->show_labels_toggle)) ? "on" : "off");
-      gdis_gtk4_window_present_report(self, "Render Controls", report);
-      gdis_gtk4_window_log(self, "Opened render control summary.\n");
+      gdis_gtk4_window_present_display_tool(self);
+      gdis_gtk4_window_log(self, "Opened display properties.\n");
       return;
     }
 
@@ -5729,6 +7713,33 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
       return;
     }
 
+  if (g_strcmp0(name, "select-all") == 0)
+    {
+      gdis_gtk4_window_select_all_atoms(self);
+      return;
+    }
+
+  if (g_strcmp0(name, "invert-selection") == 0)
+    {
+      gdis_gtk4_window_invert_selected_atoms(self);
+      return;
+    }
+
+  if (g_strcmp0(name, "delete-selected") == 0)
+    {
+      if (!self->active_model)
+        {
+          gdis_gtk4_window_log(self, "Delete selected requested, but no active model is loaded.\n");
+          return;
+        }
+
+      if (self->selected_atoms && self->selected_atoms->len > 0)
+        on_delete_selected_group_clicked(NULL, self);
+      else
+        on_delete_selected_atom_clicked(NULL, self);
+      return;
+    }
+
   gdis_gtk4_window_log(self, "Activated action: %s\n", name);
 }
 
@@ -5739,23 +7750,60 @@ install_actions(GtkApplication *app)
     {.name = "open", .activate = action_dispatch},
     {.name = "save", .activate = action_dispatch},
     {.name = "save-as", .activate = action_dispatch},
+    {.name = "undo", .activate = action_dispatch},
     {.name = "close-model", .activate = action_dispatch},
     {.name = "quit", .activate = action_dispatch},
     {.name = "new-model", .activate = action_dispatch},
     {.name = "edit", .activate = action_dispatch},
+    {.name = "select-all", .activate = action_dispatch},
+    {.name = "invert-selection", .activate = action_dispatch},
+    {.name = "delete-selected", .activate = action_dispatch},
     {.name = "render", .activate = action_dispatch},
     {.name = "measure", .activate = action_dispatch},
     {.name = "isosurface", .activate = action_dispatch},
     {.name = "surface", .activate = action_dispatch},
     {.name = "diffraction", .activate = action_dispatch},
+    {.name = "reset-images", .activate = action_dispatch},
     {.name = "reset-view", .activate = action_dispatch},
-    {.name = "about", .activate = action_dispatch}
+    {.name = "about", .activate = action_dispatch},
+    {.name = "manual", .activate = action_dispatch}
   };
 
   g_action_map_add_action_entries(G_ACTION_MAP(app),
                                   entries,
                                   G_N_ELEMENTS(entries),
                                   app);
+
+  gtk_application_set_accels_for_action(app, "app.new-model",
+                                        (const char *[]) {"<Primary>n", NULL});
+  gtk_application_set_accels_for_action(app, "app.open",
+                                        (const char *[]) {"<Primary>o", NULL});
+  gtk_application_set_accels_for_action(app, "app.save",
+                                        (const char *[]) {"<Primary>s", NULL});
+  gtk_application_set_accels_for_action(app, "app.undo",
+                                        (const char *[]) {"<Primary>z", NULL});
+  gtk_application_set_accels_for_action(app, "app.close-model",
+                                        (const char *[]) {"<Primary>w", NULL});
+  gtk_application_set_accels_for_action(app, "app.quit",
+                                        (const char *[]) {"<Primary>q", NULL});
+  gtk_application_set_accels_for_action(app, "app.edit",
+                                        (const char *[]) {"<Primary>e", NULL});
+  gtk_application_set_accels_for_action(app, "app.select-all",
+                                        (const char *[]) {"<Primary>a", NULL});
+  gtk_application_set_accels_for_action(app, "app.invert-selection",
+                                        (const char *[]) {"<Primary>i", NULL});
+  gtk_application_set_accels_for_action(app, "app.render",
+                                        (const char *[]) {"<Primary>d", NULL});
+  gtk_application_set_accels_for_action(app, "app.reset-images",
+                                        (const char *[]) {"<Primary>r", NULL});
+
+  {
+    GAction *undo_action;
+
+    undo_action = g_action_map_lookup_action(G_ACTION_MAP(app), "undo");
+    if (undo_action && G_IS_SIMPLE_ACTION(undo_action))
+      g_simple_action_set_enabled(G_SIMPLE_ACTION(undo_action), FALSE);
+  }
 }
 
 GdisGtk4Window *
@@ -5773,10 +7821,19 @@ gdis_gtk4_window_new(GtkApplication *app)
   self->models = g_ptr_array_new_with_free_func((GDestroyNotify) gdis_model_free);
   self->selected_atoms = g_array_new(FALSE, FALSE, sizeof(guint));
   self->picked_atoms = g_array_new(FALSE, FALSE, sizeof(guint));
+  self->measurement_records = g_hash_table_new_full(g_direct_hash,
+                                                    g_direct_equal,
+                                                    NULL,
+                                                    gdis_measurement_record_array_free);
+  self->undo_stacks = g_hash_table_new_full(g_direct_hash,
+                                            g_direct_equal,
+                                            NULL,
+                                            (GDestroyNotify) g_ptr_array_unref);
   self->selected_atom_index = INVALID_ATOM_INDEX;
   self->selection_mode = GDIS_SELECTION_MODE_ATOMS;
   self->click_mode = GDIS_CLICK_MODE_SELECT;
   self->fragment_anchor_index = INVALID_ATOM_INDEX;
+  self->drag_mode = GDIS_DRAG_MODE_NONE;
   gdis_gtk4_window_reset_view(self);
 
   install_actions(app);
@@ -5802,6 +7859,7 @@ gdis_gtk4_window_new(GtkApplication *app)
   gdis_gtk4_window_restore_layout(self);
 
   g_object_set_data_full(G_OBJECT(self->window), WINDOW_DATA_KEY, self, gdis_gtk4_window_free);
+  gdis_gtk4_window_update_undo_action(self);
 
   gdis_gtk4_window_log(self, "GTK4 rebuild initialized.\n");
   gdis_gtk4_window_log(self, "Legacy-derived model loaders are active for XYZ, PDB, ARC/CAR, and CIF.\n");

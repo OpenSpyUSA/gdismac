@@ -67,6 +67,15 @@ char *gdis_report_measurements(const GdisModel *model,
                                const guint *atom_indices,
                                guint count,
                                GdisMeasureMode mode);
+gboolean gdis_measure_calculate(const GdisModel *model,
+                                GdisMeasureMode mode,
+                                const guint *atom_indices,
+                                guint count,
+                                guint used_atom_indices_out[4],
+                                guint *used_count_out,
+                                GdisMeasureMode *resolved_mode_out,
+                                gdouble *value_out,
+                                GError **error);
 char *gdis_report_surface(const GdisModel *model);
 char *gdis_report_diffraction(const GdisModel *model);
 char *gdis_report_isosurface(const GdisModel *model);

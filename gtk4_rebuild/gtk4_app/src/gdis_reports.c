@@ -592,6 +592,165 @@ gdis_report_measurements(const GdisModel *model,
   return g_string_free(report, FALSE);
 }
 
+gboolean
+gdis_measure_calculate(const GdisModel *model,
+                       GdisMeasureMode mode,
+                       const guint *atom_indices,
+                       guint count,
+                       guint used_atom_indices_out[4],
+                       guint *used_count_out,
+                       GdisMeasureMode *resolved_mode_out,
+                       gdouble *value_out,
+                       GError **error)
+{
+  GdisMeasureMode resolved_mode;
+  guint required_count;
+  guint start_index;
+  guint used_indices[4] = {0, 0, 0, 0};
+
+  g_return_val_if_fail(value_out != NULL, FALSE);
+
+  if (!model)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "No active model is loaded.");
+      return FALSE;
+    }
+
+  if (!atom_indices || count == 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "No atoms are available for the requested measurement.");
+      return FALSE;
+    }
+
+  resolved_mode = mode;
+  if (resolved_mode == GDIS_MEASURE_MODE_AUTO)
+    {
+      if (count >= 4)
+        resolved_mode = GDIS_MEASURE_MODE_TORSION;
+      else if (count >= 3)
+        resolved_mode = GDIS_MEASURE_MODE_ANGLE;
+      else if (count >= 2)
+        resolved_mode = GDIS_MEASURE_MODE_DISTANCE;
+      else
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_FAILED,
+                      "Pick or select at least 2 atoms to measure.");
+          return FALSE;
+        }
+    }
+
+  switch (resolved_mode)
+    {
+    case GDIS_MEASURE_MODE_DISTANCE:
+      required_count = 2;
+      break;
+    case GDIS_MEASURE_MODE_ANGLE:
+      required_count = 3;
+      break;
+    case GDIS_MEASURE_MODE_TORSION:
+      required_count = 4;
+      break;
+    case GDIS_MEASURE_MODE_AUTO:
+    default:
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Unsupported measurement mode.");
+      return FALSE;
+    }
+
+  if (count < required_count)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "This measurement mode needs %u atoms.",
+                  required_count);
+      return FALSE;
+    }
+
+  start_index = count - required_count;
+  for (guint i = 0; i < required_count; i++)
+    {
+      if (atom_indices[start_index + i] >= model->atoms->len)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_FAILED,
+                      "One of the measurement atoms is outside the current model.");
+          return FALSE;
+        }
+      used_indices[i] = atom_indices[start_index + i];
+    }
+
+  switch (resolved_mode)
+    {
+    case GDIS_MEASURE_MODE_DISTANCE:
+      {
+        const GdisAtom *a1;
+        const GdisAtom *a2;
+
+        a1 = g_ptr_array_index(model->atoms, used_indices[0]);
+        a2 = g_ptr_array_index(model->atoms, used_indices[1]);
+        *value_out = gdis_measure_distance(model, a1->position, a2->position);
+      }
+      break;
+
+    case GDIS_MEASURE_MODE_ANGLE:
+      {
+        const GdisAtom *a1;
+        const GdisAtom *a2;
+        const GdisAtom *a3;
+
+        a1 = g_ptr_array_index(model->atoms, used_indices[0]);
+        a2 = g_ptr_array_index(model->atoms, used_indices[1]);
+        a3 = g_ptr_array_index(model->atoms, used_indices[2]);
+        *value_out = gdis_measure_angle(model, a1->position, a2->position, a3->position);
+      }
+      break;
+
+    case GDIS_MEASURE_MODE_TORSION:
+      {
+        const GdisAtom *a1;
+        const GdisAtom *a2;
+        const GdisAtom *a3;
+        const GdisAtom *a4;
+
+        a1 = g_ptr_array_index(model->atoms, used_indices[0]);
+        a2 = g_ptr_array_index(model->atoms, used_indices[1]);
+        a3 = g_ptr_array_index(model->atoms, used_indices[2]);
+        a4 = g_ptr_array_index(model->atoms, used_indices[3]);
+        *value_out = gdis_measure_torsion(model,
+                                          a1->position,
+                                          a2->position,
+                                          a3->position,
+                                          a4->position);
+      }
+      break;
+
+    case GDIS_MEASURE_MODE_AUTO:
+    default:
+      return FALSE;
+    }
+
+  if (used_atom_indices_out)
+    memcpy(used_atom_indices_out, used_indices, sizeof(used_indices));
+  if (used_count_out)
+    *used_count_out = required_count;
+  if (resolved_mode_out)
+    *resolved_mode_out = resolved_mode;
+
+  return TRUE;
+}
+
 char *
 gdis_report_surface(const GdisModel *model)
 {

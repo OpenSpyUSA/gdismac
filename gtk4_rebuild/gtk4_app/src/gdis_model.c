@@ -20,6 +20,7 @@ typedef struct
 } GdisRadiusEntry;
 
 static GdisModel *gdis_model_new(const char *path, GdisModelFormat format);
+static void gdis_model_clear_contents(GdisModel *model);
 static gboolean gdis_model_load_xyz(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_pdb(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_arc_like(GdisModel *model,
@@ -53,11 +54,13 @@ static GdisAtom *gdis_atom_new(const gchar *label,
                                gdouble y,
                                gdouble z,
                                gdouble occupancy,
+                               gint region,
                                guint serial);
 static void gdis_atom_free(gpointer data);
 static void gdis_cif_atom_record_free(gpointer data);
 static gboolean gdis_model_has_valid_cell(const GdisModel *model);
 static gboolean gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble inverse[9]);
+static gboolean gdis_model_invert_matrix3(const gdouble matrix[9], gdouble inverse[9]);
 static void gdis_frac_to_cart(const gdouble matrix[9], const gdouble frac[3], gdouble cart[3]);
 static void gdis_cart_to_frac(const gdouble inverse[9], const gdouble cart[3], gdouble frac[3]);
 static void gdis_model_init_image_limits(GdisModel *model);
@@ -78,6 +81,8 @@ static gchar *gdis_strdup_strip(const gchar *text);
 static gchar *gdis_copy_field(const gchar *line, gsize start, gsize width);
 static gchar *gdis_normalize_element_symbol(const gchar *text);
 static gchar *gdis_pdb_guess_element(const gchar *atom_name);
+static gboolean gdis_arc_like_type_is_marvin_label(const gchar *text);
+static gint gdis_arc_like_region_from_type(const gchar *text);
 static gboolean gdis_try_parse_double(const gchar *text, gdouble *value);
 static gboolean gdis_try_parse_uint(const gchar *text, guint *value);
 static gchar **gdis_split_simple(const gchar *line, gint *count);
@@ -86,6 +91,29 @@ static gboolean gdis_cif_parse_value_line(const gchar *line, gchar **tag_out, gc
 static gdouble gdis_parse_cif_number(const gchar *text);
 static gboolean gdis_cif_is_control_line(const gchar *line);
 static gdouble gdis_lookup_covalent_radius(const gchar *element);
+static void gdis_vec3_set(gdouble vector[3], gdouble x, gdouble y, gdouble z);
+static void gdis_vec3_copy(gdouble dest[3], const gdouble src[3]);
+static void gdis_vec3_add_scaled(gdouble vector[3], const gdouble addend[3], gdouble scale);
+static gdouble gdis_vec3_dot(const gdouble a[3], const gdouble b[3]);
+static void gdis_vec3_cross(const gdouble a[3], const gdouble b[3], gdouble out[3]);
+static gdouble gdis_vec3_length(const gdouble vector[3]);
+static gboolean gdis_vec3_normalize(gdouble vector[3]);
+static gint gdis_int_gcd(gint left, gint right);
+static void gdis_int_vector_reduce(gint vector[3]);
+static gboolean gdis_surface_build_inplane_indices(gint h,
+                                                   gint k,
+                                                   gint l,
+                                                   gint first[3],
+                                                   gint second[3]);
+static gboolean gdis_surface_build_cell_from_vectors(const gdouble a_vec[3],
+                                                     const gdouble b_vec[3],
+                                                     const gdouble c_vec[3],
+                                                     gdouble lengths[3],
+                                                     gdouble angles[3]);
+static gchar *gdis_model_surface_default_path(const GdisModel *source,
+                                              gint h,
+                                              gint k,
+                                              gint l);
 
 GQuark
 gdis_model_error_quark(void)
@@ -200,8 +228,100 @@ gdis_model_load(const char *path, GError **error)
   return model;
 }
 
+GdisModel *
+gdis_model_clone(const GdisModel *model)
+{
+  GdisModel *copy;
+  guint i;
+
+  g_return_val_if_fail(model != NULL, NULL);
+
+  copy = g_new0(GdisModel, 1);
+  copy->path = g_strdup(model->path);
+  copy->basename = g_strdup(model->basename);
+  copy->title = g_strdup(model->title);
+  copy->format_label = g_strdup(model->format_label);
+  copy->space_group = g_strdup(model->space_group);
+  copy->format = model->format;
+  copy->periodic = model->periodic;
+  copy->periodicity = model->periodicity;
+  memcpy(copy->cell_lengths, model->cell_lengths, sizeof(copy->cell_lengths));
+  memcpy(copy->cell_angles, model->cell_angles, sizeof(copy->cell_angles));
+  memcpy(copy->image_limits, model->image_limits, sizeof(copy->image_limits));
+  copy->atom_count = model->atom_count;
+  copy->bond_count = model->bond_count;
+  copy->explicit_bond_count = model->explicit_bond_count;
+  copy->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  copy->bonds = g_array_sized_new(FALSE,
+                                  FALSE,
+                                  sizeof(GdisBond),
+                                  model->bonds ? model->bonds->len : 0u);
+
+  if (model->atoms)
+    {
+      for (i = 0; i < model->atoms->len; i++)
+        {
+          const GdisAtom *atom;
+
+          atom = g_ptr_array_index(model->atoms, i);
+          g_ptr_array_add(copy->atoms,
+                          gdis_atom_new(atom->label,
+                                        atom->element,
+                                        atom->ff_type,
+                                        atom->position[0],
+                                        atom->position[1],
+                                        atom->position[2],
+                                        atom->occupancy,
+                                        atom->region,
+                                        atom->serial));
+        }
+    }
+
+  if (model->bonds && model->bonds->len > 0)
+    g_array_append_vals(copy->bonds, model->bonds->data, model->bonds->len);
+
+  return copy;
+}
+
+gboolean
+gdis_model_copy_from(GdisModel *dest, const GdisModel *src, GError **error)
+{
+  GdisModel *copy;
+
+  g_return_val_if_fail(dest != NULL, FALSE);
+  g_return_val_if_fail(src != NULL, FALSE);
+
+  if (dest == src)
+    return TRUE;
+
+  copy = gdis_model_clone(src);
+  if (!copy)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not clone the model for undo restoration.");
+      return FALSE;
+    }
+
+  gdis_model_clear_contents(dest);
+  *dest = *copy;
+  g_free(copy);
+  return TRUE;
+}
+
 void
 gdis_model_free(GdisModel *model)
+{
+  if (!model)
+    return;
+
+  gdis_model_clear_contents(model);
+  g_free(model);
+}
+
+static void
+gdis_model_clear_contents(GdisModel *model)
 {
   if (!model)
     return;
@@ -216,8 +336,8 @@ gdis_model_free(GdisModel *model)
     g_ptr_array_free(model->atoms, TRUE);
   if (model->bonds)
     g_array_free(model->bonds, TRUE);
-
-  g_free(model);
+  model->atoms = NULL;
+  model->bonds = NULL;
 }
 
 gboolean
@@ -405,12 +525,15 @@ gboolean
 gdis_model_add_atom(GdisModel *model,
                     const char *label,
                     const char *element,
+                    const char *ff_type,
+                    gint region,
                     gdouble x,
                     gdouble y,
                     gdouble z,
                     GError **error)
 {
   g_autofree gchar *normalized_element = NULL;
+  g_autofree gchar *normalized_ff_type = NULL;
   g_autofree gchar *final_label = NULL;
   GdisAtom *atom;
 
@@ -429,13 +552,15 @@ gdis_model_add_atom(GdisModel *model,
     }
 
   final_label = g_strdup((label && *label) ? label : normalized_element);
+  normalized_ff_type = g_strdup((ff_type && *ff_type) ? ff_type : normalized_element);
   atom = gdis_atom_new(final_label,
                        normalized_element,
-                       normalized_element,
+                       normalized_ff_type,
                        x,
                        y,
                        z,
                        1.0,
+                       region,
                        model->atoms->len + 1);
   g_ptr_array_add(model->atoms, atom);
 
@@ -451,6 +576,8 @@ gdis_model_update_atom(GdisModel *model,
                        guint atom_index,
                        const char *label,
                        const char *element,
+                       const char *ff_type,
+                       gint region,
                        gdouble x,
                        gdouble y,
                        gdouble z,
@@ -458,6 +585,7 @@ gdis_model_update_atom(GdisModel *model,
 {
   GdisAtom *atom;
   g_autofree gchar *normalized_element = NULL;
+  g_autofree gchar *normalized_ff_type = NULL;
   gchar *new_label;
 
   g_return_val_if_fail(model != NULL, FALSE);
@@ -485,16 +613,18 @@ gdis_model_update_atom(GdisModel *model,
 
   atom = g_ptr_array_index(model->atoms, atom_index);
   new_label = g_strdup((label && *label) ? label : normalized_element);
+  normalized_ff_type = g_strdup((ff_type && *ff_type) ? ff_type : normalized_element);
 
   g_free(atom->label);
   g_free(atom->element);
   atom->label = new_label;
   atom->element = g_strdup(normalized_element);
   g_free(atom->ff_type);
-  atom->ff_type = g_strdup(normalized_element);
+  atom->ff_type = g_strdup(normalized_ff_type);
   atom->position[0] = x;
   atom->position[1] = y;
   atom->position[2] = z;
+  atom->region = region;
 
   if (model->explicit_bond_count == 0)
     gdis_model_reset_inferred_bonds(model);
@@ -1142,6 +1272,7 @@ gdis_model_make_supercell(GdisModel *model,
                                        src->position[1] + shift[1],
                                        src->position[2] + shift[2],
                                        src->occupancy,
+                                       src->region,
                                        new_atoms->len + 1);
                   g_ptr_array_add(new_atoms, copy);
                 }
@@ -1199,6 +1330,400 @@ gdis_model_make_supercell(GdisModel *model,
     gdis_model_refresh_counts(model);
   gdis_model_init_image_limits(model);
   gdis_model_finalize_metadata(model);
+  return TRUE;
+}
+
+gboolean
+gdis_model_build_surface_slab(const GdisModel *source,
+                              gint h,
+                              gint k,
+                              gint l,
+                              gdouble shift,
+                              guint region_a,
+                              guint region_b,
+                              guint repeat_a,
+                              guint repeat_b,
+                              gdouble vacuum,
+                              GdisModel **surface_out,
+                              gchar **summary_out,
+                              GError **error)
+{
+  GdisModel *surface;
+  GHashTable *seen;
+  gchar *path;
+  gdouble source_matrix[9];
+  gdouble source_inverse[9];
+  gdouble source_a[3];
+  gdouble source_b[3];
+  gdouble source_c[3];
+  gdouble normal[3];
+  gdouble first_vec[3];
+  gdouble second_vec[3];
+  gdouble slab_a[3];
+  gdouble slab_b[3];
+  gdouble slab_c[3];
+  gdouble slab_actual_matrix[9];
+  gdouble slab_actual_inverse[9];
+  gdouble slab_canonical_matrix[9];
+  gdouble lengths[3];
+  gdouble angles[3];
+  gdouble d_spacing;
+  gdouble slab_thickness;
+  gdouble cell_depth;
+  gdouble base_projection;
+  gdouble start_projection;
+  gdouble split_projection;
+  gdouble end_projection;
+  gdouble tolerance;
+  gint first_indices[3];
+  gint second_indices[3];
+  guint total_layers;
+  gint range_a;
+  gint range_b;
+  gint range_c;
+  guint source_atom_count;
+
+  g_return_val_if_fail(surface_out != NULL, FALSE);
+  *surface_out = NULL;
+
+  if (summary_out)
+    *summary_out = NULL;
+
+  if (!source)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction needs an active model.");
+      return FALSE;
+    }
+
+  if (h == 0 && k == 0 && l == 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction needs a non-zero Miller index.");
+      return FALSE;
+    }
+
+  if (!source->periodic || source->periodicity < 3)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction currently targets fully 3D periodic crystal models.");
+      return FALSE;
+    }
+
+  if (repeat_a == 0 || repeat_b == 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface repeats must both be at least 1.");
+      return FALSE;
+    }
+
+  if (!gdis_model_build_cell_matrix(source, source_matrix, source_inverse))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction requires a valid source unit cell.");
+      return FALSE;
+    }
+
+  source_a[0] = source_matrix[0];
+  source_a[1] = source_matrix[3];
+  source_a[2] = source_matrix[6];
+  source_b[0] = source_matrix[1];
+  source_b[1] = source_matrix[4];
+  source_b[2] = source_matrix[7];
+  source_c[0] = source_matrix[2];
+  source_c[1] = source_matrix[5];
+  source_c[2] = source_matrix[8];
+
+  normal[0] = source_inverse[0] * h + source_inverse[3] * k + source_inverse[6] * l;
+  normal[1] = source_inverse[1] * h + source_inverse[4] * k + source_inverse[7] * l;
+  normal[2] = source_inverse[2] * h + source_inverse[5] * k + source_inverse[8] * l;
+  d_spacing = gdis_vec3_length(normal);
+  if (d_spacing <= 1.0e-10)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not resolve a valid surface normal for the selected Miller index.");
+      return FALSE;
+    }
+  d_spacing = 1.0 / d_spacing;
+  if (!gdis_vec3_normalize(normal))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not normalize the surface normal.");
+      return FALSE;
+    }
+
+  if (!gdis_surface_build_inplane_indices(h, k, l, first_indices, second_indices))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not construct in-plane lattice vectors for this Miller index.");
+      return FALSE;
+    }
+
+  gdis_vec3_set(first_vec, 0.0, 0.0, 0.0);
+  gdis_vec3_add_scaled(first_vec, source_a, (gdouble) first_indices[0]);
+  gdis_vec3_add_scaled(first_vec, source_b, (gdouble) first_indices[1]);
+  gdis_vec3_add_scaled(first_vec, source_c, (gdouble) first_indices[2]);
+
+  gdis_vec3_set(second_vec, 0.0, 0.0, 0.0);
+  gdis_vec3_add_scaled(second_vec, source_a, (gdouble) second_indices[0]);
+  gdis_vec3_add_scaled(second_vec, source_b, (gdouble) second_indices[1]);
+  gdis_vec3_add_scaled(second_vec, source_c, (gdouble) second_indices[2]);
+
+  if (gdis_vec3_length(first_vec) <= 1.0e-8 ||
+      gdis_vec3_length(second_vec) <= 1.0e-8)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The derived surface plane vectors were degenerate.");
+      return FALSE;
+    }
+
+  {
+    gdouble handedness[3];
+
+    gdis_vec3_cross(first_vec, second_vec, handedness);
+    if (gdis_vec3_dot(handedness, normal) < 0.0)
+      {
+        for (guint axis = 0; axis < 3; axis++)
+          second_vec[axis] = -second_vec[axis];
+      }
+  }
+
+  gdis_vec3_copy(slab_a, first_vec);
+  for (guint axis = 0; axis < 3; axis++)
+    slab_a[axis] *= (gdouble) repeat_a;
+
+  gdis_vec3_copy(slab_b, second_vec);
+  for (guint axis = 0; axis < 3; axis++)
+    slab_b[axis] *= (gdouble) repeat_b;
+
+  total_layers = MAX(region_a + region_b, 1u);
+  slab_thickness = (gdouble) total_layers * d_spacing;
+  cell_depth = slab_thickness + MAX(vacuum, 0.0);
+  gdis_vec3_copy(slab_c, normal);
+  for (guint axis = 0; axis < 3; axis++)
+    slab_c[axis] *= cell_depth;
+
+  if (!gdis_surface_build_cell_from_vectors(slab_a, slab_b, slab_c, lengths, angles))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not convert the surface lattice vectors into a valid cell.");
+      return FALSE;
+    }
+
+  slab_actual_matrix[0] = slab_a[0];
+  slab_actual_matrix[1] = slab_b[0];
+  slab_actual_matrix[2] = slab_c[0];
+  slab_actual_matrix[3] = slab_a[1];
+  slab_actual_matrix[4] = slab_b[1];
+  slab_actual_matrix[5] = slab_c[1];
+  slab_actual_matrix[6] = slab_a[2];
+  slab_actual_matrix[7] = slab_b[2];
+  slab_actual_matrix[8] = slab_c[2];
+  if (!gdis_model_invert_matrix3(slab_actual_matrix, slab_actual_inverse))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not invert the constructed surface cell.");
+      return FALSE;
+    }
+
+  path = gdis_model_surface_default_path(source, h, k, l);
+  surface = gdis_model_new(path, GDIS_MODEL_FORMAT_CIF);
+  g_free(path);
+
+  g_clear_pointer(&surface->title, g_free);
+  surface->title = g_strdup_printf("%s surface (%d %d %d)",
+                                   source->title ? source->title : source->basename,
+                                   h,
+                                   k,
+                                   l);
+  g_clear_pointer(&surface->space_group, g_free);
+  surface->space_group = g_strdup("P 1");
+  surface->periodic = TRUE;
+  surface->periodicity = 2;
+  memcpy(surface->cell_lengths, lengths, sizeof(lengths));
+  memcpy(surface->cell_angles, angles, sizeof(angles));
+
+  if (!gdis_model_build_cell_matrix(surface, slab_canonical_matrix, NULL))
+    {
+      gdis_model_free(surface);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not build the canonical slab cell for display.");
+      return FALSE;
+    }
+
+  base_projection = G_MAXDOUBLE;
+  source_atom_count = source->atoms ? source->atoms->len : 0u;
+  for (guint atom_index = 0; atom_index < source_atom_count; atom_index++)
+    {
+      const GdisAtom *atom;
+      gdouble projection;
+
+      atom = g_ptr_array_index(source->atoms, atom_index);
+      projection = gdis_vec3_dot(normal, atom->position);
+      if (projection < base_projection)
+        base_projection = projection;
+    }
+
+  if (base_projection == G_MAXDOUBLE)
+    {
+      gdis_model_free(surface);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction could not find any atoms in the source model.");
+      return FALSE;
+    }
+
+  start_projection = base_projection + shift * d_spacing;
+  split_projection = start_projection + ((gdouble) region_a * d_spacing);
+  end_projection = start_projection + slab_thickness;
+  tolerance = MAX(1.0e-4, 0.02 * d_spacing);
+
+  range_a = (gint) (repeat_a * ABS(first_indices[0]) +
+                    repeat_b * ABS(second_indices[0]) +
+                    total_layers + 4u);
+  range_b = (gint) (repeat_a * ABS(first_indices[1]) +
+                    repeat_b * ABS(second_indices[1]) +
+                    total_layers + 4u);
+  range_c = (gint) (repeat_a * ABS(first_indices[2]) +
+                    repeat_b * ABS(second_indices[2]) +
+                    total_layers + 4u);
+
+  seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  for (gint ia = -range_a; ia <= range_a; ia++)
+    {
+      for (gint ib = -range_b; ib <= range_b; ib++)
+        {
+          for (gint ic = -range_c; ic <= range_c; ic++)
+            {
+              for (guint atom_index = 0; atom_index < source_atom_count; atom_index++)
+                {
+                  const GdisAtom *atom;
+                  gdouble candidate[3];
+                  gdouble frac[3];
+                  gdouble projection;
+                  gdouble cart[3];
+                  gint region;
+                  g_autofree gchar *key = NULL;
+
+                  atom = g_ptr_array_index(source->atoms, atom_index);
+                  gdis_vec3_copy(candidate, atom->position);
+                  gdis_vec3_add_scaled(candidate, source_a, (gdouble) ia);
+                  gdis_vec3_add_scaled(candidate, source_b, (gdouble) ib);
+                  gdis_vec3_add_scaled(candidate, source_c, (gdouble) ic);
+
+                  projection = gdis_vec3_dot(normal, candidate);
+                  if (projection < start_projection - tolerance ||
+                      projection > end_projection + tolerance)
+                    continue;
+
+                  gdis_cart_to_frac(slab_actual_inverse, candidate, frac);
+                  frac[0] -= floor(frac[0]);
+                  frac[1] -= floor(frac[1]);
+                  frac[2] = (projection - start_projection + MAX(vacuum, 0.0) * 0.5) / cell_depth;
+
+                  if (frac[0] >= 1.0 - 1.0e-6)
+                    frac[0] = 0.0;
+                  if (frac[1] >= 1.0 - 1.0e-6)
+                    frac[1] = 0.0;
+                  if (frac[2] < -1.0e-6 || frac[2] > 1.0 + 1.0e-6)
+                    continue;
+                  frac[2] = CLAMP(frac[2], 0.0, 1.0 - 1.0e-6);
+
+                  key = g_strdup_printf("%.5f|%.5f|%.5f|%s",
+                                        floor(frac[0] * 100000.0 + 0.5) / 100000.0,
+                                        floor(frac[1] * 100000.0 + 0.5) / 100000.0,
+                                        floor(frac[2] * 100000.0 + 0.5) / 100000.0,
+                                        atom->element ? atom->element : "X");
+                  if (!g_hash_table_add(seen, g_steal_pointer(&key)))
+                    continue;
+
+                  gdis_frac_to_cart(slab_canonical_matrix, frac, cart);
+                  region = atom->region;
+                  if (region < 0)
+                    region = (projection < split_projection - tolerance || region_b == 0u) ? 1 : 2;
+                  g_ptr_array_add(surface->atoms,
+                                  gdis_atom_new(atom->label,
+                                                atom->element,
+                                                atom->ff_type,
+                                                cart[0],
+                                                cart[1],
+                                                cart[2],
+                                                atom->occupancy,
+                                                region,
+                                                surface->atoms->len + 1));
+                }
+            }
+        }
+    }
+  g_hash_table_unref(seen);
+
+  if (!surface->atoms || surface->atoms->len == 0)
+    {
+      gdis_model_free(surface);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Surface construction did not capture any atoms. Try a smaller shift or larger slab depth.");
+      return FALSE;
+    }
+
+  surface->explicit_bond_count = 0;
+  gdis_model_infer_bonds(surface);
+  gdis_model_init_image_limits(surface);
+  gdis_model_finalize_metadata(surface);
+
+  if (summary_out)
+    {
+      *summary_out = g_strdup_printf(
+        "Built slab from %s\n"
+        "Miller index: (%d %d %d)\n"
+        "Dhkl: %.4f A\n"
+        "Layers: %u + %u\n"
+        "In-plane repeats: %u x %u\n"
+        "Vacuum: %.2f A\n"
+        "Result: %u atoms, cell %.4f %.4f %.4f A\n",
+        source->basename,
+        h,
+        k,
+        l,
+        d_spacing,
+        region_a,
+        region_b,
+        repeat_a,
+        repeat_b,
+        MAX(vacuum, 0.0),
+        surface->atom_count,
+        surface->cell_lengths[0],
+        surface->cell_lengths[1],
+        surface->cell_lengths[2]);
+    }
+
+  *surface_out = surface;
   return TRUE;
 }
 
@@ -1492,6 +2017,7 @@ gdis_model_load_xyz(GdisModel *model, const gchar *contents, GError **error)
                                     y,
                                     z,
                                     1.0,
+                                    -1,
                                     parsed_atoms + 1));
       g_free(element);
       parsed_atoms++;
@@ -1675,6 +2201,7 @@ gdis_model_load_pdb(GdisModel *model, const gchar *contents, GError **error)
                                         y,
                                         z,
                                         occupancy,
+                                        -1,
                                         serial));
           g_hash_table_insert(serial_to_index,
                               GUINT_TO_POINTER(serial),
@@ -1914,6 +2441,7 @@ gdis_model_load_arc_like(GdisModel *model,
           gdouble y;
           gdouble z;
           gdouble occupancy;
+          gint region;
           gboolean skip_atom;
 
           if (!gdis_try_parse_double(tokens[1], &x) ||
@@ -1925,15 +2453,12 @@ gdis_model_load_arc_like(GdisModel *model,
             }
 
           skip_atom = FALSE;
+          region = -1;
           if (g_ascii_strcasecmp(tokens[4], "SHELL") == 0)
             skip_atom = TRUE;
-          else if ((tokens[4][0] == 'R' || tokens[4][0] == 'r') &&
-                   g_ascii_isdigit(tokens[4][1]) &&
-                   (tokens[4][2] == 'A' || tokens[4][2] == 'a' ||
-                    tokens[4][2] == 'B' || tokens[4][2] == 'b') &&
-                   (tokens[4][3] == 'C' || tokens[4][3] == 'c' ||
-                    tokens[4][3] == 'S' || tokens[4][3] == 's'))
+          else if (gdis_arc_like_type_is_marvin_label(tokens[4]))
             {
+              region = gdis_arc_like_region_from_type(tokens[4]);
               if (tokens[4][3] == 'S' || tokens[4][3] == 's')
                 skip_atom = TRUE;
             }
@@ -1966,6 +2491,7 @@ gdis_model_load_arc_like(GdisModel *model,
                                         y,
                                         z,
                                         occupancy,
+                                        region,
                                         model->atoms->len + 1));
           g_free(ff_type);
           g_free(element);
@@ -2320,6 +2846,7 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                                         cart[1],
                                         cart[2],
                                         record->occupancy,
+                                        -1,
                                         idx + 1));
         }
     }
@@ -2531,6 +3058,7 @@ gdis_atom_new(const gchar *label,
               gdouble y,
               gdouble z,
               gdouble occupancy,
+              gint region,
               guint serial)
 {
   GdisAtom *atom;
@@ -2545,6 +3073,7 @@ gdis_atom_new(const gchar *label,
   atom->position[1] = y;
   atom->position[2] = z;
   atom->occupancy = occupancy;
+  atom->region = region;
   return atom;
 }
 
@@ -2714,14 +3243,23 @@ gdis_model_write_arc_like(const GdisModel *model, GdisModelFormat format)
   for (i = 0; i < model->atoms->len; i++)
     {
       const GdisAtom *atom;
+      const char *type_token;
+      gchar region_token[8];
 
       atom = g_ptr_array_index(model->atoms, i);
+      type_token = "CORE";
+      if (atom->region >= 0 && atom->region < 4)
+        {
+          g_snprintf(region_token, sizeof(region_token), "R%dAC", atom->region + 1);
+          type_token = region_token;
+        }
       g_string_append_printf(out,
-                             "%-8s %14.9f %14.9f %14.9f CORE %5u %-2s %-2s %8.4f %5u\n",
+                             "%-8s %14.9f %14.9f %14.9f %-4s %5u %-2s %-2s %8.4f %5u\n",
                              atom->label && atom->label[0] != '\0' ? atom->label : atom->element,
                              atom->position[0],
                              atom->position[1],
                              atom->position[2],
+                             type_token,
                              atom->serial,
                              atom->ff_type ? atom->ff_type : (atom->element ? atom->element : "X"),
                              atom->element ? atom->element : "X",
@@ -2807,6 +3345,219 @@ gdis_model_has_valid_cell(const GdisModel *model)
 }
 
 static gboolean
+gdis_model_invert_matrix3(const gdouble matrix[9], gdouble inverse[9])
+{
+  gdouble det;
+
+  g_return_val_if_fail(matrix != NULL, FALSE);
+  g_return_val_if_fail(inverse != NULL, FALSE);
+
+  det = matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7]) -
+        matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6]) +
+        matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
+  if (fabs(det) < 1.0e-12)
+    return FALSE;
+
+  inverse[0] =  (matrix[4] * matrix[8] - matrix[5] * matrix[7]) / det;
+  inverse[1] = -(matrix[1] * matrix[8] - matrix[2] * matrix[7]) / det;
+  inverse[2] =  (matrix[1] * matrix[5] - matrix[2] * matrix[4]) / det;
+  inverse[3] = -(matrix[3] * matrix[8] - matrix[5] * matrix[6]) / det;
+  inverse[4] =  (matrix[0] * matrix[8] - matrix[2] * matrix[6]) / det;
+  inverse[5] = -(matrix[0] * matrix[5] - matrix[2] * matrix[3]) / det;
+  inverse[6] =  (matrix[3] * matrix[7] - matrix[4] * matrix[6]) / det;
+  inverse[7] = -(matrix[0] * matrix[7] - matrix[1] * matrix[6]) / det;
+  inverse[8] =  (matrix[0] * matrix[4] - matrix[1] * matrix[3]) / det;
+  return TRUE;
+}
+
+static void
+gdis_vec3_set(gdouble vector[3], gdouble x, gdouble y, gdouble z)
+{
+  vector[0] = x;
+  vector[1] = y;
+  vector[2] = z;
+}
+
+static void
+gdis_vec3_copy(gdouble dest[3], const gdouble src[3])
+{
+  dest[0] = src[0];
+  dest[1] = src[1];
+  dest[2] = src[2];
+}
+
+static void
+gdis_vec3_add_scaled(gdouble vector[3], const gdouble addend[3], gdouble scale)
+{
+  vector[0] += addend[0] * scale;
+  vector[1] += addend[1] * scale;
+  vector[2] += addend[2] * scale;
+}
+
+static gdouble
+gdis_vec3_dot(const gdouble a[3], const gdouble b[3])
+{
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void
+gdis_vec3_cross(const gdouble a[3], const gdouble b[3], gdouble out[3])
+{
+  out[0] = a[1] * b[2] - a[2] * b[1];
+  out[1] = a[2] * b[0] - a[0] * b[2];
+  out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static gdouble
+gdis_vec3_length(const gdouble vector[3])
+{
+  return sqrt(gdis_vec3_dot(vector, vector));
+}
+
+static gboolean
+gdis_vec3_normalize(gdouble vector[3])
+{
+  gdouble length;
+
+  length = gdis_vec3_length(vector);
+  if (length <= 1.0e-12)
+    return FALSE;
+
+  vector[0] /= length;
+  vector[1] /= length;
+  vector[2] /= length;
+  return TRUE;
+}
+
+static gint
+gdis_int_gcd(gint left, gint right)
+{
+  left = ABS(left);
+  right = ABS(right);
+
+  while (right != 0)
+    {
+      gint remainder;
+
+      remainder = left % right;
+      left = right;
+      right = remainder;
+    }
+
+  return MAX(left, 1);
+}
+
+static void
+gdis_int_vector_reduce(gint vector[3])
+{
+  gint divisor;
+
+  divisor = gdis_int_gcd(vector[0], vector[1]);
+  divisor = gdis_int_gcd(divisor, vector[2]);
+  if (divisor <= 1)
+    return;
+
+  vector[0] /= divisor;
+  vector[1] /= divisor;
+  vector[2] /= divisor;
+}
+
+static gboolean
+gdis_surface_build_inplane_indices(gint h,
+                                   gint k,
+                                   gint l,
+                                   gint first[3],
+                                   gint second[3])
+{
+  gint hkl[3];
+
+  g_return_val_if_fail(first != NULL, FALSE);
+  g_return_val_if_fail(second != NULL, FALSE);
+
+  hkl[0] = h;
+  hkl[1] = k;
+  hkl[2] = l;
+
+  if (h != 0 || k != 0)
+    {
+      first[0] = k;
+      first[1] = -h;
+      first[2] = 0;
+    }
+  else if (l != 0)
+    {
+      first[0] = 1;
+      first[1] = 0;
+      first[2] = 0;
+    }
+  else
+    {
+      return FALSE;
+    }
+
+  second[0] = hkl[1] * first[2] - hkl[2] * first[1];
+  second[1] = hkl[2] * first[0] - hkl[0] * first[2];
+  second[2] = hkl[0] * first[1] - hkl[1] * first[0];
+
+  gdis_int_vector_reduce(first);
+  gdis_int_vector_reduce(second);
+
+  return !(first[0] == 0 && first[1] == 0 && first[2] == 0) &&
+         !(second[0] == 0 && second[1] == 0 && second[2] == 0);
+}
+
+static gboolean
+gdis_surface_build_cell_from_vectors(const gdouble a_vec[3],
+                                     const gdouble b_vec[3],
+                                     const gdouble c_vec[3],
+                                     gdouble lengths[3],
+                                     gdouble angles[3])
+{
+  gdouble a_length;
+  gdouble b_length;
+  gdouble c_length;
+
+  g_return_val_if_fail(a_vec != NULL, FALSE);
+  g_return_val_if_fail(b_vec != NULL, FALSE);
+  g_return_val_if_fail(c_vec != NULL, FALSE);
+  g_return_val_if_fail(lengths != NULL, FALSE);
+  g_return_val_if_fail(angles != NULL, FALSE);
+
+  a_length = gdis_vec3_length(a_vec);
+  b_length = gdis_vec3_length(b_vec);
+  c_length = gdis_vec3_length(c_vec);
+  if (a_length <= 1.0e-8 || b_length <= 1.0e-8 || c_length <= 1.0e-8)
+    return FALSE;
+
+  lengths[0] = a_length;
+  lengths[1] = b_length;
+  lengths[2] = c_length;
+  angles[0] = acos(CLAMP(gdis_vec3_dot(b_vec, c_vec) / (b_length * c_length), -1.0, 1.0)) * (180.0 / G_PI);
+  angles[1] = acos(CLAMP(gdis_vec3_dot(a_vec, c_vec) / (a_length * c_length), -1.0, 1.0)) * (180.0 / G_PI);
+  angles[2] = acos(CLAMP(gdis_vec3_dot(a_vec, b_vec) / (a_length * b_length), -1.0, 1.0)) * (180.0 / G_PI);
+  return TRUE;
+}
+
+static gchar *
+gdis_model_surface_default_path(const GdisModel *source,
+                                gint h,
+                                gint k,
+                                gint l)
+{
+  g_autofree gchar *base = NULL;
+  gchar *dot;
+
+  g_return_val_if_fail(source != NULL, NULL);
+
+  base = g_strdup(source->basename ? source->basename : "surface");
+  dot = strrchr(base, '.');
+  if (dot)
+    *dot = '\0';
+
+  return g_strdup_printf("%s-surface-%d_%d_%d.cif", base, h, k, l);
+}
+
+static gboolean
 gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble inverse[9])
 {
   gdouble alpha;
@@ -2818,7 +3569,6 @@ gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble 
   gdouble cx;
   gdouble cy;
   gdouble cz_sq;
-  gdouble det;
 
   if (!gdis_model_has_valid_cell(model))
     return FALSE;
@@ -2855,23 +3605,7 @@ gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble 
   if (!inverse)
     return TRUE;
 
-  det = matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7]) -
-        matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6]) +
-        matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
-  if (fabs(det) < 1.0e-12)
-    return FALSE;
-
-  inverse[0] =  (matrix[4] * matrix[8] - matrix[5] * matrix[7]) / det;
-  inverse[1] = -(matrix[1] * matrix[8] - matrix[2] * matrix[7]) / det;
-  inverse[2] =  (matrix[1] * matrix[5] - matrix[2] * matrix[4]) / det;
-  inverse[3] = -(matrix[3] * matrix[8] - matrix[5] * matrix[6]) / det;
-  inverse[4] =  (matrix[0] * matrix[8] - matrix[2] * matrix[6]) / det;
-  inverse[5] = -(matrix[0] * matrix[5] - matrix[2] * matrix[3]) / det;
-  inverse[6] =  (matrix[3] * matrix[7] - matrix[4] * matrix[6]) / det;
-  inverse[7] = -(matrix[0] * matrix[7] - matrix[1] * matrix[6]) / det;
-  inverse[8] =  (matrix[0] * matrix[4] - matrix[1] * matrix[3]) / det;
-
-  return TRUE;
+  return gdis_model_invert_matrix3(matrix, inverse);
 }
 
 static void
@@ -3008,6 +3742,33 @@ static gchar *
 gdis_pdb_guess_element(const gchar *atom_name)
 {
   return gdis_normalize_element_symbol(atom_name);
+}
+
+static gboolean
+gdis_arc_like_type_is_marvin_label(const gchar *text)
+{
+  g_return_val_if_fail(text != NULL, FALSE);
+
+  if (strlen(text) < 4)
+    return FALSE;
+
+  return (text[0] == 'R' || text[0] == 'r') &&
+         g_ascii_isdigit(text[1]) &&
+         (text[2] == 'A' || text[2] == 'a' ||
+          text[2] == 'B' || text[2] == 'b') &&
+         (text[3] == 'C' || text[3] == 'c' ||
+          text[3] == 'S' || text[3] == 's');
+}
+
+static gint
+gdis_arc_like_region_from_type(const gchar *text)
+{
+  g_return_val_if_fail(text != NULL, -1);
+
+  if (!gdis_arc_like_type_is_marvin_label(text))
+    return -1;
+
+  return (gint) (text[1] - '1');
 }
 
 static gboolean

@@ -109,6 +109,14 @@ How to use the current tools:
   - `Distance`
   - `Angle`
   - `Torsion`
+- The main menu now restores more of the legacy interaction surface:
+  - `File > New`
+  - `Edit > Delete Selected`
+  - `Edit > Select All`
+  - `Edit > Invert Selection`
+  - `View > Display Properties`
+  - `View > Reset Model Images`
+  - `Help > Manual`
 - `Tools > Edit` now opens the model editor window.
 - In `Edit`, the fields follow the currently selected atom in the viewer.
 - The viewer selection mode buttons now change what a click selects.
@@ -135,7 +143,8 @@ How to use the current tools:
   - bake a true supercell into the loaded model
 - `Tools > Surface` shows low-index planes and d-spacings for periodic models.
 - `Tools > Diffraction` shows a lightweight powder X-ray preview for 3D periodic models.
-- `Tools > Render` shows the current viewer controls and toggle state.
+- `Tools > Render` now opens a GTK4 display-properties window with viewer toggles, view presets, and image reset.
+- A detailed legacy-vs-GTK4 parity matrix now lives in `../RESTORATION_AUDIT.md`.
 
 Helpful checks:
 ```sh
