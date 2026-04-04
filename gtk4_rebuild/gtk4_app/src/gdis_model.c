@@ -15,12 +15,28 @@ typedef struct
 
 typedef struct
 {
+  gchar *title;
+  gchar *space_group;
+  gboolean periodic;
+  guint periodicity;
+  gdouble cell_lengths[3];
+  gdouble cell_angles[3];
+  GPtrArray *atoms;
+} GdisModelFrame;
+
+typedef struct
+{
   const char *symbol;
   gdouble radius;
 } GdisRadiusEntry;
 
 static GdisModel *gdis_model_new(const char *path, GdisModelFormat format);
 static void gdis_model_clear_contents(GdisModel *model);
+static GdisModelFrame *gdis_model_frame_new(void);
+static void gdis_model_frame_free(gpointer data);
+static GdisModelFrame *gdis_model_frame_clone(const GdisModelFrame *frame);
+static void gdis_model_frame_apply(GdisModel *model, const GdisModelFrame *frame);
+static gboolean gdis_model_frame_bonds_need_reset(const GdisModel *model);
 static gboolean gdis_model_load_xyz(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_pdb(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_arc_like(GdisModel *model,
@@ -280,6 +296,15 @@ gdis_model_clone(const GdisModel *model)
   if (model->bonds && model->bonds->len > 0)
     g_array_append_vals(copy->bonds, model->bonds->data, model->bonds->len);
 
+  if (model->frames && model->frames->len > 0)
+    {
+      copy->frames = g_ptr_array_new_with_free_func(gdis_model_frame_free);
+      for (i = 0; i < model->frames->len; i++)
+        g_ptr_array_add(copy->frames,
+                        gdis_model_frame_clone(g_ptr_array_index(model->frames, i)));
+    }
+  copy->current_frame_index = model->current_frame_index;
+
   return copy;
 }
 
@@ -336,8 +361,11 @@ gdis_model_clear_contents(GdisModel *model)
     g_ptr_array_free(model->atoms, TRUE);
   if (model->bonds)
     g_array_free(model->bonds, TRUE);
+  if (model->frames)
+    g_ptr_array_free(model->frames, TRUE);
   model->atoms = NULL;
   model->bonds = NULL;
+  model->frames = NULL;
 }
 
 gboolean
@@ -466,6 +494,8 @@ gdis_model_delete_atoms(GdisModel *model,
       return FALSE;
     }
 
+  gdis_model_discard_frames(model);
+
   new_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
   for (i = 0; i < old_len; i++)
     {
@@ -562,6 +592,7 @@ gdis_model_add_atom(GdisModel *model,
                        1.0,
                        region,
                        model->atoms->len + 1);
+  gdis_model_discard_frames(model);
   g_ptr_array_add(model->atoms, atom);
 
   gdis_model_refresh_counts(model);
@@ -612,6 +643,7 @@ gdis_model_update_atom(GdisModel *model,
     }
 
   atom = g_ptr_array_index(model->atoms, atom_index);
+  gdis_model_discard_frames(model);
   new_label = g_strdup((label && *label) ? label : normalized_element);
   normalized_ff_type = g_strdup((ff_type && *ff_type) ? ff_type : normalized_element);
 
@@ -664,6 +696,7 @@ gdis_model_add_explicit_bond(GdisModel *model,
     }
 
   gdis_model_make_all_bonds_explicit(model);
+  gdis_model_discard_frames(model);
   bond_index = gdis_model_find_bond_index(model, atom_index_a, atom_index_b);
   if (bond_index >= 0)
     {
@@ -711,6 +744,7 @@ gdis_model_remove_bond(GdisModel *model,
     }
 
   gdis_model_make_all_bonds_explicit(model);
+  gdis_model_discard_frames(model);
   bond_index = gdis_model_find_bond_index(model, atom_index_a, atom_index_b);
   if (bond_index < 0)
     {
@@ -839,6 +873,7 @@ gdis_model_confine_atoms_to_cell(GdisModel *model, GError **error)
       gdis_frac_to_cart(matrix, frac, atom->position);
     }
 
+  gdis_model_discard_frames(model);
   if (model->explicit_bond_count == 0)
     gdis_model_reset_inferred_bonds(model);
   gdis_model_finalize_metadata(model);
@@ -1042,6 +1077,7 @@ gdis_model_confine_molecules_to_cell(GdisModel *model, GError **error)
   g_free(unwrapped_positions);
   g_free(component_ids);
 
+  gdis_model_discard_frames(model);
   if (model->explicit_bond_count == 0)
     gdis_model_reset_inferred_bonds(model);
   gdis_model_finalize_metadata(model);
@@ -1066,6 +1102,7 @@ gdis_model_force_p1(GdisModel *model, GError **error)
   model->space_group = g_strdup("P 1");
   if (model->periodicity == 0)
     model->periodicity = 3;
+  gdis_model_discard_frames(model);
   gdis_model_finalize_metadata(model);
   return TRUE;
 }
@@ -1218,6 +1255,7 @@ gdis_model_make_supercell(GdisModel *model,
   if (repeat_a == 1 && repeat_b == 1 && repeat_c == 1)
     return TRUE;
 
+  gdis_model_discard_frames(model);
   old_atoms = model->atoms;
   old_bonds = model->bonds;
   old_atom_count = old_atoms ? old_atoms->len : 0u;
@@ -1797,6 +1835,107 @@ gdis_model_reset_inferred_bonds(GdisModel *model)
   return TRUE;
 }
 
+guint
+gdis_model_get_frame_count(const GdisModel *model)
+{
+  g_return_val_if_fail(model != NULL, 0u);
+
+  if (model->frames && model->frames->len > 0)
+    return model->frames->len;
+
+  return model->atoms && model->atoms->len > 0 ? 1u : 0u;
+}
+
+guint
+gdis_model_get_current_frame_index(const GdisModel *model)
+{
+  g_return_val_if_fail(model != NULL, 0u);
+
+  return model->current_frame_index;
+}
+
+const char *
+gdis_model_get_frame_title(const GdisModel *model, guint frame_index)
+{
+  GdisModelFrame *frame;
+
+  g_return_val_if_fail(model != NULL, NULL);
+
+  if (!model->frames || frame_index >= model->frames->len)
+    {
+      if (frame_index == 0u)
+        return model->title;
+      return NULL;
+    }
+
+  frame = g_ptr_array_index(model->frames, frame_index);
+  return frame ? frame->title : NULL;
+}
+
+gboolean
+gdis_model_set_frame_index(GdisModel *model, guint frame_index, GError **error)
+{
+  GdisModelFrame *frame;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  if (!model->frames || model->frames->len == 0u)
+    {
+      if (frame_index == 0u)
+        {
+          model->current_frame_index = 0u;
+          return TRUE;
+        }
+
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The current model does not contain multiple animation frames.");
+      return FALSE;
+    }
+
+  if (frame_index >= model->frames->len)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Requested frame %u is outside the available range 1..%u.",
+                  frame_index + 1u,
+                  model->frames->len);
+      return FALSE;
+    }
+
+  frame = g_ptr_array_index(model->frames, frame_index);
+  if (!frame)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Requested frame %u could not be loaded.",
+                  frame_index + 1u);
+      return FALSE;
+    }
+
+  gdis_model_frame_apply(model, frame);
+  if (model->explicit_bond_count == 0u)
+    gdis_model_reset_inferred_bonds(model);
+  else
+    gdis_model_finalize_metadata(model);
+  model->current_frame_index = frame_index;
+  return TRUE;
+}
+
+void
+gdis_model_discard_frames(GdisModel *model)
+{
+  g_return_if_fail(model != NULL);
+
+  if (model->frames)
+    g_ptr_array_set_size(model->frames, 0u);
+  g_clear_pointer(&model->frames, g_ptr_array_unref);
+  model->current_frame_index = 0u;
+}
+
 static GdisModel *
 gdis_model_new(const char *path, GdisModelFormat format)
 {
@@ -1809,12 +1948,153 @@ gdis_model_new(const char *path, GdisModelFormat format)
   model->format_label = g_strdup(gdis_model_format_label(format));
   model->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
   model->bonds = g_array_new(FALSE, FALSE, sizeof(GdisBond));
+  model->frames = NULL;
+  model->current_frame_index = 0u;
   model->cell_angles[0] = 90.0;
   model->cell_angles[1] = 90.0;
   model->cell_angles[2] = 90.0;
   gdis_model_init_image_limits(model);
 
   return model;
+}
+
+static GdisModelFrame *
+gdis_model_frame_new(void)
+{
+  GdisModelFrame *frame;
+
+  frame = g_new0(GdisModelFrame, 1);
+  frame->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  frame->cell_angles[0] = 90.0;
+  frame->cell_angles[1] = 90.0;
+  frame->cell_angles[2] = 90.0;
+  return frame;
+}
+
+static void
+gdis_model_frame_free(gpointer data)
+{
+  GdisModelFrame *frame;
+
+  frame = data;
+  if (!frame)
+    return;
+
+  g_clear_pointer(&frame->title, g_free);
+  g_clear_pointer(&frame->space_group, g_free);
+  g_clear_pointer(&frame->atoms, g_ptr_array_unref);
+  g_free(frame);
+}
+
+static GdisModelFrame *
+gdis_model_frame_clone(const GdisModelFrame *frame)
+{
+  GdisModelFrame *copy;
+
+  g_return_val_if_fail(frame != NULL, NULL);
+
+  copy = gdis_model_frame_new();
+  copy->title = g_strdup(frame->title);
+  copy->space_group = g_strdup(frame->space_group);
+  copy->periodic = frame->periodic;
+  copy->periodicity = frame->periodicity;
+  memcpy(copy->cell_lengths, frame->cell_lengths, sizeof(copy->cell_lengths));
+  memcpy(copy->cell_angles, frame->cell_angles, sizeof(copy->cell_angles));
+
+  if (frame->atoms)
+    {
+      for (guint i = 0; i < frame->atoms->len; i++)
+        {
+          const GdisAtom *atom;
+
+          atom = g_ptr_array_index(frame->atoms, i);
+          g_ptr_array_add(copy->atoms,
+                          gdis_atom_new(atom->label,
+                                        atom->element,
+                                        atom->ff_type,
+                                        atom->position[0],
+                                        atom->position[1],
+                                        atom->position[2],
+                                        atom->occupancy,
+                                        atom->region,
+                                        atom->serial));
+        }
+    }
+
+  return copy;
+}
+
+static gboolean
+gdis_model_frame_bonds_need_reset(const GdisModel *model)
+{
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  if (!model->bonds || !model->atoms)
+    return FALSE;
+
+  for (guint i = 0; i < model->bonds->len; i++)
+    {
+      const GdisBond *bond;
+
+      bond = &g_array_index(model->bonds, GdisBond, i);
+      if (bond->atom_index_a >= model->atoms->len ||
+          bond->atom_index_b >= model->atoms->len)
+        return TRUE;
+    }
+
+  return FALSE;
+}
+
+static void
+gdis_model_frame_apply(GdisModel *model, const GdisModelFrame *frame)
+{
+  GPtrArray *atoms;
+
+  g_return_if_fail(model != NULL);
+  g_return_if_fail(frame != NULL);
+
+  atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  if (frame->atoms)
+    {
+      for (guint i = 0; i < frame->atoms->len; i++)
+        {
+          const GdisAtom *atom;
+
+          atom = g_ptr_array_index(frame->atoms, i);
+          g_ptr_array_add(atoms,
+                          gdis_atom_new(atom->label,
+                                        atom->element,
+                                        atom->ff_type,
+                                        atom->position[0],
+                                        atom->position[1],
+                                        atom->position[2],
+                                        atom->occupancy,
+                                        atom->region,
+                                        atom->serial));
+        }
+    }
+
+  if (model->atoms)
+    g_ptr_array_free(model->atoms, TRUE);
+  model->atoms = atoms;
+
+  g_clear_pointer(&model->title, g_free);
+  model->title = g_strdup(frame->title);
+  g_clear_pointer(&model->space_group, g_free);
+  model->space_group = g_strdup(frame->space_group);
+  model->periodic = frame->periodic;
+  model->periodicity = frame->periodicity;
+  memcpy(model->cell_lengths, frame->cell_lengths, sizeof(model->cell_lengths));
+  memcpy(model->cell_angles, frame->cell_angles, sizeof(model->cell_angles));
+
+  if (gdis_model_frame_bonds_need_reset(model))
+    {
+      if (model->bonds)
+        g_array_set_size(model->bonds, 0u);
+      model->explicit_bond_count = 0u;
+    }
+
+  gdis_model_finalize_metadata(model);
 }
 
 static void
@@ -1936,112 +2216,166 @@ static gboolean
 gdis_model_load_xyz(GdisModel *model, const gchar *contents, GError **error)
 {
   gchar **lines;
-  gchar *endptr;
-  glong expected_atoms;
   guint line_index;
-  guint parsed_atoms;
+  GPtrArray *frames;
+  gboolean ok;
 
   lines = g_strsplit(contents, "\n", -1);
-  if (!lines[0])
+  frames = g_ptr_array_new_with_free_func(gdis_model_frame_free);
+  ok = FALSE;
+  line_index = 0u;
+
+  while (lines[line_index] != NULL)
+    {
+      GdisModelFrame *frame;
+      gchar *endptr;
+      glong expected_atoms;
+      guint parsed_atoms;
+
+      g_strchomp(lines[line_index]);
+      if (g_strstrip(lines[line_index])[0] == '\0')
+        {
+          line_index++;
+          continue;
+        }
+
+      expected_atoms = g_ascii_strtoll(lines[line_index], &endptr, 10);
+      if (endptr == lines[line_index] || expected_atoms < 0)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "XYZ atom count header is invalid at line %u in '%s'.",
+                      line_index + 1u,
+                      model->path);
+          goto xyz_done;
+        }
+
+      if (lines[line_index + 1u] == NULL)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "XYZ file '%s' ended before the frame title line.",
+                      model->path);
+          goto xyz_done;
+        }
+
+      frame = gdis_model_frame_new();
+      g_strchomp(lines[line_index + 1u]);
+      frame->title = gdis_strdup_strip(lines[line_index + 1u]);
+      if (!frame->title || frame->title[0] == '\0')
+        {
+          g_clear_pointer(&frame->title, g_free);
+          frame->title = g_strdup_printf("%s frame %u",
+                                         model->basename ? model->basename : "trajectory",
+                                         frames->len + 1u);
+        }
+
+      line_index += 2u;
+      parsed_atoms = 0u;
+      while (lines[line_index] != NULL && parsed_atoms < (guint) expected_atoms)
+        {
+          gint token_count;
+          gchar **tokens;
+          gchar *element;
+          gdouble x;
+          gdouble y;
+          gdouble z;
+
+          g_strchomp(lines[line_index]);
+          if (g_strstrip(lines[line_index])[0] == '\0')
+            {
+              line_index++;
+              continue;
+            }
+
+          tokens = gdis_split_simple(lines[line_index], &token_count);
+          if (token_count < 4)
+            {
+              g_strfreev(tokens);
+              gdis_model_frame_free(frame);
+              g_set_error(error,
+                          GDIS_MODEL_ERROR,
+                          GDIS_MODEL_ERROR_PARSE,
+                          "XYZ atom line %u is incomplete in '%s'.",
+                          line_index + 1u,
+                          model->path);
+              goto xyz_done;
+            }
+
+          if (!gdis_try_parse_double(tokens[1], &x) ||
+              !gdis_try_parse_double(tokens[2], &y) ||
+              !gdis_try_parse_double(tokens[3], &z))
+            {
+              g_strfreev(tokens);
+              gdis_model_frame_free(frame);
+              g_set_error(error,
+                          GDIS_MODEL_ERROR,
+                          GDIS_MODEL_ERROR_PARSE,
+                          "XYZ atom line %u has invalid coordinates in '%s'.",
+                          line_index + 1u,
+                          model->path);
+              goto xyz_done;
+            }
+
+          element = gdis_normalize_element_symbol(tokens[0]);
+          g_ptr_array_add(frame->atoms,
+                          gdis_atom_new(tokens[0],
+                                        element,
+                                        element,
+                                        x,
+                                        y,
+                                        z,
+                                        1.0,
+                                        -1,
+                                        parsed_atoms + 1u));
+          g_free(element);
+          g_strfreev(tokens);
+          parsed_atoms++;
+          line_index++;
+        }
+
+      if (parsed_atoms != (guint) expected_atoms)
+        {
+          gdis_model_frame_free(frame);
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "XYZ atom count mismatch in '%s': expected %ld, parsed %u.",
+                      model->path,
+                      expected_atoms,
+                      parsed_atoms);
+          goto xyz_done;
+        }
+
+      g_ptr_array_add(frames, frame);
+    }
+
+  if (frames->len == 0u)
     {
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_PARSE,
                   "XYZ file '%s' is empty.",
                   model->path);
-      g_strfreev(lines);
-      return FALSE;
+      goto xyz_done;
     }
 
-  g_strchomp(lines[0]);
-  expected_atoms = g_ascii_strtoll(g_strstrip(lines[0]), &endptr, 10);
-  if (endptr == lines[0] || expected_atoms < 0)
+  gdis_model_frame_apply(model, g_ptr_array_index(frames, 0u));
+  model->current_frame_index = 0u;
+  if (frames->len > 1u)
     {
-      g_set_error(error,
-                  GDIS_MODEL_ERROR,
-                  GDIS_MODEL_ERROR_PARSE,
-                  "XYZ atom count header is invalid in '%s'.",
-                  model->path);
-      g_strfreev(lines);
-      return FALSE;
+      model->frames = frames;
+      frames = NULL;
     }
+  ok = TRUE;
 
-  if (lines[1])
-    {
-      g_strchomp(lines[1]);
-      model->title = gdis_strdup_strip(lines[1]);
-    }
-
-  parsed_atoms = 0;
-  for (line_index = 2; lines[line_index] != NULL; line_index++)
-    {
-      gint token_count;
-      gchar **tokens;
-      gchar *element;
-      gdouble x;
-      gdouble y;
-      gdouble z;
-
-      g_strchomp(lines[line_index]);
-      if (g_strstrip(lines[line_index])[0] == '\0')
-        continue;
-
-      tokens = gdis_split_simple(lines[line_index], &token_count);
-      if (token_count < 4)
-        {
-          g_strfreev(tokens);
-          continue;
-        }
-
-      if (!gdis_try_parse_double(tokens[1], &x) ||
-          !gdis_try_parse_double(tokens[2], &y) ||
-          !gdis_try_parse_double(tokens[3], &z))
-        {
-          g_strfreev(tokens);
-          g_set_error(error,
-                      GDIS_MODEL_ERROR,
-                      GDIS_MODEL_ERROR_PARSE,
-                      "XYZ atom line %u has invalid coordinates in '%s'.",
-                      line_index + 1,
-                      model->path);
-          g_strfreev(lines);
-          return FALSE;
-        }
-
-      element = gdis_normalize_element_symbol(tokens[0]);
-      g_ptr_array_add(model->atoms,
-                      gdis_atom_new(tokens[0],
-                                    element,
-                                    element,
-                                    x,
-                                    y,
-                                    z,
-                                    1.0,
-                                    -1,
-                                    parsed_atoms + 1));
-      g_free(element);
-      parsed_atoms++;
-      g_strfreev(tokens);
-
-      if (expected_atoms > 0 && parsed_atoms >= (guint) expected_atoms)
-        break;
-    }
-
+xyz_done:
+  if (frames)
+    g_ptr_array_free(frames, TRUE);
   g_strfreev(lines);
-
-  if (expected_atoms > 0 && parsed_atoms != (guint) expected_atoms)
-    {
-      g_set_error(error,
-                  GDIS_MODEL_ERROR,
-                  GDIS_MODEL_ERROR_PARSE,
-                  "XYZ atom count mismatch in '%s': expected %ld, parsed %u.",
-                  model->path,
-                  expected_atoms,
-                  parsed_atoms);
-      return FALSE;
-    }
-
-  return TRUE;
+  return ok;
 }
 
 static gboolean
@@ -2291,15 +2625,23 @@ gdis_model_load_arc_like(GdisModel *model,
                          GError **error)
 {
   gchar **lines;
-  gboolean in_first_frame;
+  GPtrArray *frames;
+  GdisModelFrame *current_frame;
+  gchar *header_title;
   gboolean header_pbc_2d;
-  guint end_count;
+  gboolean header_periodic;
+  guint header_periodicity;
   guint i;
+  gboolean ok;
 
   lines = g_strsplit(contents, "\n", -1);
-  in_first_frame = FALSE;
+  frames = g_ptr_array_new_with_free_func(gdis_model_frame_free);
+  current_frame = NULL;
+  header_title = NULL;
   header_pbc_2d = FALSE;
-  end_count = 0;
+  header_periodic = FALSE;
+  header_periodicity = 0u;
+  ok = FALSE;
 
   for (i = 0; lines[i] != NULL; i++)
     {
@@ -2314,7 +2656,7 @@ gdis_model_load_arc_like(GdisModel *model,
       if (line[0] == '\0')
         continue;
 
-      if (!in_first_frame)
+      if (!current_frame)
         {
           if (g_ascii_strncasecmp(line, "!BIOSYM", 7) == 0 ||
               g_ascii_strncasecmp(line, "!MSI", 4) == 0)
@@ -2330,20 +2672,20 @@ gdis_model_load_arc_like(GdisModel *model,
 
               if (g_ascii_strncasecmp(value, "2D", 2) == 0)
                 {
-                  model->periodic = TRUE;
-                  model->periodicity = 2;
+                  header_periodic = TRUE;
+                  header_periodicity = 2u;
                   header_pbc_2d = TRUE;
                 }
               else if (g_ascii_strncasecmp(value, "ON", 2) == 0)
                 {
-                  model->periodic = TRUE;
-                  model->periodicity = 3;
+                  header_periodic = TRUE;
+                  header_periodicity = 3u;
                   header_pbc_2d = FALSE;
                 }
               else if (g_ascii_strncasecmp(value, "OFF", 3) == 0)
                 {
-                  model->periodic = FALSE;
-                  model->periodicity = 0;
+                  header_periodic = FALSE;
+                  header_periodicity = 0u;
                   header_pbc_2d = FALSE;
                 }
               continue;
@@ -2351,26 +2693,46 @@ gdis_model_load_arc_like(GdisModel *model,
 
           if (g_ascii_strncasecmp(line, "!DATE", 5) == 0)
             {
-              in_first_frame = TRUE;
+              current_frame = gdis_model_frame_new();
+              current_frame->periodic = header_periodic;
+              current_frame->periodicity = header_periodicity;
+              current_frame->title = g_strdup((header_title && header_title[0] != '\0')
+                                              ? header_title
+                                              : (model->basename ? model->basename : "model"));
+              current_frame->cell_angles[0] = 90.0;
+              current_frame->cell_angles[1] = 90.0;
+              current_frame->cell_angles[2] = 90.0;
               continue;
             }
 
           if (line[0] != '!')
             {
-              g_clear_pointer(&model->title, g_free);
-              model->title = gdis_strdup_strip(line);
+              g_clear_pointer(&header_title, g_free);
+              header_title = gdis_strdup_strip(line);
             }
           continue;
         }
 
       if (g_ascii_strncasecmp(line, "end", 3) == 0)
         {
-          end_count++;
-          if (end_count >= 2)
-            break;
+          if (current_frame->atoms->len > 0u)
+            {
+              if (!current_frame->title || current_frame->title[0] == '\0')
+                {
+                  g_clear_pointer(&current_frame->title, g_free);
+                  current_frame->title = g_strdup_printf("%s frame %u",
+                                                         model->basename ? model->basename : "model",
+                                                         frames->len + 1u);
+                }
+              g_ptr_array_add(frames, current_frame);
+            }
+          else
+            {
+              gdis_model_frame_free(current_frame);
+            }
+          current_frame = NULL;
           continue;
         }
-      end_count = 0;
 
       if (g_ascii_strncasecmp(line, "PBC", 3) == 0)
         {
@@ -2379,7 +2741,7 @@ gdis_model_load_arc_like(GdisModel *model,
 
           tokens = gdis_split_simple(line, &token_count);
           paren_start = strchr(line, '(');
-          if (paren_start)
+          if (paren_start && current_frame)
             {
               gchar *space_group;
 
@@ -2390,8 +2752,8 @@ gdis_model_load_arc_like(GdisModel *model,
                   g_strstrip(space_group);
                   if (space_group[0] != '\0')
                     {
-                      g_clear_pointer(&model->space_group, g_free);
-                      model->space_group = space_group;
+                      g_clear_pointer(&current_frame->space_group, g_free);
+                      current_frame->space_group = space_group;
                     }
                   else
                     {
@@ -2402,31 +2764,32 @@ gdis_model_load_arc_like(GdisModel *model,
 
           if (token_count >= 7)
             {
-              model->cell_lengths[0] = g_ascii_strtod(tokens[1], NULL);
-              model->cell_lengths[1] = g_ascii_strtod(tokens[2], NULL);
-              model->cell_lengths[2] = g_ascii_strtod(tokens[3], NULL);
-              model->cell_angles[0] = g_ascii_strtod(tokens[4], NULL);
-              model->cell_angles[1] = g_ascii_strtod(tokens[5], NULL);
-              model->cell_angles[2] = g_ascii_strtod(tokens[6], NULL);
-              model->periodic = TRUE;
-              model->periodicity = (header_pbc_2d || model->cell_lengths[2] <= 0.0) ? 2u : 3u;
-              if (model->periodicity == 2)
+              current_frame->cell_lengths[0] = g_ascii_strtod(tokens[1], NULL);
+              current_frame->cell_lengths[1] = g_ascii_strtod(tokens[2], NULL);
+              current_frame->cell_lengths[2] = g_ascii_strtod(tokens[3], NULL);
+              current_frame->cell_angles[0] = g_ascii_strtod(tokens[4], NULL);
+              current_frame->cell_angles[1] = g_ascii_strtod(tokens[5], NULL);
+              current_frame->cell_angles[2] = g_ascii_strtod(tokens[6], NULL);
+              current_frame->periodic = TRUE;
+              current_frame->periodicity =
+                (header_pbc_2d || current_frame->cell_lengths[2] <= 0.0) ? 2u : 3u;
+              if (current_frame->periodicity == 2)
                 {
-                  model->cell_lengths[2] = 1.0;
-                  model->cell_angles[0] = 90.0;
-                  model->cell_angles[1] = 90.0;
+                  current_frame->cell_lengths[2] = 1.0;
+                  current_frame->cell_angles[0] = 90.0;
+                  current_frame->cell_angles[1] = 90.0;
                 }
             }
           else if (token_count >= 4)
             {
-              model->cell_lengths[0] = g_ascii_strtod(tokens[1], NULL);
-              model->cell_lengths[1] = g_ascii_strtod(tokens[2], NULL);
-              model->cell_lengths[2] = 1.0;
-              model->cell_angles[0] = 90.0;
-              model->cell_angles[1] = 90.0;
-              model->cell_angles[2] = g_ascii_strtod(tokens[3], NULL);
-              model->periodic = TRUE;
-              model->periodicity = 2;
+              current_frame->cell_lengths[0] = g_ascii_strtod(tokens[1], NULL);
+              current_frame->cell_lengths[1] = g_ascii_strtod(tokens[2], NULL);
+              current_frame->cell_lengths[2] = 1.0;
+              current_frame->cell_angles[0] = 90.0;
+              current_frame->cell_angles[1] = 90.0;
+              current_frame->cell_angles[2] = g_ascii_strtod(tokens[3], NULL);
+              current_frame->periodic = TRUE;
+              current_frame->periodicity = 2u;
             }
           g_strfreev(tokens);
           continue;
@@ -2483,7 +2846,7 @@ gdis_model_load_arc_like(GdisModel *model,
           else
             element = gdis_normalize_element_symbol(tokens[0]);
 
-          g_ptr_array_add(model->atoms,
+          g_ptr_array_add(current_frame->atoms,
                           gdis_atom_new(tokens[0],
                                         element,
                                         (ff_type && ff_type[0] != '\0') ? ff_type : element,
@@ -2492,27 +2855,49 @@ gdis_model_load_arc_like(GdisModel *model,
                                         z,
                                         occupancy,
                                         region,
-                                        model->atoms->len + 1));
+                                        current_frame->atoms->len + 1u));
           g_free(ff_type);
           g_free(element);
         }
       g_strfreev(tokens);
     }
 
-  g_strfreev(lines);
+  if (current_frame)
+    {
+      if (current_frame->atoms->len > 0u)
+        g_ptr_array_add(frames, current_frame);
+      else
+        gdis_model_frame_free(current_frame);
+      current_frame = NULL;
+    }
 
-  if (model->atoms->len == 0)
+  if (frames->len == 0u)
     {
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_PARSE,
-                  "No atoms were parsed from the first %s frame in '%s'.",
+                  "No atoms were parsed from any %s frame in '%s'.",
                   gdis_model_format_label(format),
                   model->path);
-      return FALSE;
+      goto arc_done;
     }
 
-  return TRUE;
+  gdis_model_frame_apply(model, g_ptr_array_index(frames, 0u));
+  model->current_frame_index = 0u;
+  if (frames->len > 1u)
+    {
+      model->frames = frames;
+      frames = NULL;
+    }
+  ok = TRUE;
+
+arc_done:
+  g_strfreev(lines);
+  g_free(header_title);
+  if (frames)
+    g_ptr_array_free(frames, TRUE);
+
+  return ok;
 }
 
 static gboolean

@@ -64,6 +64,8 @@ typedef struct
 
   GPtrArray *atoms;
   GArray *bonds;
+  GPtrArray *frames;
+  guint current_frame_index;
 } GdisModel;
 
 GQuark gdis_model_error_quark(void);
@@ -143,6 +145,14 @@ GdisModelFormat gdis_model_format_from_path(const char *path);
 const char *gdis_model_format_label(GdisModelFormat format);
 
 gboolean gdis_model_reset_inferred_bonds(GdisModel *model);
+guint gdis_model_get_frame_count(const GdisModel *model);
+guint gdis_model_get_current_frame_index(const GdisModel *model);
+const char *gdis_model_get_frame_title(const GdisModel *model,
+                                       guint frame_index);
+gboolean gdis_model_set_frame_index(GdisModel *model,
+                                    guint frame_index,
+                                    GError **error);
+void gdis_model_discard_frames(GdisModel *model);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GdisModel, gdis_model_free)
 

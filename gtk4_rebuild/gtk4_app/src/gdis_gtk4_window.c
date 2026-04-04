@@ -4,9 +4,13 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <glib/gstdio.h>
 
+#include "gdis_elements.h"
 #include "gdis_legacy_map.h"
+#include "gdis_isosurface.h"
 #include "gdis_model.h"
+#include "gdis_restoration.h"
 #include "gdis_reports.h"
 
 typedef struct
@@ -19,6 +23,13 @@ typedef struct
   gdouble depth;
   gdouble radius;
 } GdisProjectedAtom;
+
+typedef struct
+{
+  gdouble screen[3][2];
+  gdouble depth;
+  gdouble shade;
+} GdisProjectedTriangle;
 
 typedef struct
 {
@@ -102,6 +113,127 @@ typedef struct _GdisSurfaceTool
   GtkTextBuffer *report_buffer;
 } GdisSurfaceTool;
 
+typedef struct _GdisIsosurfaceTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *mode_dropdown;
+  GtkWidget *grid_spin;
+  GtkWidget *blur_spin;
+  GtkWidget *value_spin;
+  GtkWidget *execute_button;
+  GtkWidget *clear_button;
+  GtkTextBuffer *report_buffer;
+} GdisIsosurfaceTool;
+
+typedef struct _GdisAnimationTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *play_button;
+  GtkWidget *frame_scale;
+  GtkWidget *delay_spin;
+  GtkWidget *step_spin;
+  GtkWidget *loop_toggle;
+  GtkWidget *preserve_connectivity_toggle;
+  GtkWidget *preserve_scale_toggle;
+  GtkWidget *confine_none_toggle;
+  GtkWidget *confine_atoms_toggle;
+  GtkWidget *confine_molecules_toggle;
+  GtkLabel *summary_label;
+  GtkLabel *processing_label;
+  GtkLabel *rendering_label;
+  guint timer_id;
+  gboolean suppress_scale_signal;
+} GdisAnimationTool;
+
+typedef struct _GdisRecordingTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *output_entry;
+  GtkWidget *prefix_entry;
+  GtkWidget *width_spin;
+  GtkWidget *height_spin;
+  GtkWidget *movie_enable_toggle;
+  GtkWidget *movie_mp4_toggle;
+  GtkWidget *movie_gif_toggle;
+  GtkWidget *fps_spin;
+  GtkWidget *keep_frames_toggle;
+  GtkWidget *movie_button;
+  GtkLabel *summary_label;
+} GdisRecordingTool;
+
+typedef struct _GdisZmatrixTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *scope_dropdown;
+  GtkWidget *row_spin;
+  GtkWidget *distance_entry;
+  GtkWidget *angle_entry;
+  GtkWidget *torsion_entry;
+  GtkLabel *row_label;
+  GtkTextBuffer *buffer;
+  GArray *scope;
+  GArray *rows;
+  gboolean suppress_row_signal;
+} GdisZmatrixTool;
+
+typedef struct _GdisDislocationTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *type_dropdown;
+  GtkWidget *line_entries[3];
+  GtkWidget *burgers_entries[3];
+  GtkWidget *origin_entries[3];
+  GtkWidget *radius_spin;
+  GtkWidget *poisson_spin;
+  GtkWidget *selection_toggle;
+  GtkTextBuffer *buffer;
+} GdisDislocationTool;
+
+typedef struct _GdisDockingTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *output_entry;
+  GtkWidget *name_entry;
+  GtkWidget *grid_spins[3];
+  GtkWidget *rotation_spins[3];
+  GtkWidget *span_spins[3];
+  GtkWidget *preview_spin;
+  GtkTextBuffer *buffer;
+} GdisDockingTool;
+
+typedef struct _GdisPeriodicTableTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkLabel *title_label;
+  GtkLabel *info_label;
+  GtkWidget *copy_button;
+  GtkWidget *apply_button;
+  guint selected_atomic_number;
+} GdisPeriodicTableTool;
+
+typedef struct _GdisTaskManagerTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkTextBuffer *buffer;
+} GdisTaskManagerTool;
+
+typedef struct _GdisExecutablePathsTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkTextBuffer *preview_buffer;
+  GtkWidget *entries[8];
+  gchar *focus_backend;
+} GdisExecutablePathsTool;
+
 typedef struct
 {
   struct _GdisGtk4Window *owner;
@@ -133,6 +265,20 @@ typedef enum
   GDIS_DRAG_MODE_ROTATE,
   GDIS_DRAG_MODE_BOX_SELECT
 } GdisDragMode;
+
+typedef enum
+{
+  GDIS_ANIMATION_SOURCE_NONE = 0,
+  GDIS_ANIMATION_SOURCE_MODEL_FRAMES,
+  GDIS_ANIMATION_SOURCE_SESSION_MODELS
+} GdisAnimationSourceType;
+
+typedef enum
+{
+  GDIS_ANIMATION_CONFINE_NONE = 0,
+  GDIS_ANIMATION_CONFINE_ATOMS,
+  GDIS_ANIMATION_CONFINE_MOLECULES
+} GdisAnimationConfineMode;
 
 typedef struct
 {
@@ -178,13 +324,24 @@ struct _GdisGtk4Window
   GArray *picked_atoms;
   GHashTable *measurement_records;
   GHashTable *undo_stacks;
+  GHashTable *iso_surfaces;
   GdisDisplayTool *display_tool;
   GdisMeasureTool *measure_tool;
   GdisEditTool *edit_tool;
   GdisDiffractionTool *diffraction_tool;
   GdisSurfaceTool *surface_tool;
+  GdisIsosurfaceTool *isosurface_tool;
+  GdisAnimationTool *animation_tool;
+  GdisRecordingTool *recording_tool;
+  GdisZmatrixTool *zmatrix_tool;
+  GdisDislocationTool *dislocation_tool;
+  GdisDockingTool *docking_tool;
+  GdisPeriodicTableTool *periodic_table_tool;
+  GdisTaskManagerTool *task_manager_tool;
+  GdisExecutablePathsTool *exec_paths_tool;
   GdisSelectionMode selection_mode;
   GdisClickMode click_mode;
+  GHashTable *executable_paths;
   guint fragment_anchor_index;
   guint untitled_counter;
   guint layout_restore_tick_id;
@@ -252,6 +409,13 @@ static void gdis_gtk4_window_refresh_measure_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_edit_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_diffraction_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_surface_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_isosurface_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_animation_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_recording_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_zmatrix_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_periodic_table_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_executable_paths_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_sync_display_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
                                                       gboolean refresh_model_buttons);
@@ -261,9 +425,38 @@ static void gdis_gtk4_window_present_measure_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_edit_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_diffraction_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_surface_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_isosurface_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_animation_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_recording_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_zmatrix_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_dislocation_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_docking_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_periodic_table_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_task_manager_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_executable_paths_tool(GdisGtk4Window *self,
+                                                           const char *focus_backend);
 static void gdis_gtk4_window_present_report(GdisGtk4Window *self,
                                             const char *title,
                                             const char *body);
+static void gdis_gtk4_window_present_placeholder_feature(GdisGtk4Window *self,
+                                                         const char *title,
+                                                         const char *body);
+static GdisIsoSurface *gdis_gtk4_window_get_isosurface(GdisGtk4Window *self,
+                                                       GdisModel *model,
+                                                       gboolean create_entry);
+static void gdis_gtk4_window_set_isosurface(GdisGtk4Window *self,
+                                            GdisModel *model,
+                                            GdisIsoSurface *surface);
+static void gdis_gtk4_window_clear_isosurface(GdisGtk4Window *self,
+                                              GdisModel *model,
+                                              const char *reason);
+static void gdis_draw_isosurface(cairo_t *cr,
+                                 GdisGtk4Window *self,
+                                 const GdisIsoSurface *surface,
+                                 const gdouble center[3],
+                                 gdouble scale,
+                                 int width,
+                                 int height);
 static gboolean gdis_gtk4_window_model_supports_diffraction(const GdisModel *model,
                                                             gchar **message_out);
 static gboolean gdis_gtk4_window_parse_entry_double(GtkWidget *entry,
@@ -287,6 +480,8 @@ static gboolean gdis_gtk4_window_get_last_two_picks(GdisGtk4Window *self,
                                                     GError **error);
 static gboolean gdis_gtk4_window_atom_array_contains(const GArray *array,
                                                      guint atom_index);
+static gint gdis_gtk4_window_find_atom_index_in_array(const GArray *array,
+                                                      guint atom_index);
 static GArray *gdis_gtk4_window_copy_atom_array(const GArray *array);
 static void gdis_gtk4_window_toggle_atom_in_array(GArray *array, guint atom_index);
 static GPtrArray *gdis_measurement_record_array_clone(const GPtrArray *records);
@@ -298,6 +493,8 @@ static gboolean gdis_gtk4_window_push_undo_snapshot(GdisGtk4Window *self,
                                                     const char *reason);
 static void gdis_gtk4_window_discard_undo_snapshot(GdisGtk4Window *self);
 static gboolean gdis_gtk4_window_perform_undo(GdisGtk4Window *self);
+static gint gdis_gtk4_window_get_model_index(GdisGtk4Window *self,
+                                             GdisModel *model);
 static guint gdis_gtk4_window_hit_test_atom_at(GdisGtk4Window *self,
                                                gdouble x,
                                                gdouble y,
@@ -308,6 +505,9 @@ static gboolean gdis_gtk4_window_apply_box_selection(GdisGtk4Window *self,
                                                      gdouble x1,
                                                      gdouble y1,
                                                      gboolean toggle_existing);
+static GdisAnimationSourceType gdis_gtk4_window_get_animation_source(GdisGtk4Window *self,
+                                                                     guint *count_out,
+                                                                     gint *active_index_out);
 static gboolean gdis_gtk4_window_should_capture_measure_picks(const GdisGtk4Window *self);
 static gboolean gdis_gtk4_window_should_record_viewer_picks(const GdisGtk4Window *self);
 static gboolean gdis_gtk4_window_set_picks_from_array(GdisGtk4Window *self,
@@ -367,6 +567,39 @@ static gboolean on_viewer_scroll(GtkEventControllerScroll *controller,
                                  gdouble dx,
                                  gdouble dy,
                                  gpointer user_data);
+static gboolean gdis_gtk4_window_export_view_png(GdisGtk4Window *self,
+                                                 const char *path,
+                                                 gint width,
+                                                 gint height,
+                                                 GError **error);
+static gboolean gdis_gtk4_window_animation_preserve_connectivity(const GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_animation_preserve_scale(const GdisGtk4Window *self);
+static GdisAnimationConfineMode gdis_gtk4_window_get_animation_confine_mode(const GdisGtk4Window *self);
+static void gdis_gtk4_window_apply_animation_processing(GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_export_animation_sequence(GdisGtk4Window *self,
+                                                           const char *output_dir,
+                                                           const char *prefix,
+                                                           gint width,
+                                                           gint height,
+                                                           guint *frame_count_out,
+                                                           GError **error);
+static gboolean gdis_gtk4_window_export_movie(GdisGtk4Window *self,
+                                              const char *output_dir,
+                                              const char *prefix,
+                                              gint width,
+                                              gint height,
+                                              guint fps,
+                                              guint format_index,
+                                              gboolean keep_frames,
+                                              gchar **movie_path_out,
+                                              guint *frame_count_out,
+                                              GError **error);
+static void gdis_zmatrix_tool_clear_working_set(GdisZmatrixTool *tool);
+static void gdis_gtk4_window_refresh_zmatrix_row_controls(GdisGtk4Window *self);
+static gboolean gdis_gtk4_window_commit_zmatrix_row_edits(GdisGtk4Window *self,
+                                                          GError **error);
+static void on_animation_processing_changed(GtkWidget *button, gpointer user_data);
+static void on_recording_settings_changed(GtkWidget *widget, gpointer user_data);
 static void on_viewer_click_pressed(GtkGestureClick *gesture,
                                     gint n_press,
                                     gdouble x,
@@ -487,6 +720,10 @@ gdis_gtk4_window_free(gpointer data)
     g_hash_table_unref(self->measurement_records);
   if (self->undo_stacks)
     g_hash_table_unref(self->undo_stacks);
+  if (self->iso_surfaces)
+    g_hash_table_unref(self->iso_surfaces);
+  if (self->executable_paths)
+    g_hash_table_unref(self->executable_paths);
   if (self->measure_tool)
     self->measure_tool->owner = NULL;
   if (self->edit_tool)
@@ -497,6 +734,24 @@ gdis_gtk4_window_free(gpointer data)
     self->diffraction_tool->owner = NULL;
   if (self->surface_tool)
     self->surface_tool->owner = NULL;
+  if (self->isosurface_tool)
+    self->isosurface_tool->owner = NULL;
+  if (self->animation_tool)
+    self->animation_tool->owner = NULL;
+  if (self->recording_tool)
+    self->recording_tool->owner = NULL;
+  if (self->zmatrix_tool)
+    self->zmatrix_tool->owner = NULL;
+  if (self->dislocation_tool)
+    self->dislocation_tool->owner = NULL;
+  if (self->docking_tool)
+    self->docking_tool->owner = NULL;
+  if (self->periodic_table_tool)
+    self->periodic_table_tool->owner = NULL;
+  if (self->task_manager_tool)
+    self->task_manager_tool->owner = NULL;
+  if (self->exec_paths_tool)
+    self->exec_paths_tool->owner = NULL;
   g_free(self);
 }
 
@@ -607,6 +862,10 @@ gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
 
   if (refresh_model_buttons)
     gdis_gtk4_window_refresh_model_buttons(self);
+  if (self->active_model)
+    gdis_gtk4_window_clear_isosurface(self,
+                                      self->active_model,
+                                      "Saved iso-surface preview was cleared because the model geometry changed.\n");
   gdis_gtk4_window_sync_display_tool(self);
   gdis_gtk4_window_update_details(self);
   gdis_gtk4_window_refresh_viewer(self);
@@ -614,6 +873,12 @@ gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_diffraction_tool(self);
   gdis_gtk4_window_refresh_surface_tool(self);
+  gdis_gtk4_window_refresh_isosurface_tool(self);
+  gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_recording_tool(self);
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+  gdis_gtk4_window_refresh_periodic_table_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
   gdis_gtk4_window_update_undo_action(self);
 }
 
@@ -655,6 +920,80 @@ gdis_gtk4_window_present_report(GdisGtk4Window *self,
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
 
   gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+gdis_gtk4_window_present_placeholder_feature(GdisGtk4Window *self,
+                                             const char *title,
+                                             const char *body)
+{
+  g_autofree gchar *report = NULL;
+
+  g_return_if_fail(self != NULL);
+  g_return_if_fail(title != NULL);
+  g_return_if_fail(body != NULL);
+
+  report = g_strdup_printf(
+    "%s\n\n"
+    "%s\n\n"
+    "The menu position now matches the legacy GDIS layout, but this module itself is not restored yet in the GTK4 rebuild.",
+    title,
+    body);
+  gdis_gtk4_window_present_report(self, title, report);
+}
+
+static GdisIsoSurface *
+gdis_gtk4_window_get_isosurface(GdisGtk4Window *self,
+                                GdisModel *model,
+                                gboolean create_entry)
+{
+  (void) create_entry;
+
+  g_return_val_if_fail(self != NULL, NULL);
+
+  if (!self->iso_surfaces || !model)
+    return NULL;
+
+  return g_hash_table_lookup(self->iso_surfaces, model);
+}
+
+static void
+gdis_gtk4_window_set_isosurface(GdisGtk4Window *self,
+                                GdisModel *model,
+                                GdisIsoSurface *surface)
+{
+  g_return_if_fail(self != NULL);
+
+  if (!self->iso_surfaces || !model)
+    {
+      g_clear_pointer(&surface, gdis_isosurface_free);
+      return;
+    }
+
+  if (!surface)
+    g_hash_table_remove(self->iso_surfaces, model);
+  else
+    g_hash_table_replace(self->iso_surfaces, model, surface);
+
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_isosurface_tool(self);
+}
+
+static void
+gdis_gtk4_window_clear_isosurface(GdisGtk4Window *self,
+                                  GdisModel *model,
+                                  const char *reason)
+{
+  g_return_if_fail(self != NULL);
+
+  if (!self->iso_surfaces || !model)
+    return;
+
+  if (g_hash_table_remove(self->iso_surfaces, model) && reason)
+    gdis_gtk4_window_log(self, "%s", reason);
+
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_isosurface_tool(self);
 }
 
 static void
@@ -989,6 +1328,20 @@ gdis_gtk4_window_atom_array_contains(const GArray *array, guint atom_index)
     }
 
   return FALSE;
+}
+
+static gint
+gdis_gtk4_window_find_atom_index_in_array(const GArray *array, guint atom_index)
+{
+  g_return_val_if_fail(array != NULL, -1);
+
+  for (guint i = 0; i < array->len; i++)
+    {
+      if (g_array_index(array, guint, i) == atom_index)
+        return (gint) i;
+    }
+
+  return -1;
 }
 
 static GArray *
@@ -4225,6 +4578,3286 @@ gdis_gtk4_window_present_surface_tool(GdisGtk4Window *self)
 }
 
 static void
+on_isosurface_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisIsosurfaceTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->isosurface_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_isosurface_tool(GdisGtk4Window *self)
+{
+  GdisIsosurfaceTool *tool;
+  GdisIsoSurface *surface;
+  gboolean has_model;
+  gboolean supported_model;
+  guint selected_mode;
+  gboolean needs_selection;
+  gboolean has_selection;
+  g_autofree gchar *report = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->isosurface_tool;
+  if (!tool)
+    return;
+
+  has_model = (self->active_model != NULL);
+  selected_mode = tool->mode_dropdown ?
+    gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->mode_dropdown)) :
+    GDIS_ISOSURFACE_MODE_MOLECULAR;
+  needs_selection = (selected_mode == GDIS_ISOSURFACE_MODE_PROMOLECULE ||
+                     selected_mode == GDIS_ISOSURFACE_MODE_HIRSHFELD);
+  has_selection = (self->selected_atoms && self->selected_atoms->len > 0u);
+  supported_model = has_model && (!needs_selection || has_selection);
+  if (tool->execute_button)
+    gtk_widget_set_sensitive(tool->execute_button, supported_model);
+
+  if (tool->clear_button)
+    gtk_widget_set_sensitive(tool->clear_button,
+                             has_model && gdis_gtk4_window_get_isosurface(self, self->active_model, FALSE) != NULL);
+
+  if (!tool->report_buffer)
+    return;
+
+  if (!has_model)
+    {
+      gtk_text_buffer_set_text(tool->report_buffer,
+                               "No active model loaded.\nOpen a structure first, then generate an iso-surface.",
+                               -1);
+      return;
+    }
+
+  if (needs_selection && !has_selection)
+    {
+      gtk_text_buffer_set_text(tool->report_buffer,
+                               "This iso-surface mode follows the legacy selected-atom workflow.\n\n"
+                               "Select one or more atoms in the main viewer first, then generate the surface.",
+                               -1);
+      return;
+    }
+
+  surface = gdis_gtk4_window_get_isosurface(self, self->active_model, FALSE);
+  if (surface && surface->summary)
+    {
+      gtk_text_buffer_set_text(tool->report_buffer, surface->summary, -1);
+      return;
+    }
+
+  report = g_strdup(
+    "GTK4 Iso-surfaces\n\n"
+    "Restored now:\n"
+    "  - Molecular surface\n"
+    "  - Promolecule isosurface\n"
+    "  - Hirshfeld-style selected-fragment surface\n"
+    "  - Analytic electron-density approximation for the whole model\n\n"
+    "Still pending:\n"
+    "  - True volumetric-grid electron density import/render\n\n"
+    "Generate a surface to preview it directly in the main viewer.");
+  gtk_text_buffer_set_text(tool->report_buffer, report, -1);
+}
+
+static void
+on_isosurface_clear_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisIsosurfaceTool *tool;
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self || !self->active_model)
+    return;
+
+  gdis_gtk4_window_clear_isosurface(self,
+                                    self->active_model,
+                                    "Cleared the active iso-surface preview.\n");
+}
+
+static void
+on_isosurface_mode_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+  GdisIsosurfaceTool *tool;
+  GdisGtk4Window *self;
+  guint selected_mode;
+  gdouble default_value;
+
+  (void) object;
+  (void) pspec;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!tool || !self || !tool->value_spin)
+    return;
+
+  selected_mode = gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->mode_dropdown));
+  default_value = 0.080;
+  if (selected_mode == GDIS_ISOSURFACE_MODE_HIRSHFELD)
+    default_value = 0.500;
+  else if (selected_mode == GDIS_ISOSURFACE_MODE_ELECTRON_DENSITY)
+    default_value = 0.100;
+
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->value_spin), default_value);
+  gdis_gtk4_window_refresh_isosurface_tool(self);
+}
+
+static void
+on_isosurface_execute_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisIsosurfaceTool *tool;
+  GdisGtk4Window *self;
+  GdisIsosurfaceSettings settings;
+  GdisIsoSurface *surface;
+  GError *error;
+  guint selected_mode;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self || !self->active_model || !tool)
+    return;
+
+  gdis_isosurface_settings_init(&settings);
+  selected_mode = gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->mode_dropdown));
+  settings.mode = (GdisIsosurfaceMode) selected_mode;
+  settings.grid_size = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->grid_spin));
+  settings.blur = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->blur_spin));
+  settings.isovalue = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->value_spin));
+  settings.selected_atoms = self->selected_atoms;
+
+  surface = NULL;
+  error = NULL;
+  if (!gdis_isosurface_generate(self->active_model, &settings, &surface, &error))
+    {
+      const char *message;
+
+      message = error ? error->message : "unknown error";
+      gdis_gtk4_window_log(self, "Iso-surface generation failed: %s\n", message);
+      if (tool->report_buffer)
+        gtk_text_buffer_set_text(tool->report_buffer, message, -1);
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_set_isosurface(self, self->active_model, surface);
+  if (surface->summary && tool->report_buffer)
+    gtk_text_buffer_set_text(tool->report_buffer, surface->summary, -1);
+  gdis_gtk4_window_log(self,
+                       "Generated %s with %u triangles.\n",
+                       gdis_isosurface_mode_label(settings.mode),
+                       surface->triangles ? surface->triangles->len : 0u);
+}
+
+static void
+gdis_gtk4_window_present_isosurface_tool(GdisGtk4Window *self)
+{
+  static const char *const mode_items[] = {
+    "Molecular surface",
+    "Promolecule isosurface",
+    "Hirshfeld surface",
+    "Electron density",
+    NULL
+  };
+  GdisIsosurfaceTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *button_row;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkStringList *mode_model;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->isosurface_tool && GTK_IS_WINDOW(self->isosurface_tool->window))
+    {
+      gdis_gtk4_window_refresh_isosurface_tool(self);
+      gtk_window_present(GTK_WINDOW(self->isosurface_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisIsosurfaceTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Iso-surfaces");
+  gtk_window_set_default_size(GTK_WINDOW(window), 760, 520);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 10);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  label = gtk_label_new("Iso-surface type");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  mode_model = gtk_string_list_new(mode_items);
+  tool->mode_dropdown = gtk_drop_down_new(G_LIST_MODEL(mode_model), NULL);
+  g_object_unref(mode_model);
+  gtk_drop_down_set_selected(GTK_DROP_DOWN(tool->mode_dropdown), GDIS_ISOSURFACE_MODE_MOLECULAR);
+  gtk_widget_set_hexpand(tool->mode_dropdown, TRUE);
+  g_signal_connect(tool->mode_dropdown,
+                   "notify::selected",
+                   G_CALLBACK(on_isosurface_mode_changed),
+                   tool);
+  gtk_grid_attach(GTK_GRID(grid), tool->mode_dropdown, 1, 0, 1, 1);
+
+  label = gtk_label_new("Grid size");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+  tool->grid_spin = gtk_spin_button_new_with_range(0.12, 2.50, 0.02);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(tool->grid_spin), 2);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->grid_spin), 0.40);
+  gtk_grid_attach(GTK_GRID(grid), tool->grid_spin, 1, 1, 1, 1);
+
+  label = gtk_label_new("Blur / smoothing");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+  tool->blur_spin = gtk_spin_button_new_with_range(0.00, 2.00, 0.05);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(tool->blur_spin), 2);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->blur_spin), 0.35);
+  gtk_grid_attach(GTK_GRID(grid), tool->blur_spin, 1, 2, 1, 1);
+
+  label = gtk_label_new("Isovalue");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 3, 1, 1);
+  tool->value_spin = gtk_spin_button_new_with_range(0.001, 5.000, 0.005);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(tool->value_spin), 3);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->value_spin), 0.080);
+  gtk_grid_attach(GTK_GRID(grid), tool->value_spin, 1, 3, 1, 1);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->report_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(button_row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), button_row);
+
+  button = gtk_button_new_with_label("Generate");
+  tool->execute_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_isosurface_execute_clicked), tool);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  button = gtk_button_new_with_label("Clear");
+  tool->clear_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_isosurface_clear_clicked), tool);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_isosurface_tool_destroy), tool);
+
+  self->isosurface_tool = tool;
+  gdis_gtk4_window_refresh_isosurface_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_animation_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->timer_id != 0u)
+    g_source_remove(tool->timer_id);
+  if (tool->owner)
+    tool->owner->animation_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_get_animation_source_label(GdisAnimationSourceType source,
+                                            gchar *buffer,
+                                            gsize buffer_len)
+{
+  g_return_if_fail(buffer != NULL);
+
+  switch (source)
+    {
+    case GDIS_ANIMATION_SOURCE_MODEL_FRAMES:
+      g_strlcpy(buffer, "active model frames", buffer_len);
+      break;
+    case GDIS_ANIMATION_SOURCE_SESSION_MODELS:
+      g_strlcpy(buffer, "loaded model list", buffer_len);
+      break;
+    case GDIS_ANIMATION_SOURCE_NONE:
+    default:
+      g_strlcpy(buffer, "none", buffer_len);
+      break;
+    }
+}
+
+static gboolean
+gdis_gtk4_window_animation_preserve_connectivity(const GdisGtk4Window *self)
+{
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  return self->animation_tool &&
+         self->animation_tool->preserve_connectivity_toggle &&
+         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->animation_tool->preserve_connectivity_toggle));
+}
+
+static gboolean
+gdis_gtk4_window_animation_preserve_scale(const GdisGtk4Window *self)
+{
+  g_return_val_if_fail(self != NULL, TRUE);
+
+  return !self->animation_tool ||
+         !self->animation_tool->preserve_scale_toggle ||
+         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->animation_tool->preserve_scale_toggle));
+}
+
+static GdisAnimationConfineMode
+gdis_gtk4_window_get_animation_confine_mode(const GdisGtk4Window *self)
+{
+  g_return_val_if_fail(self != NULL, GDIS_ANIMATION_CONFINE_NONE);
+
+  if (!self->animation_tool)
+    return GDIS_ANIMATION_CONFINE_NONE;
+  if (self->animation_tool->confine_atoms_toggle &&
+      gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->animation_tool->confine_atoms_toggle)))
+    return GDIS_ANIMATION_CONFINE_ATOMS;
+  if (self->animation_tool->confine_molecules_toggle &&
+      gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->animation_tool->confine_molecules_toggle)))
+    return GDIS_ANIMATION_CONFINE_MOLECULES;
+  return GDIS_ANIMATION_CONFINE_NONE;
+}
+
+static void
+gdis_gtk4_window_apply_animation_processing(GdisGtk4Window *self)
+{
+  GError *error;
+
+  g_return_if_fail(self != NULL);
+
+  if (!self->active_model)
+    return;
+
+  error = NULL;
+  switch (gdis_gtk4_window_get_animation_confine_mode(self))
+    {
+    case GDIS_ANIMATION_CONFINE_ATOMS:
+      gdis_model_confine_atoms_to_cell(self->active_model, &error);
+      break;
+    case GDIS_ANIMATION_CONFINE_MOLECULES:
+      gdis_model_confine_molecules_to_cell(self->active_model, &error);
+      break;
+    case GDIS_ANIMATION_CONFINE_NONE:
+    default:
+      break;
+    }
+
+  if (error)
+    {
+      gdis_gtk4_window_log(self, "Animation processing warning: %s\n", error->message);
+      g_clear_error(&error);
+    }
+}
+
+static GdisAnimationSourceType
+gdis_gtk4_window_get_animation_source(GdisGtk4Window *self,
+                                      guint *count_out,
+                                      gint *active_index_out)
+{
+  guint count;
+  gint active_index;
+  GdisAnimationSourceType source;
+
+  g_return_val_if_fail(self != NULL, GDIS_ANIMATION_SOURCE_NONE);
+
+  source = GDIS_ANIMATION_SOURCE_NONE;
+  count = 0u;
+  active_index = -1;
+
+  if (self->active_model)
+    {
+      count = gdis_model_get_frame_count(self->active_model);
+      if (count > 1u)
+        {
+          source = GDIS_ANIMATION_SOURCE_MODEL_FRAMES;
+          active_index = (gint) gdis_model_get_current_frame_index(self->active_model);
+        }
+    }
+
+  if (source == GDIS_ANIMATION_SOURCE_NONE && self->models->len > 1u)
+    {
+      source = GDIS_ANIMATION_SOURCE_SESSION_MODELS;
+      count = self->models->len;
+      active_index = gdis_gtk4_window_get_model_index(self, self->active_model);
+    }
+
+  if (source == GDIS_ANIMATION_SOURCE_NONE && self->active_model)
+    {
+      count = 1u;
+      active_index = 0;
+    }
+
+  if (count_out)
+    *count_out = count;
+  if (active_index_out)
+    *active_index_out = active_index;
+  return source;
+}
+
+static void
+gdis_gtk4_window_animation_step_to_index(GdisGtk4Window *self,
+                                         gint index,
+                                         gboolean log_change)
+{
+  GdisAnimationSourceType source;
+  GdisModel *model;
+  gdouble rotation_x;
+  gdouble rotation_y;
+  gdouble zoom;
+  guint source_count;
+  GtkTextIter start;
+  GtkTextIter end;
+  gchar source_label[32];
+  GError *error;
+  GArray *saved_bonds;
+  guint saved_explicit_bond_count;
+  guint saved_atom_count;
+  g_autofree gchar *status_text = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  source = gdis_gtk4_window_get_animation_source(self, &source_count, NULL);
+  if (source == GDIS_ANIMATION_SOURCE_NONE ||
+      index < 0 ||
+      (guint) index >= source_count)
+    return;
+
+  rotation_x = self->rotation_x;
+  rotation_y = self->rotation_y;
+  zoom = self->zoom;
+  saved_bonds = NULL;
+  saved_explicit_bond_count = 0u;
+  saved_atom_count = self->active_model ? self->active_model->atom_count : 0u;
+  if (self->status_buffer)
+    {
+      gtk_text_buffer_get_start_iter(self->status_buffer, &start);
+      gtk_text_buffer_get_end_iter(self->status_buffer, &end);
+      status_text = gtk_text_buffer_get_text(self->status_buffer, &start, &end, FALSE);
+    }
+
+  error = NULL;
+  if (source == GDIS_ANIMATION_SOURCE_MODEL_FRAMES)
+    {
+      if (gdis_gtk4_window_animation_preserve_connectivity(self) &&
+          self->active_model &&
+          self->active_model->bonds)
+        {
+          saved_bonds = g_array_sized_new(FALSE,
+                                          FALSE,
+                                          sizeof(GdisBond),
+                                          self->active_model->bonds->len);
+          if (self->active_model->bonds->len > 0u)
+            g_array_append_vals(saved_bonds,
+                                self->active_model->bonds->data,
+                                self->active_model->bonds->len);
+          saved_explicit_bond_count = self->active_model->explicit_bond_count;
+        }
+
+      if (self->active_model &&
+          (gint) gdis_model_get_current_frame_index(self->active_model) == index)
+        {
+          if (saved_bonds)
+            g_array_free(saved_bonds, TRUE);
+          gdis_gtk4_window_refresh_animation_tool(self);
+          return;
+        }
+
+      if (!self->active_model || !gdis_model_set_frame_index(self->active_model, (guint) index, &error))
+        {
+          if (saved_bonds)
+            g_array_free(saved_bonds, TRUE);
+          gdis_gtk4_window_log(self, "Animation frame change failed: %s\n",
+                               error ? error->message : "unknown error");
+          g_clear_error(&error);
+          return;
+        }
+      model = self->active_model;
+      gdis_gtk4_window_apply_animation_processing(self);
+      if (saved_bonds)
+        {
+          if (model->atom_count == saved_atom_count)
+            {
+              if (model->bonds)
+                g_array_free(model->bonds, TRUE);
+              model->bonds = saved_bonds;
+              saved_bonds = NULL;
+              model->explicit_bond_count = MIN(saved_explicit_bond_count, model->bonds->len);
+              model->bond_count = model->bonds->len;
+            }
+          else
+            {
+              g_array_free(saved_bonds, TRUE);
+              saved_bonds = NULL;
+            }
+        }
+      gdis_gtk4_window_update_details(self);
+    }
+  else
+    {
+      model = g_ptr_array_index(self->models, index);
+      if (self->active_model == model)
+        {
+          if (saved_bonds)
+            g_array_free(saved_bonds, TRUE);
+          gdis_gtk4_window_refresh_animation_tool(self);
+          return;
+        }
+      gdis_gtk4_window_set_active_model(self, model);
+      gdis_gtk4_window_apply_animation_processing(self);
+    }
+
+  if (gdis_gtk4_window_animation_preserve_scale(self))
+    {
+      self->rotation_x = rotation_x;
+      self->rotation_y = rotation_y;
+      self->zoom = zoom;
+    }
+  gdis_gtk4_window_refresh_viewer(self);
+  gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_refresh_edit_tool(self);
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+
+  if (self->status_buffer && status_text)
+    {
+      gtk_text_buffer_set_text(self->status_buffer, status_text, -1);
+      if (log_change)
+        {
+          gdis_gtk4_window_get_animation_source_label(source, source_label, sizeof(source_label));
+          gdis_gtk4_window_log(self,
+                               "Animation %s: %d / %u (%s)\n",
+                               source == GDIS_ANIMATION_SOURCE_MODEL_FRAMES ? "frame" : "step",
+                               index + 1,
+                               source_count,
+                               source_label);
+        }
+    }
+
+  gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_recording_tool(self);
+}
+
+static gboolean
+on_animation_tick(gpointer user_data)
+{
+  GdisAnimationTool *tool;
+  GdisGtk4Window *self;
+  GdisAnimationSourceType source;
+  gint current_index;
+  gint step;
+  gint next_index;
+  guint source_count;
+  gboolean loop;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!tool || !self || !tool->window)
+    return G_SOURCE_REMOVE;
+
+  source = gdis_gtk4_window_get_animation_source(self, &source_count, &current_index);
+  if (source == GDIS_ANIMATION_SOURCE_NONE || source_count < 2u)
+    {
+      tool->timer_id = 0u;
+      gdis_gtk4_window_refresh_animation_tool(self);
+      return G_SOURCE_REMOVE;
+    }
+
+  step = (gint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->step_spin));
+  loop = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tool->loop_toggle));
+  next_index = current_index + MAX(step, 1);
+  if (next_index >= (gint) source_count)
+    {
+      if (!loop)
+        {
+          tool->timer_id = 0u;
+          gdis_gtk4_window_refresh_animation_tool(self);
+          return G_SOURCE_REMOVE;
+        }
+      next_index %= (gint) source_count;
+    }
+
+  gdis_gtk4_window_animation_step_to_index(self, next_index, FALSE);
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+gdis_gtk4_window_refresh_animation_tool(GdisGtk4Window *self)
+{
+  GdisAnimationTool *tool;
+  GdisAnimationSourceType source;
+  guint source_count;
+  gint active_index;
+  gchar source_label[32];
+  const char *confine_label;
+  gboolean can_play;
+  g_autofree gchar *summary = NULL;
+  g_autofree gchar *processing = NULL;
+  g_autofree gchar *rendering = NULL;
+  g_autofree gchar *ffmpeg_path = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->animation_tool;
+  if (!tool)
+    return;
+
+  source = gdis_gtk4_window_get_animation_source(self, &source_count, &active_index);
+  gdis_gtk4_window_get_animation_source_label(source, source_label, sizeof(source_label));
+  can_play = (source_count > 1u);
+  switch (gdis_gtk4_window_get_animation_confine_mode(self))
+    {
+    case GDIS_ANIMATION_CONFINE_ATOMS:
+      confine_label = "Confine atoms to PBC";
+      break;
+    case GDIS_ANIMATION_CONFINE_MOLECULES:
+      confine_label = "Confine molecules to PBC";
+      break;
+    case GDIS_ANIMATION_CONFINE_NONE:
+    default:
+      confine_label = "Cell confinement off";
+      break;
+    }
+
+  if (tool->frame_scale)
+    {
+      tool->suppress_scale_signal = TRUE;
+      gtk_range_set_range(GTK_RANGE(tool->frame_scale),
+                          1.0,
+                          MAX((gdouble) source_count, 1.0));
+      gtk_range_set_value(GTK_RANGE(tool->frame_scale),
+                          active_index >= 0 ? (gdouble) active_index + 1.0 : 1.0);
+      gtk_widget_set_sensitive(tool->frame_scale, source_count > 0u);
+      tool->suppress_scale_signal = FALSE;
+    }
+
+  if (tool->play_button)
+    {
+      gtk_widget_set_sensitive(tool->play_button, can_play);
+      gtk_button_set_label(GTK_BUTTON(tool->play_button),
+                           tool->timer_id != 0u ? "Pause" : "Play");
+    }
+
+  summary = g_strdup_printf(
+    "Animation source: %s\n"
+    "Loaded models: %u\n"
+    "Available steps: %u\n"
+    "Current frame: %d / %u\n"
+    "Active model: %s\n\n"
+    "Delay: %d ms   Step size: %d   Loop: %s\n\n"
+    "%s",
+    source_label,
+    self->models->len,
+    source_count,
+    active_index >= 0 ? active_index + 1 : 0,
+    source_count,
+    self->active_model ? self->active_model->basename : "none",
+    tool->delay_spin ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->delay_spin)) : 0,
+    tool->step_spin ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->step_spin)) : 1,
+    (tool->loop_toggle && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tool->loop_toggle))) ? "on" : "off",
+    source == GDIS_ANIMATION_SOURCE_MODEL_FRAMES
+      ? "GTK4 animation is now driving the active model's internal frame set."
+      : (source == GDIS_ANIMATION_SOURCE_SESSION_MODELS
+         ? "GTK4 animation is using the loaded model list because the active model is single-frame."
+         : "Load a trajectory-capable model or multiple models to enable playback."));
+  gtk_label_set_text(tool->summary_label, summary);
+
+  processing = g_strdup_printf(
+    "Per-cycle processing\n"
+    "  Connectivity: %s\n"
+    "  View scale/rotation: %s\n"
+    "  Cell handling: %s\n\n"
+    "These controls mirror the old Linux dialog. Connectivity preservation is applied when stepping active-model frames.",
+    gdis_gtk4_window_animation_preserve_connectivity(self) ? "preserve current bonding" : "recompute as frame changes",
+    gdis_gtk4_window_animation_preserve_scale(self) ? "preserve current zoom/rotation" : "allow per-step reset",
+    confine_label);
+  if (tool->processing_label)
+    gtk_label_set_text(tool->processing_label, processing);
+
+  ffmpeg_path = g_find_program_in_path("ffmpeg");
+  rendering = g_strdup_printf(
+    "Rendering / recording\n"
+    "  Snapshot and PNG sequence export are available now.\n"
+    "  Movie backend: %s\n"
+    "  Use Record... to open the GTK4 rendering/export panel with MP4/GIF controls.",
+    ffmpeg_path ? ffmpeg_path : "ffmpeg not found");
+  if (tool->rendering_label)
+    gtk_label_set_text(tool->rendering_label, rendering);
+}
+
+static void
+on_animation_play_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+  guint interval_ms;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  if (tool->timer_id != 0u)
+    {
+      g_source_remove(tool->timer_id);
+      tool->timer_id = 0u;
+      gdis_gtk4_window_refresh_animation_tool(tool->owner);
+      return;
+    }
+
+  interval_ms = (guint) MAX(80, gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->delay_spin)));
+  tool->timer_id = g_timeout_add(interval_ms, on_animation_tick, tool);
+  gdis_gtk4_window_refresh_animation_tool(tool->owner);
+}
+
+static void
+on_animation_prev_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+  GdisAnimationSourceType source;
+  guint source_count;
+  gint active_index;
+  gint step;
+  gint next_index;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  source = gdis_gtk4_window_get_animation_source(tool->owner, &source_count, &active_index);
+  if (source == GDIS_ANIMATION_SOURCE_NONE || source_count == 0u)
+    return;
+  if (active_index < 0)
+    active_index = 0;
+  step = (gint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->step_spin));
+  next_index = active_index - MAX(step, 1);
+  while (next_index < 0)
+    next_index += (gint) source_count;
+  gdis_gtk4_window_animation_step_to_index(tool->owner, next_index, TRUE);
+}
+
+static void
+on_animation_next_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  on_animation_tick(tool);
+}
+
+static void
+on_animation_scale_value_changed(GtkRange *range, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+  gint index;
+
+  tool = user_data;
+  if (!tool || !tool->owner || tool->suppress_scale_signal)
+    return;
+
+  index = (gint) llround(gtk_range_get_value(range)) - 1;
+  gdis_gtk4_window_animation_step_to_index(tool->owner, index, TRUE);
+}
+
+static void
+on_animation_processing_changed(GtkWidget *button, gpointer user_data)
+{
+  GdisAnimationTool *tool;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool || !tool->owner)
+    return;
+
+  gdis_gtk4_window_refresh_animation_tool(tool->owner);
+}
+
+static void
+gdis_gtk4_window_present_animation_tool(GdisGtk4Window *self)
+{
+  GdisAnimationTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *controls;
+  GtkWidget *button;
+  GtkWidget *label;
+  GtkWidget *frame;
+  GtkWidget *top_frame;
+  GtkWidget *switcher;
+  GtkWidget *stack;
+  GtkWidget *page;
+  GtkWidget *section;
+  GtkWidget *grid;
+  GtkWidget *transport_frame;
+  GtkWidget *actions;
+  GtkWidget *record_row;
+  GtkWidget *toggle;
+  GtkCheckButton *group_head;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->animation_tool && GTK_IS_WINDOW(self->animation_tool->window))
+    {
+      gdis_gtk4_window_refresh_animation_tool(self);
+      gtk_window_present(GTK_WINDOW(self->animation_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisAnimationTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Animation");
+  gtk_window_set_default_size(GTK_WINDOW(window), 720, 560);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  top_frame = gtk_frame_new(NULL);
+  gtk_box_append(GTK_BOX(root), top_frame);
+
+  page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(page, 10);
+  gtk_widget_set_margin_end(page, 10);
+  gtk_widget_set_margin_top(page, 10);
+  gtk_widget_set_margin_bottom(page, 10);
+  gtk_frame_set_child(GTK_FRAME(top_frame), page);
+
+  switcher = gtk_stack_switcher_new();
+  gtk_widget_set_halign(switcher, GTK_ALIGN_START);
+  gtk_box_append(GTK_BOX(page), switcher);
+
+  stack = gtk_stack_new();
+  gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+  gtk_stack_set_hhomogeneous(GTK_STACK(stack), FALSE);
+  gtk_stack_set_vhomogeneous(GTK_STACK(stack), FALSE);
+  gtk_widget_set_vexpand(stack, TRUE);
+  gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(switcher), GTK_STACK(stack));
+  gtk_box_append(GTK_BOX(page), stack);
+
+  page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  section = gtk_frame_new("Playback");
+  gtk_box_append(GTK_BOX(page), section);
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+  gtk_widget_set_margin_start(grid, 10);
+  gtk_widget_set_margin_end(grid, 10);
+  gtk_widget_set_margin_top(grid, 10);
+  gtk_widget_set_margin_bottom(grid, 10);
+  gtk_frame_set_child(GTK_FRAME(section), grid);
+
+  label = gtk_label_new("Delay (ms)");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  tool->delay_spin = gtk_spin_button_new_with_range(80.0, 5000.0, 20.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->delay_spin), 350.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->delay_spin, 1, 0, 1, 1);
+
+  label = gtk_label_new("Step size");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 0, 1, 1);
+  tool->step_spin = gtk_spin_button_new_with_range(1.0, 24.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->step_spin), 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->step_spin, 3, 0, 1, 1);
+
+  tool->loop_toggle = gtk_check_button_new_with_label("Loop");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->loop_toggle), TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->loop_toggle, 0, 1, 2, 1);
+
+  tool->preserve_connectivity_toggle = gtk_check_button_new_with_label("Don't recalculate connectivity");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->preserve_connectivity_toggle), TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->preserve_connectivity_toggle, 2, 1, 2, 1);
+
+  tool->preserve_scale_toggle = gtk_check_button_new_with_label("Don't recalculate scale");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->preserve_scale_toggle), TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->preserve_scale_toggle, 0, 2, 2, 1);
+
+  frame = gtk_frame_new("Control summary");
+  gtk_box_append(GTK_BOX(page), frame);
+  tool->summary_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_wrap(tool->summary_label, TRUE);
+  gtk_label_set_xalign(tool->summary_label, 0.0f);
+  gtk_widget_set_margin_start(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_end(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_top(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_bottom(GTK_WIDGET(tool->summary_label), 10);
+  gtk_frame_set_child(GTK_FRAME(frame), GTK_WIDGET(tool->summary_label));
+  gtk_stack_add_titled(GTK_STACK(stack), page, "control", "Control");
+
+  page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  section = gtk_frame_new("Per-cycle processing");
+  gtk_box_append(GTK_BOX(page), section);
+  controls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(controls, 10);
+  gtk_widget_set_margin_end(controls, 10);
+  gtk_widget_set_margin_top(controls, 10);
+  gtk_widget_set_margin_bottom(controls, 10);
+  gtk_frame_set_child(GTK_FRAME(section), controls);
+
+  group_head = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Cell confinement off"));
+  tool->confine_none_toggle = GTK_WIDGET(group_head);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->confine_none_toggle), TRUE);
+  gtk_box_append(GTK_BOX(controls), tool->confine_none_toggle);
+
+  toggle = gtk_check_button_new_with_label("Confine atoms to PBC");
+  gtk_check_button_set_group(GTK_CHECK_BUTTON(toggle), group_head);
+  tool->confine_atoms_toggle = toggle;
+  gtk_box_append(GTK_BOX(controls), tool->confine_atoms_toggle);
+
+  toggle = gtk_check_button_new_with_label("Confine molecules to PBC");
+  gtk_check_button_set_group(GTK_CHECK_BUTTON(toggle), group_head);
+  tool->confine_molecules_toggle = toggle;
+  gtk_box_append(GTK_BOX(controls), tool->confine_molecules_toggle);
+
+  frame = gtk_frame_new("Processing summary");
+  gtk_box_append(GTK_BOX(page), frame);
+  tool->processing_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_wrap(tool->processing_label, TRUE);
+  gtk_label_set_xalign(tool->processing_label, 0.0f);
+  gtk_widget_set_margin_start(GTK_WIDGET(tool->processing_label), 10);
+  gtk_widget_set_margin_end(GTK_WIDGET(tool->processing_label), 10);
+  gtk_widget_set_margin_top(GTK_WIDGET(tool->processing_label), 10);
+  gtk_widget_set_margin_bottom(GTK_WIDGET(tool->processing_label), 10);
+  gtk_frame_set_child(GTK_FRAME(frame), GTK_WIDGET(tool->processing_label));
+  gtk_stack_add_titled(GTK_STACK(stack), page, "processing", "Processing");
+
+  page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  frame = gtk_frame_new("Rendering");
+  gtk_box_append(GTK_BOX(page), frame);
+  controls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_start(controls, 10);
+  gtk_widget_set_margin_end(controls, 10);
+  gtk_widget_set_margin_top(controls, 10);
+  gtk_widget_set_margin_bottom(controls, 10);
+  gtk_frame_set_child(GTK_FRAME(frame), controls);
+
+  tool->rendering_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_wrap(tool->rendering_label, TRUE);
+  gtk_label_set_xalign(tool->rendering_label, 0.0f);
+  gtk_box_append(GTK_BOX(controls), GTK_WIDGET(tool->rendering_label));
+
+  record_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(controls), record_row);
+
+  button = gtk_button_new_with_label("Open Export Panel...");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gdis_gtk4_window_present_recording_tool), self);
+  gtk_box_append(GTK_BOX(record_row), button);
+  gtk_stack_add_titled(GTK_STACK(stack), page, "rendering", "Rendering");
+
+  transport_frame = gtk_frame_new(NULL);
+  gtk_box_append(GTK_BOX(root), transport_frame);
+  page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_start(page, 10);
+  gtk_widget_set_margin_end(page, 10);
+  gtk_widget_set_margin_top(page, 10);
+  gtk_widget_set_margin_bottom(page, 10);
+  gtk_frame_set_child(GTK_FRAME(transport_frame), page);
+
+  label = gtk_label_new("Frame");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_box_append(GTK_BOX(page), label);
+
+  tool->frame_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 1.0, 1.0, 1.0);
+  gtk_scale_set_digits(GTK_SCALE(tool->frame_scale), 0);
+  gtk_scale_set_draw_value(GTK_SCALE(tool->frame_scale), TRUE);
+  g_signal_connect(tool->frame_scale,
+                   "value-changed",
+                   G_CALLBACK(on_animation_scale_value_changed),
+                   tool);
+  gtk_box_append(GTK_BOX(page), tool->frame_scale);
+
+  controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(page), controls);
+
+  button = gtk_button_new_with_label("Previous");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_animation_prev_clicked), tool);
+  gtk_box_append(GTK_BOX(controls), button);
+
+  button = gtk_button_new_with_label("Play");
+  tool->play_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_animation_play_clicked), tool);
+  gtk_box_append(GTK_BOX(controls), button);
+
+  button = gtk_button_new_with_label("Next");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_animation_next_clicked), tool);
+  gtk_box_append(GTK_BOX(controls), button);
+
+  actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(actions, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), actions);
+
+  button = gtk_button_new_with_label("Record...");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gdis_gtk4_window_present_recording_tool), self);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  g_signal_connect(tool->loop_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->delay_spin, "value-changed", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->step_spin, "value-changed", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->preserve_connectivity_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->preserve_scale_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->confine_none_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->confine_atoms_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+  g_signal_connect(tool->confine_molecules_toggle, "toggled", G_CALLBACK(on_animation_processing_changed), tool);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_animation_tool_destroy), tool);
+
+  self->animation_tool = tool;
+  gdis_gtk4_window_refresh_animation_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_recording_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisRecordingTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->recording_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_recording_tool(GdisGtk4Window *self)
+{
+  GdisRecordingTool *tool;
+  GdisAnimationSourceType source;
+  guint source_count;
+  gint active_index;
+  gchar source_label[32];
+  g_autofree gchar *summary = NULL;
+  g_autofree gchar *default_output = NULL;
+  g_autofree gchar *default_prefix = NULL;
+  g_autofree gchar *ffmpeg_path = NULL;
+  const char *current_output;
+  const char *current_prefix;
+  const char *format_label;
+  gboolean movie_enabled;
+  gboolean ffmpeg_available;
+  guint fps;
+  gint viewer_width;
+  gint viewer_height;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->recording_tool;
+  if (!tool)
+    return;
+
+  source = gdis_gtk4_window_get_animation_source(self, &source_count, &active_index);
+  gdis_gtk4_window_get_animation_source_label(source, source_label, sizeof(source_label));
+  viewer_width = self->viewer_area ? gtk_widget_get_width(self->viewer_area) : 1280;
+  viewer_height = self->viewer_area ? gtk_widget_get_height(self->viewer_area) : 900;
+
+  current_output = tool->output_entry ? gtk_editable_get_text(GTK_EDITABLE(tool->output_entry)) : NULL;
+  if (!current_output || current_output[0] == '\0')
+    {
+      default_output = g_build_filename(g_get_current_dir(), "gdis_exports", NULL);
+      gtk_editable_set_text(GTK_EDITABLE(tool->output_entry), default_output);
+    }
+
+  current_prefix = tool->prefix_entry ? gtk_editable_get_text(GTK_EDITABLE(tool->prefix_entry)) : NULL;
+  if ((!current_prefix || current_prefix[0] == '\0') && self->active_model)
+    {
+      default_prefix = g_strdup_printf("%s_capture",
+                                       self->active_model->basename ? self->active_model->basename : "gdis");
+      gtk_editable_set_text(GTK_EDITABLE(tool->prefix_entry), default_prefix);
+    }
+
+  if (tool->width_spin && gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->width_spin)) <= 1)
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->width_spin), MAX(viewer_width, 640));
+  if (tool->height_spin && gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->height_spin)) <= 1)
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->height_spin), MAX(viewer_height, 480));
+  if (tool->fps_spin && gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->fps_spin)) <= 0)
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->fps_spin), 12.0);
+
+  ffmpeg_path = g_find_program_in_path("ffmpeg");
+  ffmpeg_available = (ffmpeg_path != NULL);
+  movie_enabled = tool->movie_enable_toggle &&
+                  gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tool->movie_enable_toggle));
+  format_label = (tool->movie_gif_toggle &&
+                  gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tool->movie_gif_toggle)))
+                   ? "Animated GIF"
+                   : "MP4 (H.264)";
+  fps = tool->fps_spin ? (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->fps_spin)) : 12u;
+
+  if (tool->movie_mp4_toggle)
+    gtk_widget_set_sensitive(tool->movie_mp4_toggle, ffmpeg_available && movie_enabled);
+  if (tool->movie_gif_toggle)
+    gtk_widget_set_sensitive(tool->movie_gif_toggle, ffmpeg_available && movie_enabled);
+  if (tool->fps_spin)
+    gtk_widget_set_sensitive(tool->fps_spin, ffmpeg_available && movie_enabled);
+  if (tool->keep_frames_toggle)
+    gtk_widget_set_sensitive(tool->keep_frames_toggle, ffmpeg_available && movie_enabled);
+  if (tool->movie_button)
+    gtk_widget_set_sensitive(tool->movie_button, ffmpeg_available && movie_enabled);
+
+  summary = g_strdup_printf(
+    "Recording source: %s\n"
+    "Available steps: %u\n"
+    "Current step: %d / %u\n"
+    "Active model: %s\n"
+    "Viewer size: %d x %d\n"
+    "Movie backend: %s\n"
+    "Create movie: %s\n"
+    "Movie format: %s at %u fps\n\n"
+    "Snapshot exports the current view.\n"
+    "Sequence exports one PNG per animation step, using active model frames when available.\n"
+    "Movie export assembles those frames with ffmpeg%s.",
+    source_label,
+    source_count,
+    active_index >= 0 ? active_index + 1 : 0,
+    source_count,
+    self->active_model ? self->active_model->basename : "none",
+    viewer_width,
+    viewer_height,
+    ffmpeg_path ? ffmpeg_path : "not available",
+    movie_enabled ? "on" : "off",
+    format_label,
+    MAX(fps, 1u),
+    ffmpeg_path ? "" : " once ffmpeg is installed");
+  gtk_label_set_text(tool->summary_label, summary);
+}
+
+static void
+on_recording_settings_changed(GtkWidget *widget, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) widget;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  gdis_gtk4_window_refresh_recording_tool(self);
+}
+
+static void
+on_recording_snapshot_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  const char *output_dir;
+  const char *prefix;
+  gint width;
+  gint height;
+  g_autofree gchar *basename = NULL;
+  gchar *path;
+  GError *error;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->recording_tool)
+    return;
+
+  output_dir = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->output_entry));
+  prefix = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->prefix_entry));
+  width = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->width_spin));
+  height = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->height_spin));
+
+  if (!output_dir || output_dir[0] == '\0')
+    {
+      gdis_gtk4_window_log(self, "Recording snapshot failed: choose an output directory first.\n");
+      return;
+    }
+
+  if (g_mkdir_with_parents(output_dir, 0755) != 0)
+    {
+      gdis_gtk4_window_log(self, "Recording snapshot failed: could not create %s.\n", output_dir);
+      return;
+    }
+
+  basename = (prefix && prefix[0] != '\0') ? g_strdup_printf("%s_snapshot.png", prefix)
+                                           : g_strdup("gdis_snapshot.png");
+  path = g_build_filename(output_dir, basename, NULL);
+  error = NULL;
+  if (!gdis_gtk4_window_export_view_png(self, path, width, height, &error))
+    {
+      gdis_gtk4_window_log(self, "Recording snapshot failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      g_free(path);
+      return;
+    }
+
+  gdis_gtk4_window_log(self, "Saved snapshot: %s\n", path);
+  g_free(path);
+}
+
+static void
+on_recording_sequence_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  gint width;
+  gint height;
+  const char *output_dir;
+  const char *prefix;
+  GError *error;
+  guint frame_count;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->recording_tool)
+    return;
+
+  output_dir = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->output_entry));
+  prefix = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->prefix_entry));
+  width = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->width_spin));
+  height = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->height_spin));
+  error = NULL;
+  if (!gdis_gtk4_window_export_animation_sequence(self,
+                                                  output_dir,
+                                                  prefix,
+                                                  width,
+                                                  height,
+                                                  &frame_count,
+                                                  &error))
+    {
+      gdis_gtk4_window_log(self, "Recording sequence failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_log(self,
+                       "Saved PNG sequence to %s using %u animation step%s.\n",
+                       output_dir,
+                       frame_count,
+                       frame_count == 1u ? "" : "s");
+  gdis_gtk4_window_refresh_recording_tool(self);
+}
+
+static void
+on_recording_movie_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  const char *output_dir;
+  const char *prefix;
+  gint width;
+  gint height;
+  guint fps;
+  guint format_index;
+  gboolean keep_frames;
+  guint frame_count;
+  g_autofree gchar *movie_path = NULL;
+  GError *error;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->recording_tool)
+    return;
+
+  output_dir = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->output_entry));
+  prefix = gtk_editable_get_text(GTK_EDITABLE(self->recording_tool->prefix_entry));
+  width = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->width_spin));
+  height = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->height_spin));
+  fps = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->recording_tool->fps_spin));
+  format_index = (self->recording_tool->movie_gif_toggle &&
+                  gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->recording_tool->movie_gif_toggle)))
+                   ? 1u
+                   : 0u;
+  keep_frames = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->recording_tool->keep_frames_toggle));
+
+  if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->recording_tool->movie_enable_toggle)))
+    {
+      gdis_gtk4_window_log(self, "Recording movie failed: enable Create movie first.\n");
+      return;
+    }
+
+  error = NULL;
+  if (!gdis_gtk4_window_export_movie(self,
+                                     output_dir,
+                                     prefix,
+                                     width,
+                                     height,
+                                     MAX(fps, 1u),
+                                     format_index,
+                                     keep_frames,
+                                     &movie_path,
+                                     &frame_count,
+                                     &error))
+    {
+      gdis_gtk4_window_log(self, "Recording movie failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_log(self,
+                       "Created movie %s from %u animation step%s.\n",
+                       movie_path,
+                       frame_count,
+                       frame_count == 1u ? "" : "s");
+  gdis_gtk4_window_refresh_recording_tool(self);
+}
+
+static void
+gdis_gtk4_window_present_recording_tool(GdisGtk4Window *self)
+{
+  GdisRecordingTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *button_row;
+  GtkWidget *button;
+  GtkWidget *frame;
+  GtkWidget *section;
+  GtkWidget *controls;
+  GtkCheckButton *group_head;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->recording_tool && GTK_IS_WINDOW(self->recording_tool->window))
+    {
+      gdis_gtk4_window_refresh_recording_tool(self);
+      gtk_window_present(GTK_WINDOW(self->recording_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisRecordingTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Recording");
+  gtk_window_set_default_size(GTK_WINDOW(window), 700, 460);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  frame = gtk_frame_new("Output");
+  gtk_box_append(GTK_BOX(root), frame);
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_widget_set_margin_start(grid, 10);
+  gtk_widget_set_margin_end(grid, 10);
+  gtk_widget_set_margin_top(grid, 10);
+  gtk_widget_set_margin_bottom(grid, 10);
+  gtk_frame_set_child(GTK_FRAME(frame), grid);
+
+  label = gtk_label_new("Output directory");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  tool->output_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->output_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->output_entry, 1, 0, 3, 1);
+
+  label = gtk_label_new("Prefix");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+  tool->prefix_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->prefix_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->prefix_entry, 1, 1, 3, 1);
+
+  label = gtk_label_new("Width");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+  tool->width_spin = gtk_spin_button_new_with_range(320.0, 4096.0, 16.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->width_spin, 1, 2, 1, 1);
+
+  label = gtk_label_new("Height");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 2, 1, 1);
+  tool->height_spin = gtk_spin_button_new_with_range(240.0, 4096.0, 16.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->height_spin, 3, 2, 1, 1);
+
+  frame = gtk_frame_new("Rendering");
+  gtk_box_append(GTK_BOX(root), frame);
+  section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(section, 10);
+  gtk_widget_set_margin_end(section, 10);
+  gtk_widget_set_margin_top(section, 10);
+  gtk_widget_set_margin_bottom(section, 10);
+  gtk_frame_set_child(GTK_FRAME(frame), section);
+
+  tool->movie_enable_toggle = gtk_check_button_new_with_label("Create movie");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->movie_enable_toggle), TRUE);
+  gtk_box_append(GTK_BOX(section), tool->movie_enable_toggle);
+
+  controls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_set_margin_start(controls, 16);
+  gtk_box_append(GTK_BOX(section), controls);
+
+  group_head = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("MP4 (H.264)"));
+  tool->movie_mp4_toggle = GTK_WIDGET(group_head);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->movie_mp4_toggle), TRUE);
+  gtk_box_append(GTK_BOX(controls), tool->movie_mp4_toggle);
+
+  tool->movie_gif_toggle = gtk_check_button_new_with_label("Animated GIF");
+  gtk_check_button_set_group(GTK_CHECK_BUTTON(tool->movie_gif_toggle), group_head);
+  gtk_box_append(GTK_BOX(controls), tool->movie_gif_toggle);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_box_append(GTK_BOX(controls), grid);
+
+  label = gtk_label_new("Delay / fps");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  tool->fps_spin = gtk_spin_button_new_with_range(1.0, 60.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->fps_spin), 12.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->fps_spin, 1, 0, 1, 1);
+
+  tool->keep_frames_toggle = gtk_check_button_new_with_label("Keep PNG frames after movie export");
+  gtk_grid_attach(GTK_GRID(grid), tool->keep_frames_toggle, 0, 1, 2, 1);
+
+  frame = gtk_frame_new("Export summary");
+  gtk_box_append(GTK_BOX(root), frame);
+  tool->summary_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_wrap(tool->summary_label, TRUE);
+  gtk_label_set_xalign(tool->summary_label, 0.0f);
+  gtk_widget_set_margin_start(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_end(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_top(GTK_WIDGET(tool->summary_label), 10);
+  gtk_widget_set_margin_bottom(GTK_WIDGET(tool->summary_label), 10);
+  gtk_frame_set_child(GTK_FRAME(frame), GTK_WIDGET(tool->summary_label));
+
+  button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(button_row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), button_row);
+
+  button = gtk_button_new_with_label("Snapshot");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_recording_snapshot_clicked), self);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  button = gtk_button_new_with_label("Sequence");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_recording_sequence_clicked), self);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  button = gtk_button_new_with_label("Movie");
+  tool->movie_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_recording_movie_clicked), self);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(button_row), button);
+
+  g_signal_connect(tool->movie_enable_toggle, "toggled", G_CALLBACK(on_recording_settings_changed), self);
+  g_signal_connect(tool->movie_mp4_toggle, "toggled", G_CALLBACK(on_recording_settings_changed), self);
+  g_signal_connect(tool->movie_gif_toggle, "toggled", G_CALLBACK(on_recording_settings_changed), self);
+  g_signal_connect(tool->fps_spin, "value-changed", G_CALLBACK(on_recording_settings_changed), self);
+  g_signal_connect(tool->keep_frames_toggle, "toggled", G_CALLBACK(on_recording_settings_changed), self);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_recording_tool_destroy), tool);
+
+  self->recording_tool = tool;
+  gdis_gtk4_window_refresh_recording_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_zmatrix_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisZmatrixTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  gdis_zmatrix_tool_clear_working_set(tool);
+  if (tool->owner)
+    tool->owner->zmatrix_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_zmatrix_tool_clear_working_set(GdisZmatrixTool *tool)
+{
+  g_return_if_fail(tool != NULL);
+
+  g_clear_pointer(&tool->scope, gdis_uint_array_free);
+  if (tool->rows)
+    {
+      g_array_free(tool->rows, TRUE);
+      tool->rows = NULL;
+    }
+}
+
+static void
+gdis_gtk4_window_refresh_zmatrix_row_controls(GdisGtk4Window *self)
+{
+  GdisZmatrixTool *tool;
+  gint row_index;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->zmatrix_tool;
+  if (!tool || !tool->row_spin || !tool->distance_entry || !tool->angle_entry ||
+      !tool->torsion_entry || !tool->row_label)
+    return;
+
+  tool->suppress_row_signal = TRUE;
+  if (!tool->rows || tool->rows->len == 0u || !self->active_model)
+    {
+      gtk_label_set_text(tool->row_label, "No editable Z-matrix rows are available.");
+      gtk_editable_set_text(GTK_EDITABLE(tool->distance_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(tool->angle_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(tool->torsion_entry), "");
+      gtk_widget_set_sensitive(tool->row_spin, FALSE);
+      gtk_widget_set_sensitive(tool->distance_entry, FALSE);
+      gtk_widget_set_sensitive(tool->angle_entry, FALSE);
+      gtk_widget_set_sensitive(tool->torsion_entry, FALSE);
+      tool->suppress_row_signal = FALSE;
+      return;
+    }
+
+  gtk_widget_set_sensitive(tool->row_spin, TRUE);
+  row_index = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->row_spin));
+  row_index = CLAMP(row_index, 1, (gint) tool->rows->len) - 1;
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->row_spin), row_index + 1);
+
+  {
+    const GdisZmatrixRow *row;
+    const GdisAtom *atom;
+    gint bond_ref;
+    gint angle_ref;
+    gint torsion_ref;
+    gchar number[64];
+    g_autofree gchar *label = NULL;
+    g_autofree gchar *bond_text = NULL;
+    g_autofree gchar *angle_text = NULL;
+    g_autofree gchar *torsion_text = NULL;
+
+    row = &g_array_index(tool->rows, GdisZmatrixRow, row_index);
+    atom = g_ptr_array_index(self->active_model->atoms, row->atom_index);
+    bond_ref = (row->distance_ref != G_MAXUINT)
+               ? gdis_gtk4_window_find_atom_index_in_array(tool->scope, row->distance_ref) + 1
+               : 0;
+    angle_ref = (row->angle_ref != G_MAXUINT)
+                ? gdis_gtk4_window_find_atom_index_in_array(tool->scope, row->angle_ref) + 1
+                : 0;
+    torsion_ref = (row->torsion_ref != G_MAXUINT)
+                  ? gdis_gtk4_window_find_atom_index_in_array(tool->scope, row->torsion_ref) + 1
+                  : 0;
+    bond_text = (bond_ref > 0) ? g_strdup_printf("bond %d", bond_ref) : g_strdup("bond -");
+    angle_text = (angle_ref > 0) ? g_strdup_printf("angle %d", angle_ref) : g_strdup("angle -");
+    torsion_text = (torsion_ref > 0) ? g_strdup_printf("torsion %d", torsion_ref) : g_strdup("torsion -");
+    label = g_strdup_printf("Row %d: %s  |  refs: %s, %s, %s",
+                            row_index + 1,
+                            atom->label && atom->label[0] != '\0' ? atom->label : atom->element,
+                            bond_text,
+                            angle_text,
+                            torsion_text);
+    gtk_label_set_text(tool->row_label, label);
+
+    if (row->distance_ref != G_MAXUINT)
+      {
+        g_snprintf(number, sizeof(number), "%.6f", row->distance);
+        gtk_editable_set_text(GTK_EDITABLE(tool->distance_entry), number);
+      }
+    else
+      {
+        gtk_editable_set_text(GTK_EDITABLE(tool->distance_entry), "");
+      }
+
+    if (row->angle_ref != G_MAXUINT)
+      {
+        g_snprintf(number, sizeof(number), "%.6f", row->angle);
+        gtk_editable_set_text(GTK_EDITABLE(tool->angle_entry), number);
+      }
+    else
+      {
+        gtk_editable_set_text(GTK_EDITABLE(tool->angle_entry), "");
+      }
+
+    if (row->torsion_ref != G_MAXUINT)
+      {
+        g_snprintf(number, sizeof(number), "%.6f", row->torsion);
+        gtk_editable_set_text(GTK_EDITABLE(tool->torsion_entry), number);
+      }
+    else
+      {
+        gtk_editable_set_text(GTK_EDITABLE(tool->torsion_entry), "");
+      }
+
+    gtk_widget_set_sensitive(tool->distance_entry, row->distance_ref != G_MAXUINT);
+    gtk_widget_set_sensitive(tool->angle_entry, row->angle_ref != G_MAXUINT);
+    gtk_widget_set_sensitive(tool->torsion_entry, row->torsion_ref != G_MAXUINT);
+  }
+
+  tool->suppress_row_signal = FALSE;
+}
+
+static gboolean
+gdis_gtk4_window_commit_zmatrix_row_edits(GdisGtk4Window *self, GError **error)
+{
+  GdisZmatrixTool *tool;
+  GdisZmatrixRow *row;
+  gint row_index;
+  g_autofree gchar *report = NULL;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  tool = self->zmatrix_tool;
+  if (!tool || !tool->rows || tool->rows->len == 0u || !self->active_model)
+    return TRUE;
+
+  row_index = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->row_spin));
+  row_index = CLAMP(row_index, 1, (gint) tool->rows->len) - 1;
+  row = &g_array_index(tool->rows, GdisZmatrixRow, row_index);
+
+  if (row->distance_ref != G_MAXUINT)
+    {
+      if (!gdis_gtk4_window_parse_entry_double(tool->distance_entry, "Bond length", &row->distance, error))
+        return FALSE;
+      if (row->distance <= 0.0)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_FAILED,
+                      "Bond length must be greater than zero.");
+          return FALSE;
+        }
+    }
+
+  if (row->angle_ref != G_MAXUINT &&
+      !gdis_gtk4_window_parse_entry_double(tool->angle_entry, "Angle", &row->angle, error))
+    return FALSE;
+
+  if (row->torsion_ref != G_MAXUINT &&
+      !gdis_gtk4_window_parse_entry_double(tool->torsion_entry, "Torsion", &row->torsion, error))
+    return FALSE;
+
+  report = gdis_format_zmatrix_rows(self->active_model,
+                                    tool->scope,
+                                    tool->rows,
+                                    gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->scope_dropdown)) == 1u);
+  gtk_text_buffer_set_text(tool->buffer, report ? report : "Z-matrix report unavailable.", -1);
+  return TRUE;
+}
+
+static void
+gdis_gtk4_window_refresh_zmatrix_tool(GdisGtk4Window *self)
+{
+  GdisZmatrixTool *tool;
+  gboolean use_selection;
+  GArray *scope;
+  GArray *rows;
+  gint wanted_row;
+  GError *error;
+  g_autofree gchar *report = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->zmatrix_tool;
+  if (!tool || !tool->buffer)
+    return;
+
+  if (!self->active_model)
+    {
+      gdis_zmatrix_tool_clear_working_set(tool);
+      gtk_text_buffer_set_text(tool->buffer, "No active model loaded.", -1);
+      gdis_gtk4_window_refresh_zmatrix_row_controls(self);
+      return;
+    }
+
+  use_selection = gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->scope_dropdown)) == 1u;
+  wanted_row = tool->row_spin ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->row_spin)) : 1;
+  error = NULL;
+  if (!gdis_build_zmatrix_rows(self->active_model,
+                               self->selected_atoms,
+                               use_selection,
+                               &scope,
+                               &rows,
+                               &error))
+    {
+      gdis_zmatrix_tool_clear_working_set(tool);
+      gtk_text_buffer_set_text(tool->buffer,
+                               error ? error->message : "Z-matrix report is unavailable.",
+                               -1);
+      g_clear_error(&error);
+      gdis_gtk4_window_refresh_zmatrix_row_controls(self);
+      return;
+    }
+
+  gdis_zmatrix_tool_clear_working_set(tool);
+  tool->scope = scope;
+  tool->rows = rows;
+  report = gdis_format_zmatrix_rows(self->active_model, tool->scope, tool->rows, use_selection);
+  gtk_text_buffer_set_text(tool->buffer, report ? report : "Z-matrix report is unavailable.", -1);
+
+  tool->suppress_row_signal = TRUE;
+  gtk_spin_button_set_range(GTK_SPIN_BUTTON(tool->row_spin), 1.0, (gdouble) MAX(tool->rows->len, 1u));
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->row_spin),
+                            (gdouble) CLAMP(wanted_row, 1, (gint) tool->rows->len));
+  tool->suppress_row_signal = FALSE;
+  gdis_gtk4_window_refresh_zmatrix_row_controls(self);
+}
+
+static void
+on_zmatrix_generate_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+  gdis_gtk4_window_log(self, "Rebuilt the working Z-matrix from the current model.\n");
+}
+
+static void
+on_zmatrix_scope_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) object;
+  (void) pspec;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+}
+
+static void
+on_zmatrix_row_changed(GtkSpinButton *spin, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) spin;
+
+  self = user_data;
+  if (!self || !self->zmatrix_tool || self->zmatrix_tool->suppress_row_signal)
+    return;
+
+  gdis_gtk4_window_refresh_zmatrix_row_controls(self);
+}
+
+static void
+on_zmatrix_entry_changed(GtkEditable *editable, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GError *error;
+
+  (void) editable;
+
+  self = user_data;
+  if (!self || !self->zmatrix_tool || self->zmatrix_tool->suppress_row_signal)
+    return;
+
+  error = NULL;
+  if (!gdis_gtk4_window_commit_zmatrix_row_edits(self, &error))
+    g_clear_error(&error);
+}
+
+static void
+on_zmatrix_apply_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GError *error;
+  g_autofree gchar *summary = NULL;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model || !self->zmatrix_tool || !self->zmatrix_tool->rows)
+    return;
+
+  error = NULL;
+  if (!gdis_gtk4_window_commit_zmatrix_row_edits(self, &error))
+    {
+      gdis_gtk4_window_log(self, "Z-matrix apply failed: %s\n",
+                           error ? error->message : "invalid internal coordinates");
+      g_clear_error(&error);
+      return;
+    }
+
+  if (!gdis_gtk4_window_push_undo_snapshot(self, NULL))
+    return;
+
+  if (!gdis_apply_zmatrix_rows(self->active_model,
+                               self->zmatrix_tool->scope,
+                               self->zmatrix_tool->rows,
+                               &summary,
+                               &error))
+    {
+      gdis_gtk4_window_discard_undo_snapshot(self);
+      gdis_gtk4_window_log(self, "Z-matrix apply failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
+  gdis_gtk4_window_log(self, "%s\n", summary ? summary : "Recomputed geometry from the current Z-matrix rows.");
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+}
+
+static void
+on_zmatrix_build_selection_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->zmatrix_tool)
+    return;
+
+  if (!self->selected_atoms || self->selected_atoms->len == 0u)
+    {
+      gdis_gtk4_window_log(self, "Build Z-matrix from selection failed: select one molecule or atom set first.\n");
+      return;
+    }
+
+  gtk_drop_down_set_selected(GTK_DROP_DOWN(self->zmatrix_tool->scope_dropdown), 1u);
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+  gdis_gtk4_window_log(self, "Rebuilt the working Z-matrix from the current selection order.\n");
+}
+
+static void
+gdis_gtk4_window_present_zmatrix_tool(GdisGtk4Window *self)
+{
+  GdisZmatrixTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *row;
+  GtkWidget *editor_frame;
+  GtkWidget *editor_grid;
+  GtkWidget *units_label;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkStringList *scope_model;
+  const char *const scope_items[] = {"Whole model", "Current selection", NULL};
+
+  g_return_if_fail(self != NULL);
+
+  if (self->zmatrix_tool && GTK_IS_WINDOW(self->zmatrix_tool->window))
+    {
+      gdis_gtk4_window_refresh_zmatrix_tool(self);
+      gtk_window_present(GTK_WINDOW(self->zmatrix_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisZmatrixTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Z-matrix");
+  gtk_window_set_default_size(GTK_WINDOW(window), 920, 640);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(root), row);
+
+  scope_model = gtk_string_list_new(scope_items);
+  tool->scope_dropdown = gtk_drop_down_new(G_LIST_MODEL(scope_model), NULL);
+  g_object_unref(scope_model);
+  gtk_drop_down_set_selected(GTK_DROP_DOWN(tool->scope_dropdown),
+                             (self->selected_atoms && self->selected_atoms->len > 0u) ? 1u : 0u);
+  g_signal_connect(tool->scope_dropdown,
+                   "notify::selected",
+                   G_CALLBACK(on_zmatrix_scope_changed),
+                   self);
+  gtk_box_append(GTK_BOX(row), tool->scope_dropdown);
+
+  button = gtk_button_new_with_label("Generate");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_zmatrix_generate_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Build From Selection");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_zmatrix_build_selection_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Recompute Geometry");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_zmatrix_apply_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(row), button);
+
+  editor_frame = gtk_frame_new("Row Editor");
+  gtk_box_append(GTK_BOX(root), editor_frame);
+
+  editor_grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(editor_grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(editor_grid), 8);
+  gtk_widget_set_margin_start(editor_grid, 10);
+  gtk_widget_set_margin_end(editor_grid, 10);
+  gtk_widget_set_margin_top(editor_grid, 10);
+  gtk_widget_set_margin_bottom(editor_grid, 10);
+  gtk_frame_set_child(GTK_FRAME(editor_frame), editor_grid);
+
+  units_label = gtk_label_new("Distance units: Angstrom   Angle units: degrees");
+  gtk_widget_set_halign(units_label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(editor_grid), units_label, 0, 0, 4, 1);
+
+  button = gtk_label_new("Row");
+  gtk_widget_set_halign(button, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(editor_grid), button, 0, 1, 1, 1);
+
+  tool->row_spin = gtk_spin_button_new_with_range(1.0, 1.0, 1.0);
+  gtk_widget_set_hexpand(tool->row_spin, FALSE);
+  gtk_grid_attach(GTK_GRID(editor_grid), tool->row_spin, 1, 1, 1, 1);
+
+  tool->row_label = GTK_LABEL(gtk_label_new("No editable Z-matrix rows are available."));
+  gtk_label_set_wrap(tool->row_label, TRUE);
+  gtk_label_set_xalign(tool->row_label, 0.0f);
+  gtk_grid_attach(GTK_GRID(editor_grid), GTK_WIDGET(tool->row_label), 2, 1, 2, 1);
+
+  button = gtk_label_new("Bond");
+  gtk_widget_set_halign(button, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(editor_grid), button, 0, 2, 1, 1);
+  tool->distance_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(editor_grid), tool->distance_entry, 1, 2, 1, 1);
+
+  button = gtk_label_new("Angle");
+  gtk_widget_set_halign(button, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(editor_grid), button, 2, 2, 1, 1);
+  tool->angle_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(editor_grid), tool->angle_entry, 3, 2, 1, 1);
+
+  button = gtk_label_new("Torsion");
+  gtk_widget_set_halign(button, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(editor_grid), button, 0, 3, 1, 1);
+  tool->torsion_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(editor_grid), tool->torsion_entry, 1, 3, 1, 1);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_NONE);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  g_signal_connect(tool->row_spin, "value-changed", G_CALLBACK(on_zmatrix_row_changed), self);
+  g_signal_connect(tool->distance_entry, "changed", G_CALLBACK(on_zmatrix_entry_changed), self);
+  g_signal_connect(tool->angle_entry, "changed", G_CALLBACK(on_zmatrix_entry_changed), self);
+  g_signal_connect(tool->torsion_entry, "changed", G_CALLBACK(on_zmatrix_entry_changed), self);
+  g_signal_connect(window, "destroy", G_CALLBACK(on_zmatrix_tool_destroy), tool);
+
+  self->zmatrix_tool = tool;
+  gdis_gtk4_window_refresh_zmatrix_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_dislocation_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisDislocationTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->dislocation_tool = NULL;
+  g_free(tool);
+}
+
+static void
+on_dislocation_execute_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisDislocationSettings settings;
+  GdisDislocationTool *tool;
+  gchar *summary;
+  GError *error;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model || !self->dislocation_tool)
+    return;
+
+  tool = self->dislocation_tool;
+  gdis_dislocation_settings_init(&settings);
+  settings.type = (GdisDislocationType) gtk_drop_down_get_selected(GTK_DROP_DOWN(tool->type_dropdown));
+  settings.radius = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->radius_spin));
+  settings.poisson_ratio = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->poisson_spin));
+  settings.selected_atoms = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tool->selection_toggle))
+                              ? self->selected_atoms
+                              : NULL;
+
+  error = NULL;
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      if (!gdis_gtk4_window_parse_entry_double(tool->line_entries[axis], "Line direction",
+                                               &settings.line_direction[axis], &error) ||
+          !gdis_gtk4_window_parse_entry_double(tool->burgers_entries[axis], "Burgers vector",
+                                               &settings.burgers_vector[axis], &error) ||
+          !gdis_gtk4_window_parse_entry_double(tool->origin_entries[axis], "Origin",
+                                               &settings.origin[axis], &error))
+        {
+          gtk_text_buffer_set_text(tool->buffer,
+                                   error ? error->message : "Invalid dislocation input.",
+                                   -1);
+          g_clear_error(&error);
+          return;
+        }
+    }
+
+  if (!gdis_gtk4_window_push_undo_snapshot(self, NULL))
+    return;
+
+  summary = NULL;
+  if (!gdis_model_apply_dislocation(self->active_model, &settings, &summary, &error))
+    {
+      gdis_gtk4_window_discard_undo_snapshot(self);
+      gtk_text_buffer_set_text(tool->buffer,
+                               error ? error->message : "Dislocation build failed.",
+                               -1);
+      gdis_gtk4_window_log(self, "Dislocation build failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gtk_text_buffer_set_text(tool->buffer, summary ? summary : "Dislocation applied.", -1);
+  g_free(summary);
+  gdis_gtk4_window_refresh_after_model_edit(self, FALSE);
+  gdis_gtk4_window_log(self, "Applied the dislocation transform to the active model.\n");
+}
+
+static void
+gdis_gtk4_window_present_dislocation_tool(GdisGtk4Window *self)
+{
+  GdisDislocationTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *row;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkStringList *type_model;
+  const char *const type_items[] = {"Screw", "Edge (experimental)", NULL};
+  GdisDislocationSettings defaults;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->dislocation_tool && GTK_IS_WINDOW(self->dislocation_tool->window))
+    {
+      gtk_window_present(GTK_WINDOW(self->dislocation_tool->window));
+      return;
+    }
+
+  gdis_dislocation_settings_init(&defaults);
+  tool = g_new0(GdisDislocationTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Dislocations");
+  gtk_window_set_default_size(GTK_WINDOW(window), 840, 520);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  label = gtk_label_new("Type");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  type_model = gtk_string_list_new(type_items);
+  tool->type_dropdown = gtk_drop_down_new(G_LIST_MODEL(type_model), NULL);
+  g_object_unref(type_model);
+  gtk_grid_attach(GTK_GRID(grid), tool->type_dropdown, 1, 0, 2, 1);
+
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      static const char *const axis_labels[] = {"X", "Y", "Z"};
+
+      label = gtk_label_new(axis_labels[axis]);
+      gtk_widget_set_halign(label, GTK_ALIGN_START);
+      gtk_grid_attach(GTK_GRID(grid), label, axis + 1, 1, 1, 1);
+    }
+
+  label = gtk_label_new("Line direction");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+  label = gtk_label_new("Burgers vector");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 3, 1, 1);
+  label = gtk_label_new("Origin");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 4, 1, 1);
+
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      tool->line_entries[axis] = gtk_entry_new();
+      tool->burgers_entries[axis] = gtk_entry_new();
+      tool->origin_entries[axis] = gtk_entry_new();
+      gtk_editable_set_text(GTK_EDITABLE(tool->line_entries[axis]),
+                            axis == 2 ? "1.0" : "0.0");
+      gtk_editable_set_text(GTK_EDITABLE(tool->burgers_entries[axis]),
+                            axis == 2 ? "1.0" : "0.0");
+      gtk_editable_set_text(GTK_EDITABLE(tool->origin_entries[axis]), "0.0");
+      gtk_grid_attach(GTK_GRID(grid), tool->line_entries[axis], axis + 1, 2, 1, 1);
+      gtk_grid_attach(GTK_GRID(grid), tool->burgers_entries[axis], axis + 1, 3, 1, 1);
+      gtk_grid_attach(GTK_GRID(grid), tool->origin_entries[axis], axis + 1, 4, 1, 1);
+    }
+
+  label = gtk_label_new("Radius");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 5, 1, 1);
+  tool->radius_spin = gtk_spin_button_new_with_range(0.0, 200.0, 0.5);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->radius_spin), 0.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->radius_spin, 1, 5, 1, 1);
+
+  label = gtk_label_new("Poisson");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 5, 1, 1);
+  tool->poisson_spin = gtk_spin_button_new_with_range(0.01, 0.49, 0.01);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->poisson_spin), defaults.poisson_ratio);
+  gtk_grid_attach(GTK_GRID(grid), tool->poisson_spin, 3, 5, 1, 1);
+
+  tool->selection_toggle = gtk_check_button_new_with_label("Apply to current selection only");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool->selection_toggle),
+                               self->selected_atoms && self->selected_atoms->len > 0u);
+  gtk_box_append(GTK_BOX(root), tool->selection_toggle);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), row);
+  button = gtk_button_new_with_label("Execute");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_dislocation_execute_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(row), button);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_text_buffer_set_text(tool->buffer,
+                           "Configure the line direction, Burgers vector, and optional radius filter,\nthen Execute to apply a native GTK4 dislocation transform to the active model.",
+                           -1);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_dislocation_tool_destroy), tool);
+
+  self->dislocation_tool = tool;
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_docking_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisDockingTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->docking_tool = NULL;
+  g_free(tool);
+}
+
+static void
+on_docking_generate_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisDockingTool *tool;
+  GdisDockingSettings settings;
+  GError *error;
+  gchar *summary;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->active_model || !self->docking_tool)
+    return;
+
+  tool = self->docking_tool;
+  gdis_docking_settings_init(&settings);
+  settings.output_dir = gtk_editable_get_text(GTK_EDITABLE(tool->output_entry));
+  settings.project_name = gtk_editable_get_text(GTK_EDITABLE(tool->name_entry));
+  settings.preview_limit = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->preview_spin));
+  settings.selected_atoms = self->selected_atoms;
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      settings.grid_counts[axis] =
+        (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->grid_spins[axis]));
+      settings.rotation_counts[axis] =
+        (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->rotation_spins[axis]));
+      settings.translation_span[axis] =
+        gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->span_spins[axis]));
+    }
+
+  error = NULL;
+  summary = NULL;
+  if (!gdis_generate_docking_project(self->active_model, &settings, &summary, &error))
+    {
+      gtk_text_buffer_set_text(tool->buffer,
+                               error ? error->message : "Docking project generation failed.",
+                               -1);
+      gdis_gtk4_window_log(self, "Docking project generation failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gtk_text_buffer_set_text(tool->buffer, summary ? summary : "Docking project generated.", -1);
+  g_free(summary);
+  gdis_gtk4_window_log(self, "Generated the docking project from the current selection.\n");
+}
+
+static void
+gdis_gtk4_window_present_docking_tool(GdisGtk4Window *self)
+{
+  GdisDockingTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *row;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  g_autofree gchar *default_output = NULL;
+  g_autofree gchar *default_name = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->docking_tool && GTK_IS_WINDOW(self->docking_tool->window))
+    {
+      gtk_window_present(GTK_WINDOW(self->docking_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisDockingTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Docking");
+  gtk_window_set_default_size(GTK_WINDOW(window), 860, 540);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  default_output = g_build_filename(g_get_current_dir(), "gdis_docking", NULL);
+  default_name = g_strdup_printf("%s_dock",
+                                 self->active_model && self->active_model->basename
+                                   ? self->active_model->basename
+                                   : "project");
+
+  label = gtk_label_new("Output root");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  tool->output_entry = gtk_entry_new();
+  gtk_editable_set_text(GTK_EDITABLE(tool->output_entry), default_output);
+  gtk_widget_set_hexpand(tool->output_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->output_entry, 1, 0, 5, 1);
+
+  label = gtk_label_new("Project name");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+  tool->name_entry = gtk_entry_new();
+  gtk_editable_set_text(GTK_EDITABLE(tool->name_entry), default_name);
+  gtk_grid_attach(GTK_GRID(grid), tool->name_entry, 1, 1, 5, 1);
+
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      static const char *const axis_labels[] = {"X", "Y", "Z"};
+
+      label = gtk_label_new(axis_labels[axis]);
+      gtk_widget_set_halign(label, GTK_ALIGN_START);
+      gtk_grid_attach(GTK_GRID(grid), label, axis + 1, 2, 1, 1);
+    }
+
+  label = gtk_label_new("Grid counts");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 3, 1, 1);
+  label = gtk_label_new("Rotation counts");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 4, 1, 1);
+  label = gtk_label_new("Translation span");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 5, 1, 1);
+
+  for (guint axis = 0; axis < 3; axis++)
+    {
+      tool->grid_spins[axis] = gtk_spin_button_new_with_range(1.0, 25.0, 1.0);
+      tool->rotation_spins[axis] = gtk_spin_button_new_with_range(1.0, 36.0, 1.0);
+      tool->span_spins[axis] = gtk_spin_button_new_with_range(0.0, 100.0, 0.5);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->grid_spins[axis]), axis < 2 ? 3.0 : 1.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->rotation_spins[axis]), axis == 2 ? 4.0 : 1.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->span_spins[axis]), axis < 2 ? 6.0 : 2.0);
+      gtk_grid_attach(GTK_GRID(grid), tool->grid_spins[axis], axis + 1, 3, 1, 1);
+      gtk_grid_attach(GTK_GRID(grid), tool->rotation_spins[axis], axis + 1, 4, 1, 1);
+      gtk_grid_attach(GTK_GRID(grid), tool->span_spins[axis], axis + 1, 5, 1, 1);
+    }
+
+  label = gtk_label_new("Preview limit");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 6, 1, 1);
+  tool->preview_spin = gtk_spin_button_new_with_range(1.0, 500.0, 1.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->preview_spin), 24.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->preview_spin, 1, 6, 1, 1);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), row);
+  button = gtk_button_new_with_label("Generate");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_docking_generate_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(row), button);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_text_buffer_set_text(tool->buffer,
+                           "Select a fragment in the viewer first, then Generate to create a native GTK4 docking pose ensemble project.",
+                           -1);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_docking_tool_destroy), tool);
+
+  self->docking_tool = tool;
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_periodic_table_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisPeriodicTableTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->periodic_table_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_select_periodic_element(GdisGtk4Window *self, guint atomic_number)
+{
+  GdisPeriodicTableTool *tool;
+  const GdisElementInfo *element;
+  gboolean can_apply;
+  g_autofree gchar *title = NULL;
+  g_autofree gchar *info = NULL;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->periodic_table_tool;
+  if (!tool)
+    return;
+
+  element = gdis_element_lookup_atomic_number(atomic_number);
+  tool->selected_atomic_number = element ? element->atomic_number : 6u;
+  element = gdis_element_lookup_atomic_number(tool->selected_atomic_number);
+
+  title = g_strdup_printf("%s (%s)", element->name, element->symbol);
+  info = g_strdup_printf(
+    "Atomic number: %u\n"
+    "Family: %s\n"
+    "Covalent radius: %.2f A\n"
+    "Van der Waals radius: %.2f A\n"
+    "Viewer radius: %.2f A\n"
+    "Table position: row %u, column %u\n\n"
+    "Use 'Copy to Editor' to populate the GTK4 editing tool, or 'Apply to Selected Atom' to retag the currently selected atom.",
+    element->atomic_number,
+    gdis_element_family_label(element->family),
+    element->covalent_radius,
+    element->vdw_radius,
+    element->draw_radius,
+    element->row,
+    element->column);
+  gtk_label_set_text(tool->title_label, title);
+  gtk_label_set_text(tool->info_label, info);
+
+  can_apply = (self->active_model != NULL &&
+               self->selected_atom_index != INVALID_ATOM_INDEX &&
+               self->selected_atom_index < self->active_model->atoms->len);
+  gtk_widget_set_sensitive(tool->apply_button, can_apply);
+  gtk_widget_set_sensitive(tool->copy_button, TRUE);
+}
+
+static void
+on_periodic_element_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  guint atomic_number;
+
+  self = user_data;
+  atomic_number = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(button), "atomic-number"));
+  if (!self || atomic_number == 0u)
+    return;
+
+  gdis_gtk4_window_select_periodic_element(self, atomic_number);
+}
+
+static void
+on_periodic_copy_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisPeriodicTableTool *tool;
+  GdisGtk4Window *self;
+  const GdisElementInfo *element;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self)
+    return;
+
+  element = gdis_element_lookup_atomic_number(tool->selected_atomic_number ? tool->selected_atomic_number : 6u);
+  gdis_gtk4_window_present_edit_tool(self);
+  if (!self->edit_tool)
+    return;
+
+  gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->element_entry), element->symbol);
+  if (gtk_editable_get_text(GTK_EDITABLE(self->edit_tool->label_entry))[0] == '\0')
+    gtk_editable_set_text(GTK_EDITABLE(self->edit_tool->label_entry), element->symbol);
+  gdis_gtk4_window_log(self, "Copied %s into the GTK4 editing tool.\n", element->symbol);
+  gdis_gtk4_window_refresh_periodic_table_tool(self);
+}
+
+static void
+on_periodic_apply_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisPeriodicTableTool *tool;
+  GdisGtk4Window *self;
+  const GdisElementInfo *element;
+  const GdisAtom *atom;
+  GError *error;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self || !self->active_model)
+    return;
+
+  if (self->selected_atom_index == INVALID_ATOM_INDEX ||
+      self->selected_atom_index >= self->active_model->atoms->len)
+    return;
+
+  element = gdis_element_lookup_atomic_number(tool->selected_atomic_number ? tool->selected_atomic_number : 6u);
+  atom = g_ptr_array_index(self->active_model->atoms, self->selected_atom_index);
+  if (!gdis_gtk4_window_push_undo_snapshot(self, "Apply element from periodic table"))
+    return;
+
+  error = NULL;
+  if (!gdis_model_update_atom(self->active_model,
+                              self->selected_atom_index,
+                              atom->label && atom->label[0] ? atom->label : element->symbol,
+                              element->symbol,
+                              atom->ff_type,
+                              atom->region,
+                              atom->position[0],
+                              atom->position[1],
+                              atom->position[2],
+                              &error))
+    {
+      gdis_gtk4_window_discard_undo_snapshot(self);
+      gdis_gtk4_window_log(self, "Periodic table apply failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
+  gdis_gtk4_window_log(self,
+                       "Applied element %s to atom %u.\n",
+                       element->symbol,
+                       atom->serial);
+}
+
+static void
+gdis_gtk4_window_refresh_periodic_table_tool(GdisGtk4Window *self)
+{
+  GdisPeriodicTableTool *tool;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->periodic_table_tool;
+  if (!tool)
+    return;
+
+  if (tool->selected_atomic_number == 0u)
+    tool->selected_atomic_number = 6u;
+  gdis_gtk4_window_select_periodic_element(self, tool->selected_atomic_number);
+}
+
+static void
+gdis_gtk4_window_present_periodic_table_tool(GdisGtk4Window *self)
+{
+  GdisPeriodicTableTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *content;
+  GtkWidget *scroller;
+  GtkWidget *grid;
+  GtkWidget *right;
+  GtkWidget *button;
+  GtkWidget *frame;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->periodic_table_tool && GTK_IS_WINDOW(self->periodic_table_tool->window))
+    {
+      gdis_gtk4_window_refresh_periodic_table_tool(self);
+      gtk_window_present(GTK_WINDOW(self->periodic_table_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisPeriodicTableTool, 1);
+  tool->owner = self;
+  tool->selected_atomic_number = 6u;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Periodic Table");
+  gtk_window_set_default_size(GTK_WINDOW(window), 980, 520);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_box_append(GTK_BOX(root), content);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(content), scroller);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 6);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), grid);
+
+  for (guint atomic_number = 1; atomic_number <= gdis_element_count(); atomic_number++)
+    {
+      const GdisElementInfo *element;
+
+      element = gdis_element_lookup_atomic_number(atomic_number);
+      button = gtk_button_new_with_label(element->symbol);
+      gtk_widget_set_size_request(button, 46, 34);
+      gtk_widget_set_tooltip_text(button, element->name);
+      g_object_set_data(G_OBJECT(button), "atomic-number", GUINT_TO_POINTER(atomic_number));
+      g_signal_connect(button, "clicked", G_CALLBACK(on_periodic_element_clicked), self);
+      gtk_grid_attach(GTK_GRID(grid),
+                      button,
+                      (gint) element->column - 1,
+                      (gint) element->row - 1,
+                      1,
+                      1);
+    }
+
+  right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_size_request(right, 280, -1);
+  gtk_box_append(GTK_BOX(content), right);
+
+  tool->title_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_xalign(tool->title_label, 0.0f);
+  gtk_box_append(GTK_BOX(right), GTK_WIDGET(tool->title_label));
+
+  frame = gtk_frame_new("Element details");
+  gtk_box_append(GTK_BOX(right), frame);
+  tool->info_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_xalign(tool->info_label, 0.0f);
+  gtk_label_set_wrap(tool->info_label, TRUE);
+  gtk_widget_set_margin_start(GTK_WIDGET(tool->info_label), 10);
+  gtk_widget_set_margin_end(GTK_WIDGET(tool->info_label), 10);
+  gtk_widget_set_margin_top(GTK_WIDGET(tool->info_label), 10);
+  gtk_widget_set_margin_bottom(GTK_WIDGET(tool->info_label), 10);
+  gtk_frame_set_child(GTK_FRAME(frame), GTK_WIDGET(tool->info_label));
+
+  button = gtk_button_new_with_label("Copy to Editor");
+  tool->copy_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_periodic_copy_clicked), tool);
+  gtk_box_append(GTK_BOX(right), button);
+
+  button = gtk_button_new_with_label("Apply to Selected Atom");
+  tool->apply_button = button;
+  g_signal_connect(button, "clicked", G_CALLBACK(on_periodic_apply_clicked), tool);
+  gtk_box_append(GTK_BOX(right), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(right), button);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_periodic_table_tool_destroy), tool);
+
+  self->periodic_table_tool = tool;
+  gdis_gtk4_window_refresh_periodic_table_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+typedef struct
+{
+  const char *id;
+  const char *label;
+  const char *probe_a;
+  const char *probe_b;
+} GdisExecutableSpec;
+
+static const GdisExecutableSpec gdis_executable_specs[] = {
+  {"gulp", "GULP", "gulp", NULL},
+  {"gamess", "GAMESS", "rungms", "gamess"},
+  {"monty", "Monty", "monty", NULL},
+  {"siesta", "SIESTA", "siesta", NULL},
+  {"vasp", "VASP", "vasp_std", "vasp"},
+  {"uspex", "USPEX", "USPEX", "uspex"},
+  {"povray", "POV-Ray", "povray", NULL},
+  {"convert", "ImageMagick", "magick", "convert"}
+};
+
+static const GdisExecutableSpec *
+gdis_executable_spec_for_id(const char *id)
+{
+  for (guint i = 0; i < G_N_ELEMENTS(gdis_executable_specs); i++)
+    {
+      if (g_strcmp0(gdis_executable_specs[i].id, id) == 0)
+        return &gdis_executable_specs[i];
+    }
+  return NULL;
+}
+
+static gchar *
+gdis_executable_detect_path(const GdisExecutableSpec *spec)
+{
+  gchar *path;
+
+  g_return_val_if_fail(spec != NULL, NULL);
+
+  path = g_find_program_in_path(spec->probe_a);
+  if (!path && spec->probe_b)
+    path = g_find_program_in_path(spec->probe_b);
+  return path;
+}
+
+static void
+on_task_manager_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisTaskManagerTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->task_manager_tool = NULL;
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self)
+{
+  GdisTaskManagerTool *tool;
+  GString *text;
+  GdisIsoSurface *surface;
+  GPtrArray *records;
+  GPtrArray *undo_stack;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->task_manager_tool;
+  if (!tool || !tool->buffer)
+    return;
+
+  text = g_string_new("");
+  g_string_append_printf(text, "Loaded models: %u\n", self->models->len);
+  g_string_append_printf(text, "Active model: %s\n\n",
+                         self->active_model ? self->active_model->basename : "none");
+
+  for (guint i = 0; i < self->models->len; i++)
+    {
+      GdisModel *model;
+
+      model = g_ptr_array_index(self->models, i);
+      g_string_append_printf(text,
+                             "%c [%u] %s  |  %u atoms  |  %u bonds\n",
+                             model == self->active_model ? '*' : '-',
+                             i + 1,
+                             model->basename,
+                             model->atom_count,
+                             model->bond_count);
+    }
+
+  g_string_append(text, "\nOpen GTK4 tools:\n");
+  g_string_append_printf(text, "  Display properties: %s\n", self->display_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Editing: %s\n", self->edit_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Measurements: %s\n", self->measure_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Diffraction: %s\n", self->diffraction_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Surface builder: %s\n", self->surface_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Iso-surfaces: %s\n", self->isosurface_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Animation: %s\n", self->animation_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Periodic table: %s\n", self->periodic_table_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Executable paths: %s\n", self->exec_paths_tool ? "open" : "closed");
+
+  if (self->active_model)
+    {
+      records = gdis_gtk4_window_get_measurement_records(self, self->active_model, FALSE);
+      undo_stack = gdis_gtk4_window_get_undo_stack(self, self->active_model, FALSE);
+      surface = gdis_gtk4_window_get_isosurface(self, self->active_model, FALSE);
+      g_string_append(text, "\nActive model state:\n");
+      g_string_append_printf(text, "  Selection size: %u\n", self->selected_atoms ? self->selected_atoms->len : 0u);
+      g_string_append_printf(text, "  Pick history size: %u\n", self->picked_atoms ? self->picked_atoms->len : 0u);
+      g_string_append_printf(text, "  Undo snapshots: %u\n", undo_stack ? undo_stack->len : 0u);
+      g_string_append_printf(text, "  Saved measurements: %u\n", records ? records->len : 0u);
+      g_string_append_printf(text, "  Iso-surface triangles: %u\n",
+                             surface && surface->triangles ? surface->triangles->len : 0u);
+    }
+
+  g_string_append_printf(text,
+                         "\nConfigured executable paths: %u\n",
+                         self->executable_paths ? g_hash_table_size(self->executable_paths) : 0u);
+  gtk_text_buffer_set_text(tool->buffer, text->str, -1);
+  g_string_free(text, TRUE);
+}
+
+static void
+on_task_manager_action_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  const char *action;
+
+  self = user_data;
+  action = g_object_get_data(G_OBJECT(button), "task-action");
+  if (!self || !action)
+    return;
+
+  if (g_strcmp0(action, "display") == 0)
+    gdis_gtk4_window_present_display_tool(self);
+  else if (g_strcmp0(action, "edit") == 0)
+    gdis_gtk4_window_present_edit_tool(self);
+  else if (g_strcmp0(action, "measure") == 0)
+    gdis_gtk4_window_present_measure_tool(self);
+  else if (g_strcmp0(action, "isosurface") == 0)
+    gdis_gtk4_window_present_isosurface_tool(self);
+  else if (g_strcmp0(action, "exec-paths") == 0)
+    gdis_gtk4_window_present_executable_paths_tool(self, NULL);
+  else if (g_strcmp0(action, "close-model") == 0)
+    {
+      if (self->active_model)
+        gdis_gtk4_window_remove_model(self, self->active_model);
+    }
+
+  gdis_gtk4_window_refresh_task_manager_tool(self);
+}
+
+static void
+gdis_gtk4_window_present_task_manager_tool(GdisGtk4Window *self)
+{
+  GdisTaskManagerTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkWidget *actions;
+  GtkWidget *button;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->task_manager_tool && GTK_IS_WINDOW(self->task_manager_tool->window))
+    {
+      gdis_gtk4_window_refresh_task_manager_tool(self);
+      gtk_window_present(GTK_WINDOW(self->task_manager_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisTaskManagerTool, 1);
+  tool->owner = self;
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Task Manager");
+  gtk_window_set_default_size(GTK_WINDOW(window), 720, 420);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  tool->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(root), actions);
+
+  for (guint i = 0; i < 6; i++)
+    {
+      const char *label;
+      const char *action;
+
+      label = "";
+      action = "";
+      switch (i)
+        {
+        case 0:
+          label = "Display";
+          action = "display";
+          break;
+        case 1:
+          label = "Edit";
+          action = "edit";
+          break;
+        case 2:
+          label = "Measure";
+          action = "measure";
+          break;
+        case 3:
+          label = "Iso-surfaces";
+          action = "isosurface";
+          break;
+        case 4:
+          label = "Exec Paths";
+          action = "exec-paths";
+          break;
+        case 5:
+          label = "Close Model";
+          action = "close-model";
+          break;
+        default:
+          break;
+        }
+
+      button = gtk_button_new_with_label(label);
+      g_object_set_data_full(G_OBJECT(button), "task-action", g_strdup(action), g_free);
+      g_signal_connect(button, "clicked", G_CALLBACK(on_task_manager_action_clicked), self);
+      gtk_box_append(GTK_BOX(actions), button);
+    }
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_task_manager_tool_destroy), tool);
+
+  self->task_manager_tool = tool;
+  gdis_gtk4_window_refresh_task_manager_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
+on_exec_paths_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisExecutablePathsTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->exec_paths_tool = NULL;
+  g_clear_pointer(&tool->focus_backend, g_free);
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_executable_paths_tool(GdisGtk4Window *self)
+{
+  GdisExecutablePathsTool *tool;
+  GString *preview;
+  const GdisExecutableSpec *focus_spec;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->exec_paths_tool;
+  if (!tool)
+    return;
+
+  for (guint i = 0; i < G_N_ELEMENTS(gdis_executable_specs); i++)
+    {
+      const char *stored_path;
+      g_autofree gchar *detected_path = NULL;
+
+      stored_path = self->executable_paths ?
+        g_hash_table_lookup(self->executable_paths, gdis_executable_specs[i].id) :
+        NULL;
+      if (!stored_path || !stored_path[0])
+        detected_path = gdis_executable_detect_path(&gdis_executable_specs[i]);
+      gtk_editable_set_text(GTK_EDITABLE(tool->entries[i]),
+                            stored_path && stored_path[0] ? stored_path :
+                            detected_path ? detected_path : "");
+    }
+
+  preview = g_string_new("");
+  focus_spec = gdis_executable_spec_for_id(tool->focus_backend);
+  if (focus_spec)
+    {
+      const char *path_text;
+
+      path_text = gtk_editable_get_text(GTK_EDITABLE(tool->entries[focus_spec - gdis_executable_specs]));
+      g_string_append_printf(preview,
+                             "Focused backend: %s\n"
+                             "Executable: %s\n"
+                             "Active model: %s\n\n"
+                             "The GTK4 rebuild now restores executable-path management here. Native diffraction and surface workflows already run directly in GTK4; backend-specific input-deck editors for %s are still a later port, but this window is now where the session executable path lives.\n",
+                             focus_spec->label,
+                             (path_text && path_text[0]) ? path_text : "(not set)",
+                             self->active_model ? self->active_model->basename : "none",
+                             focus_spec->label);
+    }
+  else
+    {
+      g_string_append(preview,
+                      "Configure session executable paths for restored legacy backends here.\n"
+                      "These paths are kept in the current GTK4 session and reused by the computation menus.");
+    }
+  gtk_text_buffer_set_text(tool->preview_buffer, preview->str, -1);
+  g_string_free(preview, TRUE);
+}
+
+static void
+on_exec_detect_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisExecutablePathsTool *tool;
+  guint index;
+  g_autofree gchar *path = NULL;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  index = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(button), "spec-index"));
+  if (index >= G_N_ELEMENTS(gdis_executable_specs))
+    return;
+
+  path = gdis_executable_detect_path(&gdis_executable_specs[index]);
+  gtk_editable_set_text(GTK_EDITABLE(tool->entries[index]), path ? path : "");
+  gdis_gtk4_window_refresh_executable_paths_tool(tool->owner);
+}
+
+static void
+on_exec_apply_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisExecutablePathsTool *tool;
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  tool = user_data;
+  self = tool ? tool->owner : NULL;
+  if (!self || !self->executable_paths)
+    return;
+
+  for (guint i = 0; i < G_N_ELEMENTS(gdis_executable_specs); i++)
+    {
+      const char *text;
+
+      text = gtk_editable_get_text(GTK_EDITABLE(tool->entries[i]));
+      if (text && text[0])
+        g_hash_table_replace(self->executable_paths,
+                             g_strdup(gdis_executable_specs[i].id),
+                             g_strdup(text));
+      else
+        g_hash_table_remove(self->executable_paths, gdis_executable_specs[i].id);
+    }
+
+  gdis_gtk4_window_log(self, "Saved session executable-path settings.\n");
+  gdis_gtk4_window_refresh_executable_paths_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
+}
+
+static void
+on_exec_detect_all_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisExecutablePathsTool *tool;
+
+  (void) button;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  for (guint i = 0; i < G_N_ELEMENTS(gdis_executable_specs); i++)
+    {
+      g_autofree gchar *path = gdis_executable_detect_path(&gdis_executable_specs[i]);
+      if (path)
+        gtk_editable_set_text(GTK_EDITABLE(tool->entries[i]), path);
+    }
+  gdis_gtk4_window_refresh_executable_paths_tool(tool->owner);
+}
+
+static void
+gdis_gtk4_window_present_executable_paths_tool(GdisGtk4Window *self,
+                                               const char *focus_backend)
+{
+  GdisExecutablePathsTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkWidget *actions;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->exec_paths_tool && GTK_IS_WINDOW(self->exec_paths_tool->window))
+    {
+      g_free(self->exec_paths_tool->focus_backend);
+      self->exec_paths_tool->focus_backend = g_strdup(focus_backend);
+      gdis_gtk4_window_refresh_executable_paths_tool(self);
+      gtk_window_present(GTK_WINDOW(self->exec_paths_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisExecutablePathsTool, 1);
+  tool->owner = self;
+  tool->focus_backend = g_strdup(focus_backend);
+
+  window = gtk_window_new();
+  tool->window = window;
+  gtk_window_set_application(GTK_WINDOW(window), self->app);
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_title(GTK_WINDOW(window), "Executable Paths");
+  gtk_window_set_default_size(GTK_WINDOW(window), 780, 520);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_box_append(GTK_BOX(root), grid);
+
+  for (guint i = 0; i < G_N_ELEMENTS(gdis_executable_specs); i++)
+    {
+      label = gtk_label_new(gdis_executable_specs[i].label);
+      gtk_widget_set_halign(label, GTK_ALIGN_START);
+      gtk_grid_attach(GTK_GRID(grid), label, 0, (gint) i, 1, 1);
+
+      tool->entries[i] = gtk_entry_new();
+      gtk_widget_set_hexpand(tool->entries[i], TRUE);
+      gtk_grid_attach(GTK_GRID(grid), tool->entries[i], 1, (gint) i, 1, 1);
+
+      button = gtk_button_new_with_label("Detect");
+      g_object_set_data(G_OBJECT(button), "spec-index", GUINT_TO_POINTER(i));
+      g_signal_connect(button, "clicked", G_CALLBACK(on_exec_detect_clicked), tool);
+      gtk_grid_attach(GTK_GRID(grid), button, 2, (gint) i, 1, 1);
+    }
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_box_append(GTK_BOX(root), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  tool->preview_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_box_append(GTK_BOX(root), actions);
+
+  button = gtk_button_new_with_label("Detect All");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_exec_detect_all_clicked), tool);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  button = gtk_button_new_with_label("Apply");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_exec_apply_clicked), tool);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(actions), button);
+
+  g_signal_connect(window, "destroy", G_CALLBACK(on_exec_paths_tool_destroy), tool);
+
+  self->exec_paths_tool = tool;
+  gdis_gtk4_window_refresh_executable_paths_tool(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
+static void
 gdis_gtk4_window_update_details(GdisGtk4Window *self)
 {
   GString *summary;
@@ -4509,6 +8142,23 @@ gdis_gtk4_window_find_model(GdisGtk4Window *self, const char *path)
   return NULL;
 }
 
+static gint
+gdis_gtk4_window_get_model_index(GdisGtk4Window *self, GdisModel *model)
+{
+  g_return_val_if_fail(self != NULL, -1);
+
+  if (!model)
+    return -1;
+
+  for (guint i = 0; i < self->models->len; i++)
+    {
+      if (g_ptr_array_index(self->models, i) == model)
+        return (gint) i;
+    }
+
+  return -1;
+}
+
 static GtkWidget *
 gdis_gtk4_window_find_model_button(GdisGtk4Window *self, const char *path)
 {
@@ -4604,6 +8254,10 @@ gdis_gtk4_window_set_active_model(GdisGtk4Window *self, GdisModel *model)
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_diffraction_tool(self);
   gdis_gtk4_window_refresh_surface_tool(self);
+  gdis_gtk4_window_refresh_isosurface_tool(self);
+  gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_periodic_table_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
   gdis_gtk4_window_update_undo_action(self);
 }
 
@@ -4861,12 +8515,16 @@ gdis_gtk4_window_remove_model(GdisGtk4Window *self, GdisModel *model)
     g_hash_table_remove(self->measurement_records, model);
   if (self->undo_stacks)
     g_hash_table_remove(self->undo_stacks, model);
+  if (self->iso_surfaces)
+    g_hash_table_remove(self->iso_surfaces, model);
 
   g_ptr_array_remove_index(self->models, index);
   gdis_gtk4_window_set_active_model(self, replacement);
   gdis_gtk4_window_refresh_model_buttons(self);
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_measure_tool(self);
+  gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
 }
 
 static void
@@ -5143,55 +8801,23 @@ gdis_project_point(const gdouble point[3],
 static gdouble
 gdis_element_draw_radius(const char *element)
 {
-  if (!element || !*element)
-    return 0.65;
+  const GdisElementInfo *info;
 
-  if (g_ascii_strcasecmp(element, "H") == 0)
-    return 0.32;
-  if (g_ascii_strcasecmp(element, "C") == 0)
-    return 0.72;
-  if (g_ascii_strcasecmp(element, "N") == 0)
-    return 0.68;
-  if (g_ascii_strcasecmp(element, "O") == 0)
-    return 0.66;
-  if (g_ascii_strcasecmp(element, "S") == 0)
-    return 1.02;
-  if (g_ascii_strcasecmp(element, "P") == 0)
-    return 1.06;
-  if (g_ascii_strcasecmp(element, "Cl") == 0)
-    return 0.99;
-  if (g_ascii_strcasecmp(element, "Na") == 0)
-    return 1.02;
-  if (g_ascii_strcasecmp(element, "Ca") == 0)
-    return 1.08;
-  return 0.82;
+  info = gdis_element_lookup(element);
+  return info ? info->draw_radius : 0.82;
 }
 
 static void
 gdis_set_element_color(cairo_t *cr, const char *element, gdouble alpha)
 {
-  if (!element || !*element)
-    {
-      cairo_set_source_rgba(cr, 0.78, 0.82, 0.88, alpha);
-      return;
-    }
+  const GdisElementInfo *info;
 
-  if (g_ascii_strcasecmp(element, "H") == 0)
-    cairo_set_source_rgba(cr, 0.96, 0.96, 0.96, alpha);
-  else if (g_ascii_strcasecmp(element, "C") == 0)
-    cairo_set_source_rgba(cr, 0.35, 0.37, 0.40, alpha);
-  else if (g_ascii_strcasecmp(element, "N") == 0)
-    cairo_set_source_rgba(cr, 0.20, 0.45, 0.92, alpha);
-  else if (g_ascii_strcasecmp(element, "O") == 0)
-    cairo_set_source_rgba(cr, 0.88, 0.18, 0.22, alpha);
-  else if (g_ascii_strcasecmp(element, "S") == 0)
-    cairo_set_source_rgba(cr, 0.93, 0.79, 0.24, alpha);
-  else if (g_ascii_strcasecmp(element, "P") == 0)
-    cairo_set_source_rgba(cr, 0.95, 0.56, 0.20, alpha);
-  else if (g_ascii_strcasecmp(element, "Cl") == 0)
-    cairo_set_source_rgba(cr, 0.19, 0.74, 0.30, alpha);
-  else
-    cairo_set_source_rgba(cr, 0.58, 0.74, 0.86, alpha);
+  info = gdis_element_lookup(element);
+  cairo_set_source_rgba(cr,
+                        info ? info->color_rgb[0] : 0.58,
+                        info ? info->color_rgb[1] : 0.74,
+                        info ? info->color_rgb[2] : 0.86,
+                        alpha);
 }
 
 static gint
@@ -5199,6 +8825,22 @@ gdis_projected_atom_compare(gconstpointer left, gconstpointer right)
 {
   const GdisProjectedAtom *a;
   const GdisProjectedAtom *b;
+
+  a = left;
+  b = right;
+
+  if (a->depth < b->depth)
+    return -1;
+  if (a->depth > b->depth)
+    return 1;
+  return 0;
+}
+
+static gint
+gdis_projected_triangle_compare(gconstpointer left, gconstpointer right)
+{
+  const GdisProjectedTriangle *a;
+  const GdisProjectedTriangle *b;
 
   a = left;
   b = right;
@@ -5559,6 +9201,101 @@ gdis_draw_overlay(GdisGtk4Window *self, cairo_t *cr, int width, int height)
 }
 
 static void
+gdis_draw_isosurface(cairo_t *cr,
+                     GdisGtk4Window *self,
+                     const GdisIsoSurface *surface,
+                     const gdouble center[3],
+                     gdouble scale,
+                     int width,
+                     int height)
+{
+  GdisProjectedTriangle *triangles;
+
+  g_return_if_fail(cr != NULL);
+  g_return_if_fail(self != NULL);
+
+  if (!surface || !surface->triangles || surface->triangles->len == 0)
+    return;
+
+  triangles = g_new(GdisProjectedTriangle, surface->triangles->len);
+  for (guint i = 0; i < surface->triangles->len; i++)
+    {
+      const GdisIsoTriangle *triangle;
+      gdouble average_normal[3];
+      gdouble rotated_normal[3];
+      gdouble accumulated_depth;
+
+      triangle = &g_array_index(surface->triangles, GdisIsoTriangle, i);
+      accumulated_depth = 0.0;
+      for (guint v = 0; v < 3; v++)
+        {
+          gdouble depth;
+
+          gdis_project_point(triangle->vertices[v].position,
+                             center,
+                             self->rotation_x,
+                             self->rotation_y,
+                             scale,
+                             width,
+                             height,
+                             &triangles[i].screen[v][0],
+                             &triangles[i].screen[v][1],
+                             &depth);
+          accumulated_depth += depth;
+        }
+
+      average_normal[0] = triangle->vertices[0].normal[0] +
+                          triangle->vertices[1].normal[0] +
+                          triangle->vertices[2].normal[0];
+      average_normal[1] = triangle->vertices[0].normal[1] +
+                          triangle->vertices[1].normal[1] +
+                          triangle->vertices[2].normal[1];
+      average_normal[2] = triangle->vertices[0].normal[2] +
+                          triangle->vertices[1].normal[2] +
+                          triangle->vertices[2].normal[2];
+      gdis_rotate_point(average_normal,
+                        self->rotation_x,
+                        self->rotation_y,
+                        rotated_normal);
+      triangles[i].depth = accumulated_depth / 3.0;
+      triangles[i].shade = CLAMP(0.20 + 0.80 * fabs(rotated_normal[2]), 0.15, 1.0);
+    }
+
+  qsort(triangles,
+        surface->triangles->len,
+        sizeof(*triangles),
+        gdis_projected_triangle_compare);
+
+  cairo_save(cr);
+  cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+  for (guint i = 0; i < surface->triangles->len; i++)
+    {
+      const gdouble shade = triangles[i].shade;
+
+      cairo_move_to(cr, triangles[i].screen[0][0], triangles[i].screen[0][1]);
+      cairo_line_to(cr, triangles[i].screen[1][0], triangles[i].screen[1][1]);
+      cairo_line_to(cr, triangles[i].screen[2][0], triangles[i].screen[2][1]);
+      cairo_close_path(cr);
+      cairo_set_source_rgba(cr,
+                            surface->color_rgba[0] * shade,
+                            surface->color_rgba[1] * shade,
+                            surface->color_rgba[2] * shade,
+                            surface->color_rgba[3]);
+      cairo_fill_preserve(cr);
+      cairo_set_source_rgba(cr,
+                            surface->color_rgba[0] * CLAMP(shade + 0.10, 0.0, 1.0),
+                            surface->color_rgba[1] * CLAMP(shade + 0.10, 0.0, 1.0),
+                            surface->color_rgba[2] * CLAMP(shade + 0.10, 0.0, 1.0),
+                            MIN(surface->color_rgba[3] + 0.12, 0.75));
+      cairo_set_line_width(cr, 0.6);
+      cairo_stroke(cr);
+    }
+  cairo_restore(cr);
+
+  g_free(triangles);
+}
+
+static void
 viewer_draw(GtkDrawingArea *area,
             cairo_t *cr,
             int width,
@@ -5655,6 +9392,14 @@ viewer_draw(GtkDrawingArea *area,
       cairo_stroke(cr);
       cairo_restore(cr);
     }
+
+  {
+    GdisIsoSurface *surface;
+
+    surface = gdis_gtk4_window_get_isosurface(self, self->active_model, FALSE);
+    if (surface)
+      gdis_draw_isosurface(cr, self, surface, center, scale, width, height);
+  }
 
   if (show_atoms)
     {
@@ -5763,6 +9508,381 @@ viewer_draw(GtkDrawingArea *area,
 
   g_free(draw_order);
   g_free(projected);
+}
+
+static gboolean
+gdis_gtk4_window_export_view_png(GdisGtk4Window *self,
+                                 const char *path,
+                                 gint width,
+                                 gint height,
+                                 GError **error)
+{
+  cairo_surface_t *surface;
+  cairo_t *cr;
+  cairo_status_t status;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(path != NULL, FALSE);
+
+  if (width < 32 || height < 32)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "PNG export size must be at least 32x32.");
+      return FALSE;
+    }
+
+  surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+  status = cairo_surface_status(surface);
+  if (status != CAIRO_STATUS_SUCCESS)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not create the export surface: %s",
+                  cairo_status_to_string(status));
+      cairo_surface_destroy(surface);
+      return FALSE;
+    }
+
+  cr = cairo_create(surface);
+  viewer_draw(GTK_DRAWING_AREA(self->viewer_area), cr, width, height, self);
+  cairo_destroy(cr);
+
+  status = cairo_surface_write_to_png(surface, path);
+  cairo_surface_destroy(surface);
+  if (status != CAIRO_STATUS_SUCCESS)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not write '%s': %s",
+                  path,
+                  cairo_status_to_string(status));
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static void
+gdis_gtk4_window_remove_export_dir(const char *dir_path)
+{
+  GDir *dir;
+  const gchar *name;
+
+  if (!dir_path || dir_path[0] == '\0')
+    return;
+
+  dir = g_dir_open(dir_path, 0, NULL);
+  if (!dir)
+    return;
+
+  while ((name = g_dir_read_name(dir)) != NULL)
+    {
+      g_autofree gchar *path = NULL;
+
+      path = g_build_filename(dir_path, name, NULL);
+      g_remove(path);
+    }
+
+  g_dir_close(dir);
+  g_rmdir(dir_path);
+}
+
+static gboolean
+gdis_gtk4_window_run_argv(const gchar * const *argv, GError **error)
+{
+  gint wait_status;
+  gchar *stderr_text;
+
+  stderr_text = NULL;
+  if (!g_spawn_sync(NULL,
+                    (gchar **) argv,
+                    NULL,
+                    G_SPAWN_SEARCH_PATH,
+                    NULL,
+                    NULL,
+                    NULL,
+                    &stderr_text,
+                    &wait_status,
+                    error))
+    {
+      g_free(stderr_text);
+      return FALSE;
+    }
+
+  if (!g_spawn_check_wait_status(wait_status, error))
+    {
+      if (stderr_text && stderr_text[0] != '\0')
+        g_prefix_error(error, "%s", stderr_text);
+      g_free(stderr_text);
+      return FALSE;
+    }
+
+  g_free(stderr_text);
+  return TRUE;
+}
+
+static gboolean
+gdis_gtk4_window_export_animation_sequence(GdisGtk4Window *self,
+                                           const char *output_dir,
+                                           const char *prefix,
+                                           gint width,
+                                           gint height,
+                                           guint *frame_count_out,
+                                           GError **error)
+{
+  GdisAnimationSourceType source;
+  GdisModel *saved_model;
+  guint source_count;
+  gint active_index;
+  guint saved_frame_index;
+  gint saved_model_index;
+  gboolean success;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  source = gdis_gtk4_window_get_animation_source(self, &source_count, &active_index);
+  if (source == GDIS_ANIMATION_SOURCE_NONE || source_count == 0u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "There is nothing to export yet.");
+      return FALSE;
+    }
+  if (!output_dir || output_dir[0] == '\0')
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Choose an output directory first.");
+      return FALSE;
+    }
+  if (g_mkdir_with_parents(output_dir, 0755) != 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not create %s.",
+                  output_dir);
+      return FALSE;
+    }
+
+  saved_model = self->active_model;
+  saved_frame_index = self->active_model ? gdis_model_get_current_frame_index(self->active_model) : 0u;
+  saved_model_index = gdis_gtk4_window_get_model_index(self, self->active_model);
+  success = TRUE;
+
+  for (guint i = 0; i < source_count; i++)
+    {
+      g_autofree gchar *basename = NULL;
+      g_autofree gchar *path = NULL;
+
+      gdis_gtk4_window_animation_step_to_index(self, (gint) i, FALSE);
+      basename = g_strdup_printf("%s_%04u.png",
+                                 (prefix && prefix[0] != '\0') ? prefix : "gdis_capture",
+                                 i + 1u);
+      path = g_build_filename(output_dir, basename, NULL);
+      if (!gdis_gtk4_window_export_view_png(self, path, width, height, error))
+        {
+          success = FALSE;
+          break;
+        }
+    }
+
+  if (source == GDIS_ANIMATION_SOURCE_MODEL_FRAMES && saved_model)
+    {
+      GError *restore_error;
+
+      restore_error = NULL;
+      gdis_model_set_frame_index(saved_model, saved_frame_index, &restore_error);
+      g_clear_error(&restore_error);
+      gdis_gtk4_window_update_details(self);
+      gdis_gtk4_window_refresh_viewer(self);
+      gdis_gtk4_window_refresh_measure_tool(self);
+      gdis_gtk4_window_refresh_edit_tool(self);
+      gdis_gtk4_window_refresh_zmatrix_tool(self);
+    }
+  else if (source == GDIS_ANIMATION_SOURCE_SESSION_MODELS && saved_model_index >= 0)
+    {
+      gdis_gtk4_window_animation_step_to_index(self, saved_model_index, FALSE);
+    }
+
+  if (frame_count_out)
+    *frame_count_out = source_count;
+  return success;
+}
+
+static gboolean
+gdis_gtk4_window_export_movie(GdisGtk4Window *self,
+                              const char *output_dir,
+                              const char *prefix,
+                              gint width,
+                              gint height,
+                              guint fps,
+                              guint format_index,
+                              gboolean keep_frames,
+                              gchar **movie_path_out,
+                              guint *frame_count_out,
+                              GError **error)
+{
+  g_autofree gchar *ffmpeg_path = NULL;
+  g_autofree gchar *frames_dir = NULL;
+  g_autofree gchar *movie_path = NULL;
+  g_autofree gchar *sequence_pattern = NULL;
+  g_autofree gchar *movie_name = NULL;
+  g_autofree gchar *fps_text = NULL;
+  g_autofree gchar *palette_dir = NULL;
+  g_autofree gchar *palette_path = NULL;
+  guint frame_count;
+  gboolean success;
+  const gchar *basename;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+
+  ffmpeg_path = g_find_program_in_path("ffmpeg");
+  if (!ffmpeg_path)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "ffmpeg is required for movie export.");
+      return FALSE;
+    }
+  if (!output_dir || output_dir[0] == '\0')
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Choose an output directory first.");
+      return FALSE;
+    }
+  if (g_mkdir_with_parents(output_dir, 0755) != 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not create %s.",
+                  output_dir);
+      return FALSE;
+    }
+
+  if (keep_frames)
+    frames_dir = g_canonicalize_filename(output_dir, NULL);
+  else
+    frames_dir = g_dir_make_tmp("gdis-movie-XXXXXX", error);
+  if (!frames_dir)
+    return FALSE;
+
+  if (!gdis_gtk4_window_export_animation_sequence(self,
+                                                  frames_dir,
+                                                  prefix,
+                                                  width,
+                                                  height,
+                                                  &frame_count,
+                                                  error))
+    {
+      if (!keep_frames)
+        gdis_gtk4_window_remove_export_dir(frames_dir);
+      return FALSE;
+    }
+
+  basename = (prefix && prefix[0] != '\0') ? prefix : "gdis_capture";
+  movie_name = g_strdup_printf("%s.%s", basename, format_index == 1u ? "gif" : "mp4");
+  movie_path = g_build_filename(output_dir, movie_name, NULL);
+  {
+    g_autofree gchar *pattern_name = NULL;
+
+    pattern_name = g_strdup_printf("%s_%%04d.png", basename);
+    sequence_pattern = g_build_filename(frames_dir, pattern_name, NULL);
+  }
+  fps_text = g_strdup_printf("%u", MAX(fps, 1u));
+  success = FALSE;
+
+  if (format_index == 1u)
+    {
+      const gchar * const palette_argv[] = {
+        "ffmpeg", "-y", "-framerate", fps_text, "-i", sequence_pattern,
+        "-vf", "palettegen", NULL, NULL
+      };
+      const gchar * const gif_argv[] = {
+        "ffmpeg", "-y", "-framerate", fps_text, "-i", sequence_pattern,
+        "-i", NULL, "-lavfi", "paletteuse", NULL, NULL
+      };
+      gchar **palette_argv_mut;
+      gchar **gif_argv_mut;
+
+      palette_dir = g_dir_make_tmp("gdis-gif-XXXXXX", error);
+      if (!palette_dir)
+        goto movie_cleanup;
+      palette_path = g_build_filename(palette_dir, "palette.png", NULL);
+
+      palette_argv_mut = g_new0(gchar *, G_N_ELEMENTS(palette_argv));
+      gif_argv_mut = g_new0(gchar *, G_N_ELEMENTS(gif_argv));
+      memcpy(palette_argv_mut, palette_argv, sizeof(palette_argv));
+      memcpy(gif_argv_mut, gif_argv, sizeof(gif_argv));
+      palette_argv_mut[8] = palette_path;
+      gif_argv_mut[7] = palette_path;
+      gif_argv_mut[10] = movie_path;
+
+      if (!gdis_gtk4_window_run_argv((const gchar * const *) palette_argv_mut, error))
+        {
+          g_free(palette_argv_mut);
+          g_free(gif_argv_mut);
+          goto movie_cleanup;
+        }
+      if (!gdis_gtk4_window_run_argv((const gchar * const *) gif_argv_mut, error))
+        {
+          g_free(palette_argv_mut);
+          g_free(gif_argv_mut);
+          goto movie_cleanup;
+        }
+
+      g_free(palette_argv_mut);
+      g_free(gif_argv_mut);
+    }
+  else
+    {
+      const gchar * const movie_argv[] = {
+        "ffmpeg", "-y", "-framerate", fps_text, "-i", sequence_pattern,
+        "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264",
+        NULL, NULL
+      };
+      gchar **movie_argv_mut;
+
+      movie_argv_mut = g_new0(gchar *, G_N_ELEMENTS(movie_argv));
+      memcpy(movie_argv_mut, movie_argv, sizeof(movie_argv));
+      movie_argv_mut[14] = movie_path;
+      if (!gdis_gtk4_window_run_argv((const gchar * const *) movie_argv_mut, error))
+        {
+          g_free(movie_argv_mut);
+          goto movie_cleanup;
+        }
+      g_free(movie_argv_mut);
+    }
+
+  success = TRUE;
+
+movie_cleanup:
+  if (palette_dir)
+    gdis_gtk4_window_remove_export_dir(palette_dir);
+  if (!keep_frames)
+    gdis_gtk4_window_remove_export_dir(frames_dir);
+
+  if (!success)
+    return FALSE;
+
+  if (movie_path_out)
+    *movie_path_out = g_steal_pointer(&movie_path);
+  if (frame_count_out)
+    *frame_count_out = frame_count;
+  return TRUE;
 }
 
 static void
@@ -7430,6 +11550,9 @@ build_menu_bar_model(void)
   GMenu *computation_menu;
   GMenu *analysis_menu;
   GMenu *view_menu;
+  GMenu *view_general_section;
+  GMenu *view_mode_section;
+  GMenu *view_tools_section;
   GMenu *help_menu;
 
   root = g_menu_new();
@@ -7452,33 +11575,58 @@ build_menu_bar_model(void)
 
   tools_menu = g_menu_new();
   visualization_menu = g_menu_new();
-  g_menu_append(visualization_menu, "Iso-surfaces", "app.isosurface");
+  g_menu_append(visualization_menu, "Animation...", "app.animation");
+  g_menu_append(visualization_menu, "Iso-surfaces...", "app.isosurface");
+  g_menu_append(visualization_menu, "Periodic table...", "app.periodic-table");
   g_menu_append_submenu(tools_menu, "Visualization", G_MENU_MODEL(visualization_menu));
 
   building_menu = g_menu_new();
-  g_menu_append(building_menu, "Editing", "app.edit");
-  g_menu_append(building_menu, "Surfaces", "app.surface");
+  g_menu_append(building_menu, "Editing...", "app.edit");
+  g_menu_append(building_menu, "Dislocations...", "app.dislocations");
+  g_menu_append(building_menu, "Docking...", "app.docking");
+  g_menu_append(building_menu, "Dynamics...", "app.building-dynamics");
+  g_menu_append(building_menu, "Surfaces...", "app.surface");
+  g_menu_append(building_menu, "Zmatrix...", "app.zmatrix");
   g_menu_append_submenu(tools_menu, "Building", G_MENU_MODEL(building_menu));
 
   computation_menu = g_menu_new();
-  g_menu_append(computation_menu, "Diffraction", "app.diffraction");
+  g_menu_append(computation_menu, "Diffraction...", "app.diffraction");
+  g_menu_append(computation_menu, "GULP...", "app.gulp");
+  g_menu_append(computation_menu, "GAMESS...", "app.gamess");
+  g_menu_append(computation_menu, "Monty...", "app.monty");
+  g_menu_append(computation_menu, "SIESTA...", "app.siesta");
+  g_menu_append(computation_menu, "VASP...", "app.vasp");
+  g_menu_append(computation_menu, "USPEX...", "app.uspex");
   g_menu_append_submenu(tools_menu, "Computation", G_MENU_MODEL(computation_menu));
 
   analysis_menu = g_menu_new();
-  g_menu_append(analysis_menu, "Measurements", "app.measure");
+  g_menu_append(analysis_menu, "Dynamics...", "app.analysis-dynamics");
+  g_menu_append(analysis_menu, "Measurements...", "app.measure");
+  g_menu_append(analysis_menu, "Plots...", "app.plots");
   g_menu_append_submenu(tools_menu, "Analysis", G_MENU_MODEL(analysis_menu));
 
   g_menu_append_submenu(root, "Tools", G_MENU_MODEL(tools_menu));
 
   view_menu = g_menu_new();
-  g_menu_append(view_menu, "Display Properties", "app.render");
-  g_menu_append(view_menu, "Reset Model Images", "app.reset-images");
-  g_menu_append(view_menu, "Reset View", "app.reset-view");
+  view_general_section = g_menu_new();
+  g_menu_append(view_general_section, "Display properties...", "app.render");
+  g_menu_append(view_general_section, "Reset model images", "app.reset-images");
+  g_menu_append_section(view_menu, NULL, G_MENU_MODEL(view_general_section));
+
+  view_mode_section = g_menu_new();
+  g_menu_append(view_mode_section, "Normal mode", "app.normal-mode");
+  g_menu_append(view_mode_section, "Recording mode", "app.recording-mode");
+  g_menu_append_section(view_menu, NULL, G_MENU_MODEL(view_mode_section));
+
+  view_tools_section = g_menu_new();
+  g_menu_append(view_tools_section, "Task manager...", "app.task-manager");
+  g_menu_append(view_tools_section, "Executable paths...", "app.executable-paths");
+  g_menu_append_section(view_menu, NULL, G_MENU_MODEL(view_tools_section));
   g_menu_append_submenu(root, "View", G_MENU_MODEL(view_menu));
 
   help_menu = g_menu_new();
-  g_menu_append(help_menu, "About", "app.about");
-  g_menu_append(help_menu, "Manual", "app.manual");
+  g_menu_append(help_menu, "About...", "app.about");
+  g_menu_append(help_menu, "Manual...", "app.manual");
   g_menu_append_submenu(root, "Help", G_MENU_MODEL(help_menu));
 
   g_object_unref(file_menu);
@@ -7489,6 +11637,9 @@ build_menu_bar_model(void)
   g_object_unref(computation_menu);
   g_object_unref(analysis_menu);
   g_object_unref(view_menu);
+  g_object_unref(view_general_section);
+  g_object_unref(view_mode_section);
+  g_object_unref(view_tools_section);
   g_object_unref(help_menu);
 
   return G_MENU_MODEL(root);
@@ -7600,9 +11751,11 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
         "GDIS GTK4 Rebuild\n\n"
         "Current restored core:\n"
         "  - native GTK4 viewer with rotate / zoom / atom picking\n"
-        "  - legacy-derived loaders for XYZ, PDB, ARC/CAR, and CIF\n"
+        "  - legacy-derived loaders for XYZ, PDB, ARC/CAR, and CIF, with multi-frame XYZ/ARC trajectories restored\n"
         "  - structure editing, bond editing, measurements, and undo\n"
-        "  - periodic image controls, slab surface builder, and powder diffraction tool\n\n"
+        "  - periodic image controls, slab surface builder, and powder diffraction tool\n"
+        "  - selected-fragment iso-surfaces, periodic table, and analytic electron-density approximation\n"
+        "  - per-model animation playback with Linux-style Control/Processing/Rendering panels, PNG/movie recording export, Z-matrix row editing with geometry rebuild, native dislocation transforms, docking project generation, and executable-path management\n\n"
         "Important docs in this repo:\n"
         "  - gtk4_rebuild/gtk4_app/README.md\n"
         "  - gtk4_rebuild/RESTORATION_AUDIT.md\n"
@@ -7624,18 +11777,44 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
         "  3. Click atoms to build the current selection and pick history.\n"
         "  4. Use Tools > Building > Editing for atom edits, add atom, and bond editing.\n"
         "  5. Use Tools > Analysis > Measurements for distance / angle / torsion.\n"
-        "  6. Use View > Reset Model Images for periodic image cleanup.\n\n"
+        "  6. Use Tools > Visualization > Periodic table to copy or apply an element.\n"
+        "  7. Use Tools > Visualization > Iso-surfaces for molecular, promolecule, Hirshfeld-style, or analytic electron-density surfaces.\n"
+        "  8. Use Tools > Building > Zmatrix to rebuild an internal-coordinate editor from the whole model or current selection, then Recompute Geometry to apply edits.\n"
+        "  9. Use Tools > Building > Dislocations or Docking for the restored native builders.\n"
+        " 10. Use Tools > Visualization > Animation for the tabbed playback panel, then open Record to export PNG snapshots, sequences, MP4 movies, or animated GIFs.\n"
+        " 11. Use View > Reset Model Images for periodic image cleanup.\n\n"
         "Current GTK4-native tools:\n"
         "  - Editing\n"
         "  - Measurements\n"
         "  - Surface Builder\n"
-        "  - Powder Diffraction\n\n"
+        "  - Powder Diffraction\n"
+        "  - Periodic Table\n"
+        "  - Animation (active-model frames when available, otherwise loaded-model playback)\n"
+        "  - Recording export (PNG sequence / MP4 / GIF)\n"
+        "  - Z-matrix editor with explicit geometry rebuild\n"
+        "  - Dislocation builder\n"
+        "  - Docking project generator\n"
+        "  - Executable Paths / Task Manager\n\n"
         "Detailed parity audit:\n"
         "  gtk4_rebuild/RESTORATION_AUDIT.md\n\n"
         "Legacy reference:\n"
         "  gtk4_rebuild/legacy_snapshot/src/gui_main.c");
       gdis_gtk4_window_present_report(self, "GTK4 Manual", report);
       gdis_gtk4_window_log(self, "Opened GTK4 usage guide.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "animation") == 0)
+    {
+      gdis_gtk4_window_present_animation_tool(self);
+      gdis_gtk4_window_log(self, "Opened animation tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "periodic-table") == 0)
+    {
+      gdis_gtk4_window_present_periodic_table_tool(self);
+      gdis_gtk4_window_log(self, "Opened periodic table.\n");
       return;
     }
 
@@ -7674,13 +11853,64 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
       return;
     }
 
+  if (g_strcmp0(name, "dislocations") == 0)
+    {
+      gdis_gtk4_window_present_dislocation_tool(self);
+      gdis_gtk4_window_log(self, "Opened dislocation tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "docking") == 0)
+    {
+      gdis_gtk4_window_present_docking_tool(self);
+      gdis_gtk4_window_log(self, "Opened docking tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "building-dynamics") == 0 ||
+      g_strcmp0(name, "analysis-dynamics") == 0)
+    {
+      gdis_gtk4_window_present_placeholder_feature(
+        self,
+        "Dynamics...",
+        "The original dynamics builders and analysis dialogs are not ported yet in this GTK4 rebuild.");
+      gdis_gtk4_window_log(self, "Opened dynamics status.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "zmatrix") == 0)
+    {
+      gdis_gtk4_window_present_zmatrix_tool(self);
+      gdis_gtk4_window_log(self, "Opened Z-matrix tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "gulp") == 0 ||
+      g_strcmp0(name, "gamess") == 0 ||
+      g_strcmp0(name, "monty") == 0 ||
+      g_strcmp0(name, "siesta") == 0 ||
+      g_strcmp0(name, "vasp") == 0 ||
+      g_strcmp0(name, "uspex") == 0)
+    {
+      gdis_gtk4_window_present_executable_paths_tool(self, name);
+      gdis_gtk4_window_log(self, "Opened external computation setup for %s.\n", name);
+      return;
+    }
+
+  if (g_strcmp0(name, "plots") == 0)
+    {
+      gdis_gtk4_window_present_placeholder_feature(
+        self,
+        "Plots...",
+        "The original plotting dialogs are not restored yet in the GTK4 rebuild.");
+      gdis_gtk4_window_log(self, "Opened plots status.\n");
+      return;
+    }
+
   if (g_strcmp0(name, "isosurface") == 0)
     {
-      g_autofree char *report = NULL;
-
-      report = gdis_report_isosurface(self->active_model);
-      gdis_gtk4_window_present_report(self, "Iso-surface Status", report);
-      gdis_gtk4_window_log(self, "Opened iso-surface status report.\n");
+      gdis_gtk4_window_present_isosurface_tool(self);
+      gdis_gtk4_window_log(self, "Opened iso-surface tool.\n");
       return;
     }
 
@@ -7688,6 +11918,33 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
     {
       gdis_gtk4_window_present_display_tool(self);
       gdis_gtk4_window_log(self, "Opened display properties.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "normal-mode") == 0)
+    {
+      gdis_gtk4_window_log(self, "Normal mode selected. The GTK4 rebuild already uses the standard viewer interaction mode.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "recording-mode") == 0)
+    {
+      gdis_gtk4_window_present_recording_tool(self);
+      gdis_gtk4_window_log(self, "Opened recording tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "task-manager") == 0)
+    {
+      gdis_gtk4_window_present_task_manager_tool(self);
+      gdis_gtk4_window_log(self, "Opened task manager.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "executable-paths") == 0)
+    {
+      gdis_gtk4_window_present_executable_paths_tool(self, NULL);
+      gdis_gtk4_window_log(self, "Opened executable paths.\n");
       return;
     }
 
@@ -7759,12 +12016,30 @@ install_actions(GtkApplication *app)
     {.name = "invert-selection", .activate = action_dispatch},
     {.name = "delete-selected", .activate = action_dispatch},
     {.name = "render", .activate = action_dispatch},
+    {.name = "animation", .activate = action_dispatch},
+    {.name = "periodic-table", .activate = action_dispatch},
     {.name = "measure", .activate = action_dispatch},
     {.name = "isosurface", .activate = action_dispatch},
+    {.name = "dislocations", .activate = action_dispatch},
+    {.name = "docking", .activate = action_dispatch},
+    {.name = "building-dynamics", .activate = action_dispatch},
+    {.name = "zmatrix", .activate = action_dispatch},
     {.name = "surface", .activate = action_dispatch},
     {.name = "diffraction", .activate = action_dispatch},
+    {.name = "gulp", .activate = action_dispatch},
+    {.name = "gamess", .activate = action_dispatch},
+    {.name = "monty", .activate = action_dispatch},
+    {.name = "siesta", .activate = action_dispatch},
+    {.name = "vasp", .activate = action_dispatch},
+    {.name = "uspex", .activate = action_dispatch},
+    {.name = "analysis-dynamics", .activate = action_dispatch},
+    {.name = "plots", .activate = action_dispatch},
     {.name = "reset-images", .activate = action_dispatch},
     {.name = "reset-view", .activate = action_dispatch},
+    {.name = "normal-mode", .activate = action_dispatch},
+    {.name = "recording-mode", .activate = action_dispatch},
+    {.name = "task-manager", .activate = action_dispatch},
+    {.name = "executable-paths", .activate = action_dispatch},
     {.name = "about", .activate = action_dispatch},
     {.name = "manual", .activate = action_dispatch}
   };
@@ -7829,6 +12104,14 @@ gdis_gtk4_window_new(GtkApplication *app)
                                             g_direct_equal,
                                             NULL,
                                             (GDestroyNotify) g_ptr_array_unref);
+  self->iso_surfaces = g_hash_table_new_full(g_direct_hash,
+                                             g_direct_equal,
+                                             NULL,
+                                             (GDestroyNotify) gdis_isosurface_free);
+  self->executable_paths = g_hash_table_new_full(g_str_hash,
+                                                 g_str_equal,
+                                                 g_free,
+                                                 g_free);
   self->selected_atom_index = INVALID_ATOM_INDEX;
   self->selection_mode = GDIS_SELECTION_MODE_ATOMS;
   self->click_mode = GDIS_CLICK_MODE_SELECT;

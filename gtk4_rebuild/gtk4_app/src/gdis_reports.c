@@ -39,7 +39,8 @@ static gboolean gdis_measure_prepare_periodic(const GdisModel *model,
 static void gdis_cart_to_frac(const gdouble inverse[9],
                               const gdouble cart[3],
                               gdouble frac[3]);
-static void gdis_measure_minimum_image_delta(const gdouble matrix[9],
+static void gdis_measure_minimum_image_delta(const GdisModel *model,
+                                             const gdouble matrix[9],
                                              const gdouble inverse[9],
                                              const gdouble from[3],
                                              const gdouble to[3],
@@ -1129,19 +1130,20 @@ gdis_report_isosurface(const GdisModel *model)
     g_string_append_printf(report, "Active model: %s\n\n", model->basename);
 
   g_string_append(report,
-                  "Iso-surfaces are not just a missing button in this GTK4 rebuild.\n"
-                  "They need volumetric scalar-field data, such as electron density or potential grids.\n\n"
+                  "Iso-surfaces are not impossible here, but they are a much larger rebuild than a menu hookup.\n"
+                  "The original GDIS had real promolecule / electron-density iso-surface code.\n"
+                  "What the GTK4 rebuild still lacks is the scalar-field and mesh-display pipeline that code depends on.\n\n"
                   "The current bridge loads structure models only:\n"
                   "  XYZ\n"
                   "  PDB\n"
                   "  ARC/CAR\n"
                   "  CIF\n\n"
                   "To make iso-surfaces real here, the next port would need:\n"
-                  "  1. grid-data loaders\n"
+                  "  1. grid-data loaders and/or promolecule field generation\n"
                   "  2. scalar-field storage in the GTK4 model bridge\n"
                   "  3. marching-cubes style surface extraction\n"
                   "  4. shaded mesh rendering in the GTK4 viewer\n\n"
-                  "So this one is possible, but it is a separate engine port, not a quick UI hookup.");
+                  "So this feature is feasible, but it is still a separate engine port, not a small bridge fix.");
   return g_string_free(report, FALSE);
 }
 
@@ -1272,7 +1274,8 @@ gdis_atomic_number_for_element(const char *element)
 }
 
 static void
-gdis_measure_minimum_image_delta(const gdouble matrix[9],
+gdis_measure_minimum_image_delta(const GdisModel *model,
+                                 const gdouble matrix[9],
                                  const gdouble inverse[9],
                                  const gdouble from[3],
                                  const gdouble to[3],
@@ -1281,7 +1284,10 @@ gdis_measure_minimum_image_delta(const gdouble matrix[9],
   gdouble from_frac[3];
   gdouble to_frac[3];
   gdouble diff_frac[3];
+  guint dims;
   guint axis;
+
+  g_return_if_fail(model != NULL);
 
   gdis_cart_to_frac(inverse, from, from_frac);
   gdis_cart_to_frac(inverse, to, to_frac);
@@ -1289,7 +1295,12 @@ gdis_measure_minimum_image_delta(const gdouble matrix[9],
   for (axis = 0; axis < 3; axis++)
     diff_frac[axis] = to_frac[axis] - from_frac[axis];
 
-  for (axis = 0; axis < 3; axis++)
+  dims = model->periodicity;
+  if (dims == 0)
+    dims = 3u;
+  dims = MIN(dims, 3u);
+
+  for (axis = 0; axis < dims; axis++)
     diff_frac[axis] -= floor(diff_frac[axis] + 0.5);
 
   delta[0] = matrix[0] * diff_frac[0] + matrix[1] * diff_frac[1] + matrix[2] * diff_frac[2];
@@ -1385,7 +1396,7 @@ gdis_measure_distance(const GdisModel *model, const gdouble a[3], const gdouble 
 
   if (model && gdis_measure_prepare_periodic(model, matrix, inverse))
     {
-      gdis_measure_minimum_image_delta(matrix, inverse, a, b, delta);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, a, b, delta);
       dx = delta[0];
       dy = delta[1];
       dz = delta[2];
@@ -1417,8 +1428,8 @@ gdis_measure_angle(const GdisModel *model,
 
   if (model && gdis_measure_prepare_periodic(model, matrix, inverse))
     {
-      gdis_measure_minimum_image_delta(matrix, inverse, b, a, ba);
-      gdis_measure_minimum_image_delta(matrix, inverse, b, c, bc);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, b, a, ba);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, b, c, bc);
     }
   else
     {
@@ -1470,17 +1481,17 @@ gdis_measure_torsion(const GdisModel *model,
   if (model && gdis_measure_prepare_periodic(model, matrix, inverse))
     {
       memcpy(pos_a, a, sizeof(pos_a));
-      gdis_measure_minimum_image_delta(matrix, inverse, a, b, delta);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, a, b, delta);
       pos_b[0] = pos_a[0] + delta[0];
       pos_b[1] = pos_a[1] + delta[1];
       pos_b[2] = pos_a[2] + delta[2];
 
-      gdis_measure_minimum_image_delta(matrix, inverse, b, c, delta);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, b, c, delta);
       pos_c[0] = pos_b[0] + delta[0];
       pos_c[1] = pos_b[1] + delta[1];
       pos_c[2] = pos_b[2] + delta[2];
 
-      gdis_measure_minimum_image_delta(matrix, inverse, c, d, delta);
+      gdis_measure_minimum_image_delta(model, matrix, inverse, c, d, delta);
       pos_d[0] = pos_c[0] + delta[0];
       pos_d[1] = pos_c[1] + delta[1];
       pos_d[2] = pos_c[2] + delta[2];

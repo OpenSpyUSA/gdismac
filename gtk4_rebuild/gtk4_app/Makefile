@@ -3,8 +3,11 @@ BUILD_DIR := build
 SRC_DIR := src
 SOURCES := \
 	$(SRC_DIR)/main.c \
+	$(SRC_DIR)/gdis_elements.c \
 	$(SRC_DIR)/gdis_gtk4_window.c \
+	$(SRC_DIR)/gdis_isosurface.c \
 	$(SRC_DIR)/gdis_model.c \
+	$(SRC_DIR)/gdis_restoration.c \
 	$(SRC_DIR)/gdis_reports.c \
 	$(SRC_DIR)/gdis_legacy_map.c
 
