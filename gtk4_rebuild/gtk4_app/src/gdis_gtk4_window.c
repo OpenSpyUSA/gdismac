@@ -4,11 +4,13 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <glib/gstdio.h>
 
 #include "gdis_elements.h"
 #include "gdis_legacy_map.h"
 #include "gdis_isosurface.h"
+#include "gdis_macos_menu.h"
 #include "gdis_model.h"
 #include "gdis_restoration.h"
 #include "gdis_reports.h"
@@ -207,6 +209,50 @@ typedef struct _GdisDockingTool
   GtkTextBuffer *buffer;
 } GdisDockingTool;
 
+typedef struct _GdisQboxSpeciesRow
+{
+  gchar *element;
+  GtkWidget *alias_entry;
+  GtkWidget *pseudo_entry;
+} GdisQboxSpeciesRow;
+
+typedef struct _GdisQboxTool
+{
+  struct _GdisGtk4Window *owner;
+  GtkWidget *window;
+  GtkWidget *job_entry;
+  GtkWidget *workdir_entry;
+  GtkWidget *input_entry;
+  GtkWidget *output_entry;
+  GtkWidget *save_entry;
+  GtkWidget *restart_entry;
+  GtkWidget *exec_entry;
+  GtkWidget *launcher_entry;
+  GtkWidget *pseudo_dir_entry;
+  GtkWidget *xc_entry;
+  GtkWidget *wf_dyn_entry;
+  GtkWidget *atoms_dyn_entry;
+  GtkWidget *scf_tol_entry;
+  GtkWidget *ecut_spin;
+  GtkWidget *charge_spin;
+  GtkWidget *padding_spin;
+  GtkWidget *ionic_steps_spin;
+  GtkWidget *scf_steps_spin;
+  GtkWidget *density_update_spin;
+  GtkWidget *use_cell_toggle;
+  GtkWidget *atomic_density_toggle;
+  GtkWidget *randomize_toggle;
+  GtkWidget *species_scroller;
+  GtkLabel *summary_label;
+  GtkTextBuffer *deck_buffer;
+  GtkTextBuffer *report_buffer;
+  GPtrArray *species_rows;
+  GdisModel *source_model;
+  gchar *last_generated_input;
+  gboolean suppress_input_signal;
+  gboolean editor_dirty;
+} GdisQboxTool;
+
 typedef struct _GdisPeriodicTableTool
 {
   struct _GdisGtk4Window *owner;
@@ -230,7 +276,8 @@ typedef struct _GdisExecutablePathsTool
   struct _GdisGtk4Window *owner;
   GtkWidget *window;
   GtkTextBuffer *preview_buffer;
-  GtkWidget *entries[8];
+  GtkWidget **entries;
+  guint entry_count;
   gchar *focus_backend;
 } GdisExecutablePathsTool;
 
@@ -336,6 +383,7 @@ struct _GdisGtk4Window
   GdisZmatrixTool *zmatrix_tool;
   GdisDislocationTool *dislocation_tool;
   GdisDockingTool *docking_tool;
+  GdisQboxTool *qbox_tool;
   GdisPeriodicTableTool *periodic_table_tool;
   GdisTaskManagerTool *task_manager_tool;
   GdisExecutablePathsTool *exec_paths_tool;
@@ -356,10 +404,31 @@ struct _GdisGtk4Window
   gdouble drag_current_x;
   gdouble drag_current_y;
   gdouble zoom;
+  gchar *qbox_last_summary;
+  gchar *qbox_last_workdir;
+  gchar *qbox_last_input_path;
+  gchar *qbox_last_output_path;
+  gchar *qbox_last_stderr_path;
+  gchar *qbox_last_save_path;
 };
 
 static const char *const WINDOW_DATA_KEY = "gdis-gtk4-window";
 static const guint INVALID_ATOM_INDEX = G_MAXUINT;
+static const gdouble GDIS_ANGSTROM_TO_BOHR = 1.8897261254578281;
+static const char *const GDIS_QBOX_DEFAULT_PSEUDO_SOURCE_URL = "http://quantum-simulation.org/potentials/sg15_oncv/xml";
+static const gint GDIS_MAIN_WINDOW_WIDTH = 1360;
+static const gint GDIS_MAIN_WINDOW_HEIGHT = 820;
+static const gint GDIS_MAIN_ROOT_WIDTH = 1120;
+static const gint GDIS_MAIN_ROOT_HEIGHT = 680;
+static const gint GDIS_VIEWER_MIN_WIDTH = 800;
+static const gint GDIS_VIEWER_MIN_HEIGHT = 500;
+static const gint GDIS_STATUS_MIN_HEIGHT = 130;
+static const gint GDIS_MAIN_SIDEBAR_WIDTH = 320;
+static const gint GDIS_RIGHT_PANED_POSITION = 560;
+static gboolean qbox_startup_write_consumed = FALSE;
+static gboolean qbox_startup_run_consumed = FALSE;
+
+typedef struct _GdisExecutableSpec GdisExecutableSpec;
 
 static GtkWidget *gdis_gtk4_window_find_model_button(GdisGtk4Window *self,
                                                      const char *path);
@@ -413,8 +482,29 @@ static void gdis_gtk4_window_refresh_isosurface_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_animation_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_recording_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_zmatrix_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_refresh_qbox_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_periodic_table_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self);
+static void gdis_qbox_clear_last_run_state(GdisGtk4Window *self);
+static void gdis_qbox_set_last_run_state(GdisGtk4Window *self,
+                                         const char *workdir,
+                                         const char *input_path,
+                                         const char *output_path,
+                                         const char *stderr_path,
+                                         const char *save_path);
+static gboolean gdis_qbox_import_result_into_active_model(GdisGtk4Window *self,
+                                                          const char *result_path,
+                                                          GError **error);
+static gchar *gdis_qbox_build_results_report(GdisGtk4Window *self);
+static gchar *gdis_qbox_make_unique_continue_name(const char *workdir,
+                                                  const char *base_stem,
+                                                  const char *extension);
+static gchar *gdis_qbox_extract_last_etotal(const char *text);
+static gchar *gdis_qbox_tail_text(const char *text, gsize max_chars);
+static void on_qbox_use_last_xml_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_continue_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_import_result_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_results_clicked(GtkButton *button, gpointer user_data);
 static void gdis_gtk4_window_refresh_executable_paths_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_sync_display_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
@@ -431,10 +521,13 @@ static void gdis_gtk4_window_present_recording_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_zmatrix_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_dislocation_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_docking_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_present_qbox_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_periodic_table_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_task_manager_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_present_executable_paths_tool(GdisGtk4Window *self,
                                                            const char *focus_backend);
+static const GdisExecutableSpec *gdis_executable_spec_for_id(const char *id);
+static gchar *gdis_executable_detect_path(const GdisExecutableSpec *spec);
 static void gdis_gtk4_window_present_report(GdisGtk4Window *self,
                                             const char *title,
                                             const char *body);
@@ -746,12 +839,20 @@ gdis_gtk4_window_free(gpointer data)
     self->dislocation_tool->owner = NULL;
   if (self->docking_tool)
     self->docking_tool->owner = NULL;
+  if (self->qbox_tool)
+    self->qbox_tool->owner = NULL;
   if (self->periodic_table_tool)
     self->periodic_table_tool->owner = NULL;
   if (self->task_manager_tool)
     self->task_manager_tool->owner = NULL;
   if (self->exec_paths_tool)
     self->exec_paths_tool->owner = NULL;
+  g_clear_pointer(&self->qbox_last_summary, g_free);
+  g_clear_pointer(&self->qbox_last_workdir, g_free);
+  g_clear_pointer(&self->qbox_last_input_path, g_free);
+  g_clear_pointer(&self->qbox_last_output_path, g_free);
+  g_clear_pointer(&self->qbox_last_stderr_path, g_free);
+  g_clear_pointer(&self->qbox_last_save_path, g_free);
   g_free(self);
 }
 
@@ -877,6 +978,7 @@ gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
   gdis_gtk4_window_refresh_animation_tool(self);
   gdis_gtk4_window_refresh_recording_tool(self);
   gdis_gtk4_window_refresh_zmatrix_tool(self);
+  gdis_gtk4_window_refresh_qbox_tool(self);
   gdis_gtk4_window_refresh_periodic_table_tool(self);
   gdis_gtk4_window_refresh_task_manager_tool(self);
   gdis_gtk4_window_update_undo_action(self);
@@ -7074,6 +7176,2691 @@ gdis_gtk4_window_present_docking_tool(GdisGtk4Window *self)
   gtk_window_present(GTK_WINDOW(window));
 }
 
+static gchar *
+gdis_qbox_normalize_symbol(const char *text)
+{
+  g_autofree gchar *trimmed = NULL;
+  gchar *normalized;
+
+  if (!text || text[0] == '\0')
+    return g_strdup("X");
+
+  trimmed = g_strstrip(g_strdup(text));
+  if (trimmed[0] == '\0')
+    return g_strdup("X");
+
+  normalized = g_ascii_strdown(trimmed, -1);
+  normalized[0] = (gchar) g_ascii_toupper(normalized[0]);
+  for (guint i = 1; normalized[i] != '\0'; i++)
+    normalized[i] = (gchar) g_ascii_tolower(normalized[i]);
+
+  return normalized;
+}
+
+static gchar *
+gdis_qbox_entry_text(GtkWidget *entry)
+{
+  g_autofree gchar *text = NULL;
+
+  g_return_val_if_fail(GTK_IS_EDITABLE(entry), g_strdup(""));
+
+  text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(entry)));
+  g_strstrip(text);
+  return g_steal_pointer(&text);
+}
+
+static gchar *
+gdis_qbox_entry_text_or_default(GtkWidget *entry, const char *fallback)
+{
+  g_autofree gchar *text = NULL;
+
+  text = gdis_qbox_entry_text(entry);
+  if (!text[0])
+    return g_strdup(fallback ? fallback : "");
+  return g_steal_pointer(&text);
+}
+
+static gboolean
+gdis_qbox_is_remote_uri(const char *text)
+{
+  return (text &&
+          (g_str_has_prefix(text, "http://") ||
+           g_str_has_prefix(text, "https://") ||
+           g_str_has_prefix(text, "ftp://") ||
+           g_str_has_prefix(text, "file://")));
+}
+
+static gchar *
+gdis_qbox_symbol_alias(const char *symbol)
+{
+  g_autofree gchar *lower = NULL;
+  GString *alias;
+
+  lower = g_ascii_strdown(symbol ? symbol : "x", -1);
+  alias = g_string_new("");
+  for (guint i = 0; lower[i] != '\0'; i++)
+    {
+      if (g_ascii_isalnum(lower[i]))
+        g_string_append_c(alias, lower[i]);
+    }
+  if (alias->len == 0)
+    g_string_append(alias, "x");
+  return g_string_free(alias, FALSE);
+}
+
+static gchar *
+gdis_qbox_sanitize_path_component(const char *text)
+{
+  GString *value;
+
+  value = g_string_new("");
+  if (text)
+    {
+      for (guint i = 0; text[i] != '\0'; i++)
+        {
+          const guchar ch = (guchar) text[i];
+
+          if (g_ascii_isalnum(ch) || ch == '.' || ch == '-' || ch == '_')
+            g_string_append_c(value, (gchar) ch);
+          else
+            g_string_append_c(value, '_');
+        }
+    }
+  if (value->len == 0)
+    g_string_append(value, "qbox_job");
+  return g_string_free(value, FALSE);
+}
+
+static gchar *
+gdis_qbox_job_slug(const char *text)
+{
+  return gdis_qbox_sanitize_path_component(text);
+}
+
+static gchar *
+gdis_qbox_model_base_name(const GdisModel *model)
+{
+  g_autofree gchar *basename = NULL;
+  gchar *dot;
+
+  if (!model || !model->basename)
+    return g_strdup("qbox_job");
+
+  basename = g_strdup(model->basename);
+  dot = strrchr(basename, '.');
+  if (dot)
+    *dot = '\0';
+  return gdis_qbox_job_slug(basename);
+}
+
+static gchar *
+gdis_qbox_default_pseudo_cache_dir(void)
+{
+  return g_build_filename(g_get_user_data_dir(),
+                          "gdis",
+                          "qbox-pseudos",
+                          "sg15_oncv",
+                          "xml",
+                          NULL);
+}
+
+static gchar *
+gdis_qbox_default_pseudo_source(void)
+{
+  g_autofree gchar *cache_dir = NULL;
+
+  cache_dir = gdis_qbox_default_pseudo_cache_dir();
+  if (g_file_test(cache_dir, G_FILE_TEST_IS_DIR))
+    return g_steal_pointer(&cache_dir);
+
+  return g_strdup(GDIS_QBOX_DEFAULT_PSEUDO_SOURCE_URL);
+}
+
+static gboolean
+gdis_qbox_download_remote_file(const char *uri,
+                               const char *dest_path,
+                               GError **error)
+{
+  g_autofree gchar *curl_path = NULL;
+  gint wait_status = 0;
+  gchar *stdout_text = NULL;
+  gchar *stderr_text = NULL;
+  gchar *argv[9];
+
+  g_return_val_if_fail(uri != NULL, FALSE);
+  g_return_val_if_fail(dest_path != NULL, FALSE);
+
+  curl_path = g_find_program_in_path("curl");
+  if (!curl_path)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not find 'curl', which is needed to download Qbox pseudopotentials.");
+      return FALSE;
+    }
+
+  argv[0] = curl_path;
+  argv[1] = "-L";
+  argv[2] = "--fail";
+  argv[3] = "--silent";
+  argv[4] = "--show-error";
+  argv[5] = "-o";
+  argv[6] = (gchar *) dest_path;
+  argv[7] = (gchar *) uri;
+  argv[8] = NULL;
+
+  if (!g_spawn_sync(NULL,
+                    argv,
+                    NULL,
+                    G_SPAWN_SEARCH_PATH,
+                    NULL,
+                    NULL,
+                    &stdout_text,
+                    &stderr_text,
+                    &wait_status,
+                    error))
+    {
+      g_free(stdout_text);
+      g_free(stderr_text);
+      return FALSE;
+    }
+
+  if (!g_spawn_check_wait_status(wait_status, error))
+    {
+      g_prefix_error(error, "Could not download '%s': ", uri);
+      if (stderr_text && stderr_text[0])
+        {
+          g_autofree gchar *previous = g_strdup((*error)->message);
+          g_clear_error(error);
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_IO,
+                      "%s%s",
+                      previous ? previous : "Download failed. ",
+                      stderr_text);
+        }
+      g_free(stdout_text);
+      g_free(stderr_text);
+      return FALSE;
+    }
+
+  g_free(stdout_text);
+  g_free(stderr_text);
+  return TRUE;
+}
+
+static gchar *
+gdis_qbox_guess_pseudo_path(const char *pseudo_dir,
+                            const char *symbol,
+                            const char *xc_name)
+{
+  g_autofree gchar *trimmed = NULL;
+  g_autofree gchar *normalized_symbol = NULL;
+  g_autofree gchar *upper_xc = NULL;
+  static const char *const patterns[] = {
+    "%s_HSCV_%s-1.0.xml",
+    "%s_HSCV_%s-1.1.xml",
+    "%s_HSCV_%s.xml",
+    "%s_ONCV_%s-1.0.xml",
+    "%s_ONCV_%s-1.2.xml",
+    "%s_ONCV_%s.xml",
+    "%s_%s.xml",
+    "%s.xml",
+    NULL
+  };
+
+  if (!pseudo_dir || pseudo_dir[0] == '\0')
+    return NULL;
+
+  trimmed = g_strdup(pseudo_dir);
+  g_strstrip(trimmed);
+  while (g_str_has_suffix(trimmed, "/"))
+    trimmed[strlen(trimmed) - 1] = '\0';
+  if (trimmed[0] == '\0')
+    return NULL;
+
+  normalized_symbol = gdis_qbox_normalize_symbol(symbol);
+  upper_xc = g_ascii_strup((xc_name && xc_name[0]) ? xc_name : "PBE", -1);
+
+  if (gdis_qbox_is_remote_uri(trimmed))
+    {
+      g_autofree gchar *basename = NULL;
+
+      basename = g_strdup_printf("%s_ONCV_%s-1.2.xml", normalized_symbol, upper_xc);
+      if (g_strrstr(trimmed, "sg15_oncv") || g_str_has_suffix(trimmed, "/xml"))
+        return g_strdup_printf("%s/%s", trimmed, basename);
+
+      return g_strdup_printf("%s/%s/%s_HSCV_%s-1.0.xml",
+                             trimmed,
+                             normalized_symbol,
+                             normalized_symbol,
+                             upper_xc);
+    }
+
+  if (!g_file_test(trimmed, G_FILE_TEST_IS_DIR))
+    return NULL;
+
+  for (guint i = 0; patterns[i] != NULL; i++)
+    {
+      g_autofree gchar *basename = NULL;
+      g_autofree gchar *path = NULL;
+      g_autofree gchar *nested = NULL;
+
+      basename = g_strdup_printf(patterns[i], normalized_symbol, upper_xc);
+      path = g_build_filename(trimmed, basename, NULL);
+      if (g_file_test(path, G_FILE_TEST_EXISTS))
+        return g_steal_pointer(&path);
+
+      nested = g_build_filename(trimmed, normalized_symbol, basename, NULL);
+      if (g_file_test(nested, G_FILE_TEST_EXISTS))
+        return g_steal_pointer(&nested);
+    }
+
+  return NULL;
+}
+
+static gchar *
+gdis_qbox_lookup_executable_path(GdisGtk4Window *self)
+{
+  const GdisExecutableSpec *spec;
+  const char *stored_path;
+
+  g_return_val_if_fail(self != NULL, NULL);
+
+  stored_path = self->executable_paths ?
+    g_hash_table_lookup(self->executable_paths, "qbox") :
+    NULL;
+  if (stored_path && stored_path[0] != '\0')
+    return g_strdup(stored_path);
+
+  spec = gdis_executable_spec_for_id("qbox");
+  return spec ? gdis_executable_detect_path(spec) : NULL;
+}
+
+static gchar *
+gdis_qbox_default_workdir(GdisGtk4Window *self, const char *job_slug)
+{
+  g_autofree gchar *cwd = NULL;
+
+  (void) self;
+
+  cwd = g_get_current_dir();
+  return g_build_filename(cwd, "qbox_jobs", job_slug && job_slug[0] ? job_slug : "qbox_job", NULL);
+}
+
+static GPtrArray *
+gdis_qbox_collect_unique_species(const GdisModel *model)
+{
+  GHashTable *seen;
+  GPtrArray *species;
+
+  g_return_val_if_fail(model != NULL, NULL);
+
+  seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  species = g_ptr_array_new_with_free_func(g_free);
+  for (guint i = 0; i < model->atoms->len; i++)
+    {
+      const GdisAtom *atom;
+      g_autofree gchar *symbol = NULL;
+
+      atom = g_ptr_array_index(model->atoms, i);
+      symbol = gdis_qbox_normalize_symbol(atom->element && atom->element[0] ? atom->element : atom->label);
+      if (g_hash_table_contains(seen, symbol))
+        continue;
+      g_hash_table_add(seen, g_strdup(symbol));
+      g_ptr_array_add(species, g_strdup(symbol));
+    }
+  g_hash_table_unref(seen);
+  return species;
+}
+
+static guint
+gdis_qbox_count_unique_species(const GdisModel *model)
+{
+  g_autoptr(GPtrArray) species = NULL;
+
+  species = gdis_qbox_collect_unique_species(model);
+  return species ? species->len : 0u;
+}
+
+static gboolean
+gdis_qbox_build_cell_and_shift(const GdisModel *model,
+                               gboolean prefer_model_cell,
+                               gdouble padding_angstrom,
+                               gdouble cell_bohr[9],
+                               gdouble shift_angstrom[3],
+                               gchar **cell_mode_out,
+                               GError **error)
+{
+  gboolean used_model_cell;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  memset(cell_bohr, 0, sizeof(gdouble) * 9);
+  shift_angstrom[0] = 0.0;
+  shift_angstrom[1] = 0.0;
+  shift_angstrom[2] = 0.0;
+  used_model_cell = FALSE;
+
+  if (prefer_model_cell && model->periodic)
+    {
+      gdouble a_vec[3];
+      gdouble b_vec[3];
+      gdouble c_vec[3];
+
+      if (gdis_model_build_cell_vectors(model, a_vec, b_vec, c_vec))
+        {
+          cell_bohr[0] = a_vec[0] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[1] = a_vec[1] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[2] = a_vec[2] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[3] = b_vec[0] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[4] = b_vec[1] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[5] = b_vec[2] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[6] = c_vec[0] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[7] = c_vec[1] * GDIS_ANGSTROM_TO_BOHR;
+          cell_bohr[8] = c_vec[2] * GDIS_ANGSTROM_TO_BOHR;
+          used_model_cell = TRUE;
+        }
+    }
+
+  if (!used_model_cell)
+    {
+      gdouble min_pos[3];
+      gdouble max_pos[3];
+      gboolean have_atoms;
+
+      have_atoms = FALSE;
+      for (guint i = 0; i < model->atoms->len; i++)
+        {
+          const GdisAtom *atom;
+
+          atom = g_ptr_array_index(model->atoms, i);
+          if (!have_atoms)
+            {
+              memcpy(min_pos, atom->position, sizeof(min_pos));
+              memcpy(max_pos, atom->position, sizeof(max_pos));
+              have_atoms = TRUE;
+            }
+          else
+            {
+              for (guint axis = 0; axis < 3; axis++)
+                {
+                  min_pos[axis] = MIN(min_pos[axis], atom->position[axis]);
+                  max_pos[axis] = MAX(max_pos[axis], atom->position[axis]);
+                }
+            }
+        }
+
+      if (!have_atoms)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_FAILED,
+                      "The active model does not contain any atoms to export to Qbox.");
+          return FALSE;
+        }
+
+      for (guint axis = 0; axis < 3; axis++)
+        {
+          gdouble span_angstrom;
+
+          span_angstrom = MAX(max_pos[axis] - min_pos[axis], 1.0e-3) + 2.0 * padding_angstrom;
+          cell_bohr[axis * 3 + axis] = span_angstrom * GDIS_ANGSTROM_TO_BOHR;
+          shift_angstrom[axis] = padding_angstrom - min_pos[axis];
+        }
+    }
+
+  if (cell_mode_out)
+    *cell_mode_out = g_strdup(used_model_cell ? "Model periodic cell" : "Bounding box cell");
+  return TRUE;
+}
+
+static void
+gdis_qbox_species_row_free(gpointer data)
+{
+  GdisQboxSpeciesRow *row;
+
+  row = data;
+  if (!row)
+    return;
+
+  g_clear_pointer(&row->element, g_free);
+  g_free(row);
+}
+
+static void
+gdis_qbox_tool_set_generated_text(GdisQboxTool *tool, const char *text)
+{
+  g_return_if_fail(tool != NULL);
+
+  tool->suppress_input_signal = TRUE;
+  gtk_text_buffer_set_text(tool->deck_buffer, text ? text : "", -1);
+  tool->suppress_input_signal = FALSE;
+
+  g_free(tool->last_generated_input);
+  tool->last_generated_input = g_strdup(text ? text : "");
+  tool->editor_dirty = FALSE;
+}
+
+static GdisQboxSpeciesRow *
+gdis_qbox_find_species_row(GdisQboxTool *tool, const char *symbol)
+{
+  g_return_val_if_fail(tool != NULL, NULL);
+
+  if (!tool->species_rows)
+    return NULL;
+
+  for (guint i = 0; i < tool->species_rows->len; i++)
+    {
+      GdisQboxSpeciesRow *row;
+
+      row = g_ptr_array_index(tool->species_rows, i);
+      if (g_strcmp0(row->element, symbol) == 0)
+        return row;
+    }
+
+  return NULL;
+}
+
+static gchar *
+gdis_qbox_restart_reference(GdisQboxTool *tool)
+{
+  g_autofree gchar *restart_text = NULL;
+  g_autofree gchar *resolved = NULL;
+
+  restart_text = gdis_qbox_entry_text(tool->restart_entry);
+  if (!restart_text[0])
+    return NULL;
+  if (gdis_qbox_is_remote_uri(restart_text))
+    return g_steal_pointer(&restart_text);
+
+  resolved = gdis_gtk4_window_resolve_path(restart_text);
+  if (resolved)
+    return g_strdup("restart.xml");
+
+  return g_strdup("<missing-restart-xml>");
+}
+
+static gchar *
+gdis_qbox_species_reference(GdisQboxSpeciesRow *row)
+{
+  g_autofree gchar *pseudo_text = NULL;
+  g_autofree gchar *resolved = NULL;
+  g_autofree gchar *basename = NULL;
+
+  g_return_val_if_fail(row != NULL, g_strdup("<missing-species>"));
+
+  pseudo_text = gdis_qbox_entry_text(row->pseudo_entry);
+  if (!pseudo_text[0])
+    return g_strdup_printf("<set-pseudo-for-%s>", row->element ? row->element : "X");
+  if (gdis_qbox_is_remote_uri(pseudo_text))
+    return g_steal_pointer(&pseudo_text);
+
+  resolved = gdis_gtk4_window_resolve_path(pseudo_text);
+  if (!resolved)
+    return g_strdup_printf("<missing-pseudo-for-%s>", row->element ? row->element : "X");
+
+  basename = g_path_get_basename(resolved);
+  return gdis_qbox_sanitize_path_component(basename);
+}
+
+static void
+gdis_qbox_append_candidate_uri(GPtrArray *candidates, const char *uri)
+{
+  g_return_if_fail(candidates != NULL);
+
+  if (!uri || !uri[0])
+    return;
+  for (guint i = 0; i < candidates->len; i++)
+    {
+      const char *existing = g_ptr_array_index(candidates, i);
+
+      if (g_strcmp0(existing, uri) == 0)
+        return;
+    }
+  g_ptr_array_add(candidates, g_strdup(uri));
+}
+
+static gchar *
+gdis_qbox_remote_pseudo_fallback(const char *symbol, const char *xc_name)
+{
+  return gdis_qbox_guess_pseudo_path(GDIS_QBOX_DEFAULT_PSEUDO_SOURCE_URL,
+                                     symbol,
+                                     xc_name);
+}
+
+static gboolean
+gdis_qbox_prepare_local_pseudo_library(GdisGtk4Window *self,
+                                       GdisQboxTool *tool,
+                                       guint *downloaded_out,
+                                       guint *relinked_out,
+                                       GString *warnings,
+                                       GError **error)
+{
+  g_autofree gchar *cache_dir = NULL;
+  g_autofree gchar *pseudo_dir = NULL;
+  g_autofree gchar *xc_name = NULL;
+  guint downloaded = 0u;
+  guint relinked = 0u;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(tool != NULL, FALSE);
+
+  cache_dir = gdis_qbox_default_pseudo_cache_dir();
+  if (g_mkdir_with_parents(cache_dir, 0755) != 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not create the Qbox pseudo cache '%s': %s",
+                  cache_dir,
+                  g_strerror(errno));
+      return FALSE;
+    }
+
+  pseudo_dir = gdis_qbox_entry_text(tool->pseudo_dir_entry);
+  xc_name = gdis_qbox_entry_text_or_default(tool->xc_entry, "PBE");
+
+  for (guint i = 0; tool->species_rows && i < tool->species_rows->len; i++)
+    {
+      GdisQboxSpeciesRow *row;
+      g_autofree gchar *current = NULL;
+      g_autofree gchar *resolved = NULL;
+      g_autofree gchar *guessed = NULL;
+      g_autoptr(GPtrArray) candidates = NULL;
+      gboolean linked = FALSE;
+
+      row = g_ptr_array_index(tool->species_rows, i);
+      current = gdis_qbox_entry_text(row->pseudo_entry);
+      resolved = current[0] && !gdis_qbox_is_remote_uri(current) ?
+        gdis_gtk4_window_resolve_path(current) : NULL;
+      if (resolved)
+        continue;
+
+      candidates = g_ptr_array_new_with_free_func(g_free);
+      if (current[0] && gdis_qbox_is_remote_uri(current))
+        gdis_qbox_append_candidate_uri(candidates, current);
+
+      if (pseudo_dir[0] && gdis_qbox_is_remote_uri(pseudo_dir))
+        {
+          guessed = gdis_qbox_guess_pseudo_path(pseudo_dir, row->element, xc_name);
+          gdis_qbox_append_candidate_uri(candidates, guessed);
+        }
+
+      g_clear_pointer(&guessed, g_free);
+      guessed = gdis_qbox_remote_pseudo_fallback(row->element, xc_name);
+      gdis_qbox_append_candidate_uri(candidates, guessed);
+
+      for (guint candidate_index = 0; candidate_index < candidates->len; candidate_index++)
+        {
+          const char *candidate_uri;
+          g_autofree gchar *basename = NULL;
+          g_autofree gchar *safe_name = NULL;
+          g_autofree gchar *dest_path = NULL;
+          GError *download_error = NULL;
+
+          candidate_uri = g_ptr_array_index(candidates, candidate_index);
+          basename = g_path_get_basename(candidate_uri);
+          safe_name = gdis_qbox_sanitize_path_component(basename);
+          dest_path = g_build_filename(cache_dir, safe_name, NULL);
+
+          if (!g_file_test(dest_path, G_FILE_TEST_EXISTS))
+            {
+              if (!gdis_qbox_download_remote_file(candidate_uri, dest_path, &download_error))
+                {
+                  if (warnings)
+                    g_string_append_printf(warnings,
+                                           "Could not download pseudo for %s from %s: %s\n",
+                                           row->element,
+                                           candidate_uri,
+                                           download_error ? download_error->message : "unknown error");
+                  g_clear_error(&download_error);
+                  continue;
+                }
+              downloaded++;
+            }
+
+          gtk_editable_set_text(GTK_EDITABLE(row->pseudo_entry), dest_path);
+          linked = TRUE;
+          relinked++;
+          break;
+        }
+
+      if (!linked)
+        {
+          if (warnings)
+            g_string_append_printf(warnings,
+                                   "No usable pseudo source was found for %s.\n",
+                                   row->element);
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_IO,
+                      "Could not prepare a local Qbox pseudo for %s.",
+                      row->element);
+          return FALSE;
+        }
+    }
+
+  gtk_editable_set_text(GTK_EDITABLE(tool->pseudo_dir_entry), cache_dir);
+  if (downloaded_out)
+    *downloaded_out = downloaded;
+  if (relinked_out)
+    *relinked_out = relinked;
+  return TRUE;
+}
+
+static void
+gdis_qbox_tool_rebuild_species_rows(GdisGtk4Window *self,
+                                    GdisQboxTool *tool)
+{
+  GtkWidget *grid;
+
+  g_return_if_fail(self != NULL);
+  g_return_if_fail(tool != NULL);
+
+  g_clear_pointer(&tool->species_rows, g_ptr_array_unref);
+  tool->species_rows = g_ptr_array_new_with_free_func(gdis_qbox_species_row_free);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_widget_set_margin_start(grid, 10);
+  gtk_widget_set_margin_end(grid, 10);
+  gtk_widget_set_margin_top(grid, 10);
+  gtk_widget_set_margin_bottom(grid, 10);
+
+  if (!self->active_model)
+    {
+      GtkWidget *label;
+
+      label = gtk_label_new("Load a model to populate the Qbox species table.");
+      gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+      gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+      gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+      gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(tool->species_scroller), grid);
+      return;
+    }
+
+  gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Element"), 0, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Species"), 1, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Pseudo URI / File"), 2, 0, 1, 1);
+
+  g_autoptr(GPtrArray) species = gdis_qbox_collect_unique_species(self->active_model);
+  for (guint i = 0; species && i < species->len; i++)
+    {
+      GdisQboxSpeciesRow *row;
+      const char *element;
+      GtkWidget *label;
+      g_autofree gchar *alias = NULL;
+      g_autofree gchar *guess = NULL;
+
+      row = g_new0(GdisQboxSpeciesRow, 1);
+      element = g_ptr_array_index(species, i);
+      row->element = g_strdup(element);
+
+      label = gtk_label_new(element);
+      gtk_widget_set_halign(label, GTK_ALIGN_START);
+      gtk_grid_attach(GTK_GRID(grid), label, 0, (gint) i + 1, 1, 1);
+
+      row->alias_entry = gtk_entry_new();
+      alias = gdis_qbox_symbol_alias(element);
+      gtk_editable_set_text(GTK_EDITABLE(row->alias_entry), alias);
+      gtk_grid_attach(GTK_GRID(grid), row->alias_entry, 1, (gint) i + 1, 1, 1);
+
+      row->pseudo_entry = gtk_entry_new();
+      gtk_widget_set_hexpand(row->pseudo_entry, TRUE);
+      guess = gdis_qbox_guess_pseudo_path(gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
+                                          element,
+                                          gtk_editable_get_text(GTK_EDITABLE(tool->xc_entry)));
+      gtk_editable_set_text(GTK_EDITABLE(row->pseudo_entry), guess ? guess : "");
+      gtk_grid_attach(GTK_GRID(grid), row->pseudo_entry, 2, (gint) i + 1, 1, 1);
+
+      g_ptr_array_add(tool->species_rows, row);
+    }
+
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(tool->species_scroller), grid);
+}
+
+static gboolean
+gdis_qbox_build_input_deck(GdisGtk4Window *self,
+                           GdisQboxTool *tool,
+                           gchar **deck_out,
+                           gchar **cell_mode_out,
+                           GError **error)
+{
+  g_autofree gchar *xc_name = NULL;
+  g_autofree gchar *wf_dyn = NULL;
+  g_autofree gchar *atoms_dyn = NULL;
+  g_autofree gchar *scf_tol = NULL;
+  g_autofree gchar *restart_reference = NULL;
+  gdouble cell_bohr[9];
+  gdouble shift_angstrom[3];
+  gdouble padding_angstrom;
+  guint scf_steps;
+  guint ionic_steps;
+  guint density_update;
+  gint charge;
+  GString *deck;
+  GHashTable *element_counts;
+  gboolean use_atomic_density;
+  gboolean use_model_cell;
+  gboolean randomize_wf;
+  gboolean locked_atoms;
+  gboolean have_placeholders;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(tool != NULL, FALSE);
+  g_return_val_if_fail(deck_out != NULL, FALSE);
+
+  if (!self->active_model)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Load a model before generating a Qbox input deck.");
+      return FALSE;
+    }
+
+  xc_name = gdis_qbox_entry_text_or_default(tool->xc_entry, "PBE");
+  wf_dyn = gdis_qbox_entry_text_or_default(tool->wf_dyn_entry, "PSDA");
+  atoms_dyn = gdis_qbox_entry_text_or_default(tool->atoms_dyn_entry, "LOCKED");
+  scf_tol = gdis_qbox_entry_text_or_default(tool->scf_tol_entry, "1.0e-8");
+  restart_reference = gdis_qbox_restart_reference(tool);
+  padding_angstrom = gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->padding_spin));
+  scf_steps = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->scf_steps_spin));
+  ionic_steps = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->ionic_steps_spin));
+  density_update = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->density_update_spin));
+  charge = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->charge_spin));
+  use_atomic_density = gtk_check_button_get_active(GTK_CHECK_BUTTON(tool->atomic_density_toggle));
+  use_model_cell = gtk_check_button_get_active(GTK_CHECK_BUTTON(tool->use_cell_toggle));
+  randomize_wf = gtk_check_button_get_active(GTK_CHECK_BUTTON(tool->randomize_toggle));
+  locked_atoms = (g_ascii_strcasecmp(atoms_dyn, "LOCKED") == 0 || ionic_steps == 0u);
+  have_placeholders = FALSE;
+
+  scf_steps = MAX(scf_steps, 1u);
+  density_update = MAX(density_update, 1u);
+
+  if (!gdis_qbox_build_cell_and_shift(self->active_model,
+                                      use_model_cell,
+                                      padding_angstrom,
+                                      cell_bohr,
+                                      shift_angstrom,
+                                      cell_mode_out,
+                                      error))
+    return FALSE;
+
+  deck = g_string_new(
+    "# Qbox deck generated by the GDIS GTK4 Qbox tool.\n"
+    "# Coordinates and cell vectors are written in bohr.\n"
+    "# Local pseudo files and local restart XML files are staged into the job directory on Write Input / Run.\n");
+
+  if (restart_reference && restart_reference[0])
+    {
+      if (restart_reference[0] == '<')
+        have_placeholders = TRUE;
+      g_string_append_printf(deck,
+                             "# Restart source from the controls window.\n"
+                             "load %s\n\n",
+                             restart_reference);
+    }
+  else
+    {
+      GHashTable *written_species;
+
+      g_string_append_printf(deck,
+                             "set cell %.10g %.10g %.10g %.10g %.10g %.10g %.10g %.10g %.10g\n",
+                             cell_bohr[0], cell_bohr[1], cell_bohr[2],
+                             cell_bohr[3], cell_bohr[4], cell_bohr[5],
+                             cell_bohr[6], cell_bohr[7], cell_bohr[8]);
+
+      written_species = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+      for (guint i = 0; tool->species_rows && i < tool->species_rows->len; i++)
+        {
+          GdisQboxSpeciesRow *row;
+          g_autofree gchar *alias = NULL;
+          g_autofree gchar *reference = NULL;
+
+          row = g_ptr_array_index(tool->species_rows, i);
+          alias = gdis_qbox_entry_text(row->alias_entry);
+          if (!alias[0])
+            {
+              g_free(alias);
+              alias = gdis_qbox_symbol_alias(row->element);
+              gtk_editable_set_text(GTK_EDITABLE(row->alias_entry), alias);
+            }
+          reference = gdis_qbox_species_reference(row);
+          if (reference[0] == '<')
+            have_placeholders = TRUE;
+          if (!g_hash_table_contains(written_species, row->element))
+            {
+              g_hash_table_add(written_species, g_strdup(row->element));
+              g_string_append_printf(deck, "species %s %s\n", alias, reference);
+            }
+        }
+      g_hash_table_unref(written_species);
+
+      element_counts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+      for (guint i = 0; i < self->active_model->atoms->len; i++)
+        {
+          const GdisAtom *atom;
+          g_autofree gchar *symbol = NULL;
+          GdisQboxSpeciesRow *row;
+          g_autofree gchar *alias = NULL;
+          guint count;
+          gdouble x_bohr;
+          gdouble y_bohr;
+          gdouble z_bohr;
+
+          atom = g_ptr_array_index(self->active_model->atoms, i);
+          symbol = gdis_qbox_normalize_symbol(atom->element && atom->element[0] ? atom->element : atom->label);
+          row = gdis_qbox_find_species_row(tool, symbol);
+          alias = row ? gdis_qbox_entry_text(row->alias_entry) : gdis_qbox_symbol_alias(symbol);
+          if (!alias[0])
+            {
+              g_free(alias);
+              alias = gdis_qbox_symbol_alias(symbol);
+            }
+
+          count = GPOINTER_TO_UINT(g_hash_table_lookup(element_counts, symbol)) + 1u;
+          g_hash_table_replace(element_counts, g_strdup(symbol), GUINT_TO_POINTER(count));
+
+          x_bohr = (atom->position[0] + shift_angstrom[0]) * GDIS_ANGSTROM_TO_BOHR;
+          y_bohr = (atom->position[1] + shift_angstrom[1]) * GDIS_ANGSTROM_TO_BOHR;
+          z_bohr = (atom->position[2] + shift_angstrom[2]) * GDIS_ANGSTROM_TO_BOHR;
+
+          g_string_append_printf(deck,
+                                 "atom %s%u %s %.10g %.10g %.10g\n",
+                                 symbol,
+                                 count,
+                                 alias,
+                                 x_bohr,
+                                 y_bohr,
+                                 z_bohr);
+        }
+      g_hash_table_unref(element_counts);
+      g_string_append_c(deck, '\n');
+    }
+
+  if (have_placeholders)
+    g_string_append(deck, "# Replace any <...> placeholders before running Qbox.\n");
+  g_string_append_printf(deck, "set xc %s\n", xc_name);
+  g_string_append_printf(deck, "set ecut %.1f\n", gtk_spin_button_get_value(GTK_SPIN_BUTTON(tool->ecut_spin)));
+  g_string_append_printf(deck, "set scf_tol %s\n", scf_tol);
+  g_string_append_printf(deck, "set wf_dyn %s\n", wf_dyn);
+  g_string_append_printf(deck, "set atoms_dyn %s\n", atoms_dyn);
+  g_string_append(deck, "set cell_dyn LOCKED\n");
+  if (charge != 0)
+    g_string_append_printf(deck, "set net_charge %d\n", charge);
+  if (randomize_wf && !(restart_reference && restart_reference[0]))
+    g_string_append(deck, "randomize_wf\n");
+  g_string_append_printf(deck,
+                         "run %s%u %u %u\n",
+                         use_atomic_density ? "-atomic_density " : "",
+                         locked_atoms ? 0u : ionic_steps,
+                         scf_steps,
+                         density_update);
+  if (gtk_editable_get_text(GTK_EDITABLE(tool->save_entry))[0])
+    g_string_append_printf(deck, "save %s\n", gtk_editable_get_text(GTK_EDITABLE(tool->save_entry)));
+
+  *deck_out = g_string_free(deck, FALSE);
+  return TRUE;
+}
+
+static gchar *
+gdis_qbox_text_buffer_contents(GtkTextBuffer *buffer)
+{
+  GtkTextIter start;
+  GtkTextIter end;
+
+  g_return_val_if_fail(GTK_IS_TEXT_BUFFER(buffer), NULL);
+
+  gtk_text_buffer_get_bounds(buffer, &start, &end);
+  return gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+}
+
+static void
+gdis_qbox_set_report(GtkTextBuffer *buffer, const char *text)
+{
+  g_return_if_fail(GTK_IS_TEXT_BUFFER(buffer));
+
+  gtk_text_buffer_set_text(buffer,
+                           text && text[0] != '\0' ? text :
+                           "No Qbox report yet.",
+                           -1);
+}
+
+static void
+on_qbox_deck_buffer_changed(GtkTextBuffer *buffer, gpointer user_data)
+{
+  GdisQboxTool *tool;
+  g_autofree gchar *current_text = NULL;
+
+  (void) buffer;
+
+  tool = user_data;
+  if (!tool || tool->suppress_input_signal)
+    return;
+
+  current_text = gdis_qbox_text_buffer_contents(tool->deck_buffer);
+  tool->editor_dirty = (g_strcmp0(current_text, tool->last_generated_input) != 0);
+}
+
+static void
+gdis_qbox_set_last_summary(GdisGtk4Window *self, const char *summary)
+{
+  g_return_if_fail(self != NULL);
+
+  g_free(self->qbox_last_summary);
+  self->qbox_last_summary = g_strdup(summary ? summary : "");
+}
+
+static void
+gdis_qbox_clear_last_run_state(GdisGtk4Window *self)
+{
+  g_return_if_fail(self != NULL);
+
+  g_clear_pointer(&self->qbox_last_workdir, g_free);
+  g_clear_pointer(&self->qbox_last_input_path, g_free);
+  g_clear_pointer(&self->qbox_last_output_path, g_free);
+  g_clear_pointer(&self->qbox_last_stderr_path, g_free);
+  g_clear_pointer(&self->qbox_last_save_path, g_free);
+}
+
+static void
+gdis_qbox_set_last_run_state(GdisGtk4Window *self,
+                             const char *workdir,
+                             const char *input_path,
+                             const char *output_path,
+                             const char *stderr_path,
+                             const char *save_path)
+{
+  g_return_if_fail(self != NULL);
+
+  gdis_qbox_clear_last_run_state(self);
+  self->qbox_last_workdir = g_strdup(workdir);
+  self->qbox_last_input_path = g_strdup(input_path);
+  self->qbox_last_output_path = g_strdup(output_path);
+  self->qbox_last_stderr_path = g_strdup(stderr_path);
+  self->qbox_last_save_path = g_strdup(save_path);
+}
+
+static gboolean
+gdis_qbox_import_result_into_active_model(GdisGtk4Window *self,
+                                          const char *result_path,
+                                          GError **error)
+{
+  g_autofree gchar *resolved_path = NULL;
+  g_autoptr(GdisModel) loaded = NULL;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(result_path != NULL, FALSE);
+
+  if (!self->active_model)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "There is no active model to replace with the Qbox result.");
+      return FALSE;
+    }
+
+  resolved_path = gdis_gtk4_window_resolve_path(result_path);
+  if (!resolved_path)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not locate the Qbox result XML '%s'.",
+                  result_path);
+      return FALSE;
+    }
+
+  loaded = gdis_model_load(resolved_path, error);
+  if (!loaded)
+    return FALSE;
+
+  if (!gdis_model_copy_from(self->active_model, loaded, error))
+    return FALSE;
+
+  gdis_gtk4_window_refresh_after_model_edit(self, TRUE);
+  gdis_gtk4_window_set_active_model(self, self->active_model);
+  gdis_gtk4_window_log(self, "Imported Qbox result into the active model: %s\n", resolved_path);
+  return TRUE;
+}
+
+static gchar *
+gdis_qbox_build_results_report(GdisGtk4Window *self)
+{
+  GString *report;
+  g_autofree gchar *stdout_text = NULL;
+  g_autofree gchar *stderr_text = NULL;
+  g_autofree gchar *stdout_tail = NULL;
+  g_autofree gchar *stderr_tail = NULL;
+  g_autofree gchar *last_etotal = NULL;
+
+  g_return_val_if_fail(self != NULL, g_strdup("No Qbox results available."));
+
+  report = g_string_new("");
+  if (!self->qbox_last_output_path && !self->qbox_last_save_path)
+    {
+      g_string_append(report,
+                      "No completed Qbox run is recorded in this session yet.\n"
+                      "Run a Qbox job first, then reopen Results.");
+      return g_string_free(report, FALSE);
+    }
+
+  g_string_append(report, "Qbox Session Results\n");
+  if (self->qbox_last_summary && self->qbox_last_summary[0])
+    g_string_append_printf(report, "Last activity: %s\n", self->qbox_last_summary);
+  if (self->qbox_last_workdir)
+    g_string_append_printf(report, "Working directory: %s\n", self->qbox_last_workdir);
+  if (self->qbox_last_input_path)
+    g_string_append_printf(report, "Input deck: %s\n", self->qbox_last_input_path);
+  if (self->qbox_last_output_path)
+    g_string_append_printf(report, "stdout report: %s\n", self->qbox_last_output_path);
+  if (self->qbox_last_stderr_path)
+    g_string_append_printf(report, "stderr report: %s\n", self->qbox_last_stderr_path);
+  if (self->qbox_last_save_path)
+    g_string_append_printf(report, "Saved XML: %s%s\n",
+                           self->qbox_last_save_path,
+                           g_file_test(self->qbox_last_save_path, G_FILE_TEST_EXISTS) ? "" : " (missing)");
+
+  if (self->qbox_last_output_path)
+    g_file_get_contents(self->qbox_last_output_path, &stdout_text, NULL, NULL);
+  if (self->qbox_last_stderr_path)
+    g_file_get_contents(self->qbox_last_stderr_path, &stderr_text, NULL, NULL);
+
+  last_etotal = gdis_qbox_extract_last_etotal(stdout_text);
+  if (last_etotal && last_etotal[0])
+    g_string_append_printf(report, "Last <etotal>: %s\n", last_etotal);
+
+  stdout_tail = gdis_qbox_tail_text(stdout_text, 12000u);
+  stderr_tail = gdis_qbox_tail_text(stderr_text, 6000u);
+
+  if (stdout_tail && stdout_tail[0])
+    g_string_append_printf(report, "\nRecent stdout:\n%s", stdout_tail);
+  if (stderr_tail && stderr_tail[0])
+    g_string_append_printf(report, "\n\nRecent stderr:\n%s", stderr_tail);
+
+  return g_string_free(report, FALSE);
+}
+
+static gchar *
+gdis_qbox_make_unique_continue_name(const char *workdir,
+                                    const char *base_stem,
+                                    const char *extension)
+{
+  guint index;
+
+  g_return_val_if_fail(base_stem != NULL, NULL);
+  g_return_val_if_fail(extension != NULL, NULL);
+
+  for (index = 1u; index < 1000u; index++)
+    {
+      g_autofree gchar *candidate = NULL;
+      g_autofree gchar *candidate_path = NULL;
+
+      if (index == 1u)
+        candidate = g_strdup_printf("%s-continue.%s", base_stem, extension);
+      else
+        candidate = g_strdup_printf("%s-continue-%u.%s", base_stem, index, extension);
+
+      if (!workdir || !workdir[0])
+        return g_steal_pointer(&candidate);
+
+      candidate_path = g_build_filename(workdir, candidate, NULL);
+      if (!g_file_test(candidate_path, G_FILE_TEST_EXISTS))
+        return g_steal_pointer(&candidate);
+    }
+
+  return g_strdup_printf("%s-continue-final.%s", base_stem, extension);
+}
+
+static void
+on_qbox_tool_destroy(GtkWindow *window, gpointer user_data)
+{
+  GdisQboxTool *tool;
+
+  (void) window;
+
+  tool = user_data;
+  if (!tool)
+    return;
+
+  if (tool->owner)
+    tool->owner->qbox_tool = NULL;
+  g_clear_pointer(&tool->species_rows, g_ptr_array_unref);
+  g_clear_pointer(&tool->last_generated_input, g_free);
+  g_free(tool);
+}
+
+static void
+gdis_gtk4_window_refresh_qbox_tool(GdisGtk4Window *self)
+{
+  GdisQboxTool *tool;
+  GString *summary;
+  guint unique_species;
+  gboolean model_changed;
+
+  g_return_if_fail(self != NULL);
+
+  tool = self->qbox_tool;
+  if (!tool)
+    return;
+
+  model_changed = (tool->source_model != self->active_model);
+  if (model_changed)
+    {
+      g_autofree gchar *default_job = gdis_qbox_model_base_name(self->active_model);
+      g_autofree gchar *job_slug = NULL;
+      g_autofree gchar *default_workdir = NULL;
+      g_autofree gchar *default_exec = NULL;
+
+      gtk_editable_set_text(GTK_EDITABLE(tool->job_entry), default_job);
+      job_slug = gdis_qbox_job_slug(default_job);
+      default_workdir = gdis_qbox_default_workdir(self, job_slug);
+      gtk_editable_set_text(GTK_EDITABLE(tool->workdir_entry), default_workdir);
+
+      {
+        g_autofree gchar *input_name = g_strdup_printf("%s.i", job_slug);
+        g_autofree gchar *output_name = g_strdup_printf("%s.r", job_slug);
+        g_autofree gchar *save_name = g_strdup_printf("%s.xml", job_slug);
+        gtk_editable_set_text(GTK_EDITABLE(tool->input_entry), input_name);
+        gtk_editable_set_text(GTK_EDITABLE(tool->output_entry), output_name);
+        gtk_editable_set_text(GTK_EDITABLE(tool->save_entry), save_name);
+      }
+
+      gtk_editable_set_text(GTK_EDITABLE(tool->restart_entry), "");
+      gtk_editable_set_text(GTK_EDITABLE(tool->launcher_entry), "");
+      {
+        g_autofree gchar *default_pseudo_source = gdis_qbox_default_pseudo_source();
+        gtk_editable_set_text(GTK_EDITABLE(tool->pseudo_dir_entry), default_pseudo_source);
+      }
+      gtk_editable_set_text(GTK_EDITABLE(tool->xc_entry), "PBE");
+      gtk_editable_set_text(GTK_EDITABLE(tool->wf_dyn_entry), "PSDA");
+      gtk_editable_set_text(GTK_EDITABLE(tool->atoms_dyn_entry), "LOCKED");
+      gtk_editable_set_text(GTK_EDITABLE(tool->scf_tol_entry), "1.0e-8");
+
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->ecut_spin), 35.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->charge_spin), 0.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->padding_spin), 8.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->ionic_steps_spin), 0.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->scf_steps_spin), 40.0);
+      gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->density_update_spin), 10.0);
+      gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->use_cell_toggle),
+                                  self->active_model && self->active_model->periodic);
+      gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->atomic_density_toggle),
+                                  !(self->active_model && self->active_model->periodic));
+      gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->randomize_toggle), TRUE);
+
+      default_exec = gdis_qbox_lookup_executable_path(self);
+      gtk_editable_set_text(GTK_EDITABLE(tool->exec_entry), default_exec ? default_exec : "");
+
+      gdis_qbox_tool_rebuild_species_rows(self, tool);
+      tool->source_model = self->active_model;
+    }
+  else if (!gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))[0])
+    {
+      g_autofree gchar *detected_exec = gdis_qbox_lookup_executable_path(self);
+      gtk_editable_set_text(GTK_EDITABLE(tool->exec_entry), detected_exec ? detected_exec : "");
+    }
+
+  gtk_widget_set_sensitive(tool->use_cell_toggle,
+                           self->active_model && self->active_model->periodic);
+  if (!(self->active_model && self->active_model->periodic))
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->use_cell_toggle), FALSE);
+
+  if (self->active_model && (!tool->editor_dirty || model_changed))
+    {
+      g_autofree gchar *deck = NULL;
+      g_autofree gchar *cell_mode = NULL;
+      GError *error = NULL;
+
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &error))
+        gdis_qbox_tool_set_generated_text(tool, deck);
+      g_clear_error(&error);
+    }
+
+  summary = g_string_new("");
+  if (!self->active_model)
+    {
+      g_string_append(summary,
+                      "No active model.\n"
+                      "The current Qbox deck remains editable, but Regenerate needs a loaded structure.");
+    }
+  else
+    {
+      unique_species = gdis_qbox_count_unique_species(self->active_model);
+      g_string_append_printf(summary,
+                             "Active model: %s\nAtoms: %u   Unique species: %u\nCell source: %s\nExecutable: %s\nDeck status: %s",
+                             self->active_model->basename,
+                             self->active_model->atom_count,
+                             unique_species,
+                             gtk_check_button_get_active(GTK_CHECK_BUTTON(tool->use_cell_toggle)) &&
+                             self->active_model->periodic ? "Model periodic cell" : "Generated bounding box",
+                             gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))[0] ?
+                               gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry)) :
+                               "(not set)",
+                             tool->editor_dirty ? "manual edits preserved" : "synchronized");
+      if (self->qbox_last_summary && self->qbox_last_summary[0])
+        g_string_append_printf(summary, "\nLast activity: %s", self->qbox_last_summary);
+      if (self->qbox_last_save_path && self->qbox_last_save_path[0])
+        g_string_append_printf(summary, "\nLast XML: %s%s",
+                               self->qbox_last_save_path,
+                               g_file_test(self->qbox_last_save_path, G_FILE_TEST_EXISTS) ? "" : " (missing)");
+      if (self->qbox_last_output_path && self->qbox_last_output_path[0])
+        g_string_append_printf(summary, "\nLast report: %s", self->qbox_last_output_path);
+    }
+  gtk_label_set_text(tool->summary_label, summary->str);
+  g_string_free(summary, TRUE);
+}
+
+static void
+on_qbox_regenerate_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  g_autofree gchar *deck = NULL;
+  g_autofree gchar *cell_mode = NULL;
+  GError *error;
+  GString *report;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  error = NULL;
+  if (!gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &error))
+    {
+      gdis_qbox_set_report(tool->report_buffer, error ? error->message : "Qbox deck generation failed.");
+      gdis_gtk4_window_log(self, "Qbox deck generation failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_qbox_tool_set_generated_text(tool, deck);
+
+  report = g_string_new("");
+  g_string_append_printf(report,
+                         "Generated a Qbox starter deck for %s.\n"
+                         "Cell source: %s\n"
+                         "Input file: %s\n"
+                         "Output capture: %s\n"
+                         "Restart save: %s\n\n"
+                         "The editor below is live: you can keep this generated deck or customize it before writing or running.",
+                         self->active_model ? self->active_model->basename : "(none)",
+                         cell_mode ? cell_mode : "unknown",
+                         gtk_editable_get_text(GTK_EDITABLE(tool->input_entry)),
+                         gtk_editable_get_text(GTK_EDITABLE(tool->output_entry)),
+                         gtk_editable_get_text(GTK_EDITABLE(tool->save_entry)));
+  gdis_qbox_set_report(tool->report_buffer, report->str);
+  g_string_free(report, TRUE);
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_gtk4_window_log(self, "Generated the Qbox deck for %s.\n",
+                       self->active_model ? self->active_model->basename : "the active model");
+}
+
+static void
+on_qbox_detect_exec_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  g_autofree gchar *path = NULL;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->qbox_tool)
+    return;
+
+  path = gdis_qbox_lookup_executable_path(self);
+  gtk_editable_set_text(GTK_EDITABLE(self->qbox_tool->exec_entry), path ? path : "");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+}
+
+static void
+on_qbox_exec_paths_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  gdis_gtk4_window_present_executable_paths_tool(self, "qbox");
+}
+
+static gboolean
+gdis_qbox_copy_local_file(const char *source_path,
+                          const char *dest_path,
+                          GError **error)
+{
+  GFile *source;
+  GFile *dest;
+  gboolean ok;
+
+  if (g_strcmp0(source_path, dest_path) == 0)
+    return TRUE;
+
+  source = g_file_new_for_path(source_path);
+  dest = g_file_new_for_path(dest_path);
+  ok = g_file_copy(source, dest, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, error);
+  g_object_unref(source);
+  g_object_unref(dest);
+  return ok;
+}
+
+static void
+gdis_qbox_build_paths(GdisQboxTool *tool,
+                      gchar **workdir_out,
+                      gchar **input_path_out,
+                      gchar **input_name_out,
+                      gchar **output_path_out,
+                      gchar **stderr_path_out,
+                      GError **error)
+{
+  g_autofree gchar *workdir_text = NULL;
+  g_autofree gchar *input_name = NULL;
+  g_autofree gchar *output_name = NULL;
+  g_autofree gchar *workdir = NULL;
+
+  g_return_if_fail(tool != NULL);
+
+  workdir_text = gdis_qbox_entry_text(tool->workdir_entry);
+  input_name = gdis_qbox_entry_text(tool->input_entry);
+  output_name = gdis_qbox_entry_text(tool->output_entry);
+  if (!workdir_text[0] || !input_name[0] || !output_name[0])
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Qbox working directory, input filename, and output filename must not be empty.");
+      return;
+    }
+
+  workdir = g_canonicalize_filename(workdir_text, g_get_current_dir());
+  if (g_mkdir_with_parents(workdir, 0755) != 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not create '%s': %s",
+                  workdir,
+                  g_strerror(errno));
+      return;
+    }
+
+  if (workdir_out)
+    *workdir_out = g_steal_pointer(&workdir);
+  if (input_path_out)
+    *input_path_out = g_build_filename(workdir_out ? *workdir_out : workdir, input_name, NULL);
+  if (input_name_out)
+    *input_name_out = g_steal_pointer(&input_name);
+  if (output_path_out)
+    *output_path_out = g_build_filename(workdir_out ? *workdir_out : workdir, output_name, NULL);
+  if (stderr_path_out)
+    {
+      g_autofree gchar *stderr_name = g_strdup_printf("%s.stderr", output_name);
+      *stderr_path_out = g_build_filename(workdir_out ? *workdir_out : workdir, stderr_name, NULL);
+    }
+}
+
+static void
+gdis_qbox_validate_run_buffer(const char *deck_text, GError **error)
+{
+  if (!deck_text || !deck_text[0])
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The Qbox deck editor is empty.");
+      return;
+    }
+
+  if (strstr(deck_text, "<set-pseudo-for-") ||
+      strstr(deck_text, "<missing-pseudo-for-") ||
+      strstr(deck_text, "<missing-restart-xml>"))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The Qbox deck still contains unresolved placeholders. Fill the species table or edit the deck before running.");
+    }
+}
+
+static gboolean
+gdis_qbox_stage_assets(GdisGtk4Window *self,
+                       GdisQboxTool *tool,
+                       const char *workdir,
+                       guint *copied_files_out,
+                       GString *warnings,
+                       GError **error)
+{
+  guint copied_files;
+  g_autofree gchar *restart_text = NULL;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(tool != NULL, FALSE);
+  g_return_val_if_fail(workdir != NULL, FALSE);
+
+  copied_files = 0u;
+
+  restart_text = gdis_qbox_entry_text(tool->restart_entry);
+  if (restart_text[0] && !gdis_qbox_is_remote_uri(restart_text))
+    {
+      g_autofree gchar *resolved = NULL;
+      g_autofree gchar *dest = NULL;
+
+      resolved = gdis_gtk4_window_resolve_path(restart_text);
+      if (!resolved)
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_IO,
+                      "Could not locate the restart XML '%s'.",
+                      restart_text);
+          return FALSE;
+        }
+      dest = g_build_filename(workdir, "restart.xml", NULL);
+      if (!gdis_qbox_copy_local_file(resolved, dest, error))
+        return FALSE;
+      copied_files++;
+    }
+
+  for (guint i = 0; tool->species_rows && i < tool->species_rows->len; i++)
+    {
+      GdisQboxSpeciesRow *row;
+      g_autofree gchar *pseudo_text = NULL;
+      g_autofree gchar *resolved = NULL;
+      g_autofree gchar *dest_name = NULL;
+      g_autofree gchar *dest = NULL;
+
+      row = g_ptr_array_index(tool->species_rows, i);
+      pseudo_text = gdis_qbox_entry_text(row->pseudo_entry);
+      if (!pseudo_text[0] || gdis_qbox_is_remote_uri(pseudo_text))
+        continue;
+
+      resolved = gdis_gtk4_window_resolve_path(pseudo_text);
+      if (!resolved)
+        {
+          if (warnings)
+            g_string_append_printf(warnings,
+                                   "Could not stage pseudo file for %s from '%s'.\n",
+                                   row->element,
+                                   pseudo_text);
+          continue;
+        }
+
+      dest_name = gdis_qbox_species_reference(row);
+      if (dest_name[0] == '<')
+        continue;
+      dest = g_build_filename(workdir, dest_name, NULL);
+      if (!gdis_qbox_copy_local_file(resolved, dest, error))
+        return FALSE;
+      copied_files++;
+    }
+
+  if (copied_files_out)
+    *copied_files_out = copied_files;
+  return TRUE;
+}
+
+static gboolean
+gdis_qbox_write_prepared_input(GdisGtk4Window *self,
+                               GdisQboxTool *tool,
+                               gboolean validate_for_run,
+                               gchar **workdir_out,
+                               gchar **input_path_out,
+                               gchar **input_name_out,
+                               gchar **output_path_out,
+                               gchar **stderr_path_out,
+                               guint *copied_files_out,
+                               guint *localized_pseudos_out,
+                               GString *warnings,
+                               GError **error)
+{
+  g_autofree gchar *deck_text = NULL;
+  GError *local_error = NULL;
+  guint localized_pseudos = 0u;
+
+  g_return_val_if_fail(self != NULL, FALSE);
+  g_return_val_if_fail(tool != NULL, FALSE);
+
+  if (!gdis_qbox_prepare_local_pseudo_library(self,
+                                              tool,
+                                              &localized_pseudos,
+                                              NULL,
+                                              warnings,
+                                              &local_error))
+    {
+      g_propagate_error(error, local_error);
+      return FALSE;
+    }
+
+  if (!tool->editor_dirty && self->active_model)
+    {
+      g_autofree gchar *deck = NULL;
+      g_autofree gchar *cell_mode = NULL;
+
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &local_error))
+        {
+          gdis_qbox_tool_set_generated_text(tool, deck);
+          g_clear_error(&local_error);
+        }
+    }
+
+  deck_text = gdis_qbox_text_buffer_contents(tool->deck_buffer);
+  if ((!deck_text || !deck_text[0]) && self->active_model)
+    {
+      g_autofree gchar *deck = NULL;
+      g_autofree gchar *cell_mode = NULL;
+
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &local_error))
+        {
+          gdis_qbox_tool_set_generated_text(tool, deck);
+          g_clear_error(&local_error);
+          g_free(deck_text);
+          deck_text = gdis_qbox_text_buffer_contents(tool->deck_buffer);
+        }
+    }
+
+  if (validate_for_run)
+    {
+      gdis_qbox_validate_run_buffer(deck_text, &local_error);
+      if (local_error)
+        {
+          g_propagate_error(error, local_error);
+          return FALSE;
+        }
+    }
+
+  if (!deck_text || !deck_text[0])
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The Qbox deck editor is empty. Regenerate a deck or type one before writing.");
+      return FALSE;
+    }
+
+  gdis_qbox_build_paths(tool,
+                        workdir_out,
+                        input_path_out,
+                        input_name_out,
+                        output_path_out,
+                        stderr_path_out,
+                        &local_error);
+  if (local_error)
+    {
+      g_propagate_error(error, local_error);
+      return FALSE;
+    }
+
+  if (!gdis_qbox_stage_assets(self,
+                              tool,
+                              *workdir_out,
+                              copied_files_out,
+                              warnings,
+                              &local_error))
+    {
+      g_propagate_error(error, local_error);
+      return FALSE;
+    }
+
+  if (!g_file_set_contents(*input_path_out, deck_text, -1, &local_error))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_IO,
+                  "Could not write '%s': %s",
+                  *input_path_out,
+                  local_error ? local_error->message : "unknown error");
+      g_clear_error(&local_error);
+      return FALSE;
+    }
+
+  if (localized_pseudos_out)
+    *localized_pseudos_out = localized_pseudos;
+  return TRUE;
+}
+
+static gboolean
+gdis_qbox_run_shell_capture(const char *working_directory,
+                            const char *command,
+                            const char *stdout_path,
+                            const char *stderr_path,
+                            gchar **stdout_text_out,
+                            gchar **stderr_text_out,
+                            GError **error)
+{
+  g_autofree gchar *quoted_stdout = NULL;
+  g_autofree gchar *quoted_stderr = NULL;
+  g_autofree gchar *redirected_command = NULL;
+  const gchar *argv[] = {"/bin/sh", "-lc", NULL, NULL};
+  gchar *shell_stdout = NULL;
+  gchar *shell_stderr = NULL;
+  gchar *stdout_text = NULL;
+  gchar *stderr_text = NULL;
+  gint wait_status = 0;
+
+  g_return_val_if_fail(command != NULL, FALSE);
+  g_return_val_if_fail(stdout_path != NULL, FALSE);
+  g_return_val_if_fail(stderr_path != NULL, FALSE);
+
+  quoted_stdout = g_shell_quote(stdout_path);
+  quoted_stderr = g_shell_quote(stderr_path);
+  redirected_command = g_strdup_printf("exec %s > %s 2> %s",
+                                       command,
+                                       quoted_stdout,
+                                       quoted_stderr);
+  argv[2] = redirected_command;
+
+  g_file_set_contents(stdout_path, "", -1, NULL);
+  g_file_set_contents(stderr_path, "", -1, NULL);
+
+  if (!g_spawn_sync(working_directory,
+                    (gchar **) argv,
+                    NULL,
+                    G_SPAWN_SEARCH_PATH,
+                    NULL,
+                    NULL,
+                    &shell_stdout,
+                    &shell_stderr,
+                    &wait_status,
+                    error))
+    {
+      g_free(shell_stdout);
+      g_free(shell_stderr);
+      return FALSE;
+    }
+
+  if (!g_file_get_contents(stdout_path, &stdout_text, NULL, NULL))
+    stdout_text = g_strdup("");
+  if (!g_file_get_contents(stderr_path, &stderr_text, NULL, NULL))
+    stderr_text = g_strdup("");
+
+  if (shell_stdout && shell_stdout[0])
+    {
+      g_autofree gchar *merged = g_strconcat(stdout_text ? stdout_text : "",
+                                             shell_stdout,
+                                             NULL);
+      g_free(stdout_text);
+      stdout_text = g_steal_pointer(&merged);
+      g_file_set_contents(stdout_path, stdout_text, -1, NULL);
+    }
+  if (shell_stderr && shell_stderr[0])
+    {
+      g_autofree gchar *merged = g_strconcat(stderr_text ? stderr_text : "",
+                                             shell_stderr,
+                                             NULL);
+      g_free(stderr_text);
+      stderr_text = g_steal_pointer(&merged);
+      g_file_set_contents(stderr_path, stderr_text, -1, NULL);
+    }
+
+  if (!g_spawn_check_wait_status(wait_status, error))
+    {
+      if (stdout_text_out)
+        *stdout_text_out = stdout_text;
+      else
+        g_free(stdout_text);
+      if (stderr_text_out)
+        *stderr_text_out = stderr_text;
+      else
+        g_free(stderr_text);
+      g_free(shell_stdout);
+      g_free(shell_stderr);
+      return FALSE;
+    }
+
+  if (stdout_text_out)
+    *stdout_text_out = stdout_text;
+  else
+    g_free(stdout_text);
+  if (stderr_text_out)
+    *stderr_text_out = stderr_text;
+  else
+    g_free(stderr_text);
+  g_free(shell_stdout);
+  g_free(shell_stderr);
+  return TRUE;
+}
+
+static gchar *
+gdis_qbox_extract_last_etotal(const char *text)
+{
+  const gchar *start;
+  const gchar *end;
+
+  if (!text)
+    return NULL;
+
+  start = g_strrstr(text, "<etotal>");
+  end = g_strrstr(text, "</etotal>");
+  if (!start || !end || end <= start)
+    return NULL;
+
+  start += strlen("<etotal>");
+  return g_strndup(start, (gsize) (end - start));
+}
+
+static gchar *
+gdis_qbox_tail_text(const char *text, gsize max_chars)
+{
+  gsize length;
+
+  if (!text)
+    return g_strdup("");
+
+  length = strlen(text);
+  if (length <= max_chars)
+    return g_strdup(text);
+  return g_strdup(text + (length - max_chars));
+}
+
+static void
+on_qbox_guess_pseudos_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  guint filled = 0u;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool || !tool->species_rows)
+    return;
+
+  for (guint i = 0; i < tool->species_rows->len; i++)
+    {
+      GdisQboxSpeciesRow *row;
+      g_autofree gchar *current = NULL;
+      g_autofree gchar *guess = NULL;
+
+      row = g_ptr_array_index(tool->species_rows, i);
+      current = gdis_qbox_entry_text(row->pseudo_entry);
+      if (current[0] && !g_str_has_prefix(current, "<"))
+        continue;
+
+      guess = gdis_qbox_guess_pseudo_path(gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
+                                          row->element,
+                                          gtk_editable_get_text(GTK_EDITABLE(tool->xc_entry)));
+      if (guess && guess[0])
+        {
+          gtk_editable_set_text(GTK_EDITABLE(row->pseudo_entry), guess);
+          filled++;
+        }
+    }
+
+  if (filled > 0u)
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "Filled missing pseudo entries from the current pseudo dir/URL setting.\n"
+                           "Regenerate the deck if you want the updated URIs written into the editor.");
+      gdis_gtk4_window_log(self, "Updated %u Qbox pseudo mapping%s from the current pseudo dir/URL.\n",
+                           filled,
+                           filled == 1u ? "" : "s");
+    }
+  else
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "No additional pseudo files were auto-detected.\n"
+                           "Edit the species table directly if your library uses different names.");
+    }
+}
+
+static void
+on_qbox_setup_local_pseudos_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  GString *warnings;
+  GError *error = NULL;
+  guint downloaded = 0u;
+  guint relinked = 0u;
+  GString *report;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  warnings = g_string_new("");
+  if (!gdis_qbox_prepare_local_pseudo_library(self,
+                                              tool,
+                                              &downloaded,
+                                              &relinked,
+                                              warnings,
+                                              &error))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           error ? error->message : "Could not prepare the local Qbox pseudo library.");
+      gdis_gtk4_window_log(self, "Qbox local pseudo setup failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_string_free(warnings, TRUE);
+      g_clear_error(&error);
+      return;
+    }
+
+  if (!tool->editor_dirty && self->active_model)
+    on_qbox_regenerate_clicked(NULL, self);
+
+  report = g_string_new("");
+  g_string_append_printf(report,
+                         "Prepared the local Qbox pseudo library.\n"
+                         "Cache directory: %s\n"
+                         "Species linked: %u\n"
+                         "Fresh downloads: %u\n",
+                         gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
+                         relinked,
+                         downloaded);
+  if (warnings->len > 0)
+    g_string_append_printf(report, "\nWarnings:\n%s", warnings->str);
+  gdis_qbox_set_report(tool->report_buffer, report->str);
+  g_string_free(report, TRUE);
+  g_string_free(warnings, TRUE);
+  gdis_qbox_set_last_summary(self, downloaded > 0u ? "local pseudos downloaded" : "local pseudos ready");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_gtk4_window_log(self,
+                       "Prepared the local Qbox pseudo library at %s (%u download%s).\n",
+                       gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
+                       downloaded,
+                       downloaded == 1u ? "" : "s");
+}
+
+static void
+on_qbox_write_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  g_autofree gchar *workdir = NULL;
+  g_autofree gchar *input_path = NULL;
+  g_autofree gchar *input_name = NULL;
+  g_autofree gchar *output_path = NULL;
+  g_autofree gchar *stderr_path = NULL;
+  g_autofree gchar *save_path = NULL;
+  GString *warnings;
+  GError *error = NULL;
+  guint copied_files = 0u;
+  guint localized_pseudos = 0u;
+  GString *report;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  if (gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))[0])
+    g_hash_table_replace(self->executable_paths,
+                         g_strdup("qbox"),
+                         g_strdup(gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))));
+
+  warnings = g_string_new("");
+  if (!gdis_qbox_write_prepared_input(self,
+                                      tool,
+                                      FALSE,
+                                      &workdir,
+                                      &input_path,
+                                      &input_name,
+                                      &output_path,
+                                      &stderr_path,
+                                      &copied_files,
+                                      &localized_pseudos,
+                                      warnings,
+                                      &error))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           error ? error->message : "Could not write the Qbox input deck.");
+      gdis_gtk4_window_log(self, "Qbox input write failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_string_free(warnings, TRUE);
+      g_clear_error(&error);
+      return;
+    }
+
+  report = g_string_new("");
+  if (gtk_editable_get_text(GTK_EDITABLE(tool->save_entry))[0])
+    save_path = g_build_filename(workdir,
+                                 gtk_editable_get_text(GTK_EDITABLE(tool->save_entry)),
+                                 NULL);
+  g_string_append_printf(report,
+                         "Wrote the Qbox input deck.\n"
+                         "Working directory: %s\n"
+                         "Input file: %s\n"
+                         "Planned output capture: %s\n"
+                         "Planned save XML: %s\n"
+                         "Staged local assets: %u\n"
+                         "Localized pseudos: %u\n",
+                         workdir,
+                         input_path,
+                         output_path,
+                         save_path ? save_path : "(not set)",
+                         copied_files,
+                         localized_pseudos);
+  if (warnings->len > 0)
+    g_string_append_printf(report, "\nWarnings:\n%s", warnings->str);
+  gdis_qbox_set_report(tool->report_buffer, report->str);
+  g_string_free(report, TRUE);
+  g_string_free(warnings, TRUE);
+
+  gdis_qbox_set_last_summary(self, "input deck written");
+  gdis_qbox_set_last_run_state(self,
+                               workdir,
+                               input_path,
+                               output_path,
+                               stderr_path,
+                               save_path);
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_gtk4_window_refresh_executable_paths_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
+  gdis_gtk4_window_log(self, "Wrote the Qbox input deck: %s\n", input_path);
+}
+
+static void
+on_qbox_use_last_xml_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  if (!self->qbox_last_save_path || !g_file_test(self->qbox_last_save_path, G_FILE_TEST_EXISTS))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "There is no saved Qbox XML from this session yet. Run a job that writes a save XML first.");
+      return;
+    }
+
+  gtk_editable_set_text(GTK_EDITABLE(tool->restart_entry), self->qbox_last_save_path);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->randomize_toggle), FALSE);
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Loaded the most recent Qbox save XML into Restart XML.\n"
+                       "Randomize_wf was turned off for a continuation-friendly deck.");
+  gdis_qbox_set_last_summary(self, "last XML selected for restart");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+}
+
+static void
+on_qbox_continue_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  const char *workdir_text;
+  g_autofree gchar *base_stem = NULL;
+  g_autofree gchar *next_input = NULL;
+  g_autofree gchar *next_output = NULL;
+  g_autofree gchar *next_save = NULL;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  if (!self->qbox_last_save_path || !g_file_test(self->qbox_last_save_path, G_FILE_TEST_EXISTS))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "There is no saved Qbox XML to continue from yet. Run a job that writes a save XML first.");
+      return;
+    }
+
+  workdir_text = gtk_editable_get_text(GTK_EDITABLE(tool->workdir_entry));
+  if (self->qbox_last_workdir && self->qbox_last_workdir[0])
+    gtk_editable_set_text(GTK_EDITABLE(tool->workdir_entry), self->qbox_last_workdir);
+
+  if (gtk_editable_get_text(GTK_EDITABLE(tool->job_entry))[0])
+    base_stem = gdis_qbox_job_slug(gtk_editable_get_text(GTK_EDITABLE(tool->job_entry)));
+  else if (self->qbox_last_save_path)
+    {
+      g_autofree gchar *basename = g_path_get_basename(self->qbox_last_save_path);
+      gchar *dot = strrchr(basename, '.');
+      if (dot)
+        *dot = '\0';
+      base_stem = gdis_qbox_job_slug(basename);
+    }
+  if (!base_stem || !base_stem[0])
+    base_stem = g_strdup("qbox_job");
+
+  next_input = gdis_qbox_make_unique_continue_name(self->qbox_last_workdir ? self->qbox_last_workdir : workdir_text,
+                                                   base_stem,
+                                                   "i");
+  next_output = gdis_qbox_make_unique_continue_name(self->qbox_last_workdir ? self->qbox_last_workdir : workdir_text,
+                                                    base_stem,
+                                                    "r");
+  next_save = gdis_qbox_make_unique_continue_name(self->qbox_last_workdir ? self->qbox_last_workdir : workdir_text,
+                                                  base_stem,
+                                                  "xml");
+
+  gtk_editable_set_text(GTK_EDITABLE(tool->restart_entry), self->qbox_last_save_path);
+  gtk_editable_set_text(GTK_EDITABLE(tool->input_entry), next_input);
+  gtk_editable_set_text(GTK_EDITABLE(tool->output_entry), next_output);
+  gtk_editable_set_text(GTK_EDITABLE(tool->save_entry), next_save);
+  {
+    g_autofree gchar *job_name = g_strdup(next_save);
+    gchar *dot = strrchr(job_name, '.');
+    if (dot)
+      *dot = '\0';
+    gtk_editable_set_text(GTK_EDITABLE(tool->job_entry), job_name);
+  }
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(tool->randomize_toggle), FALSE);
+
+  on_qbox_regenerate_clicked(NULL, self);
+  gdis_qbox_set_last_summary(self, "continue deck prepared");
+  gdis_gtk4_window_log(self, "Prepared a Qbox continuation deck from: %s\n", self->qbox_last_save_path);
+}
+
+static void
+on_qbox_import_result_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  GError *error = NULL;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  if (!self->qbox_last_save_path || !g_file_test(self->qbox_last_save_path, G_FILE_TEST_EXISTS))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "There is no saved Qbox XML to import yet. Run a job that writes a save XML first.");
+      return;
+    }
+
+  if (!gdis_qbox_import_result_into_active_model(self, self->qbox_last_save_path, &error))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           error ? error->message : "Could not import the saved Qbox XML.");
+      gdis_gtk4_window_log(self, "Qbox result import failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+      return;
+    }
+
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Imported the most recent Qbox result XML into the active model.\n"
+                       "The viewer and model summary were refreshed from the saved Qbox state.");
+  gdis_qbox_set_last_summary(self, "result imported");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+}
+
+static void
+on_qbox_results_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  g_autofree gchar *report = NULL;
+
+  (void) button;
+
+  self = user_data;
+  if (!self)
+    return;
+
+  report = gdis_qbox_build_results_report(self);
+  gdis_gtk4_window_present_report(self, "Qbox Results", report);
+}
+
+static void
+on_qbox_run_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  g_autofree gchar *workdir = NULL;
+  g_autofree gchar *input_path = NULL;
+  g_autofree gchar *input_name = NULL;
+  g_autofree gchar *output_path = NULL;
+  g_autofree gchar *stderr_path = NULL;
+  g_autofree gchar *save_path = NULL;
+  g_autofree gchar *stdout_text = NULL;
+  g_autofree gchar *stderr_text = NULL;
+  g_autofree gchar *tail = NULL;
+  g_autofree gchar *last_etotal = NULL;
+  g_autofree gchar *launcher = NULL;
+  g_autofree gchar *quoted_exec = NULL;
+  g_autofree gchar *quoted_input = NULL;
+  g_autofree gchar *command = NULL;
+  GString *warnings;
+  GError *error = NULL;
+  guint copied_files = 0u;
+  guint localized_pseudos = 0u;
+  gboolean success;
+  GString *report;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool)
+    return;
+
+  if (!gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))[0])
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           "Set the Qbox executable path first. You can type it here, Detect it, or open Executable Paths.");
+      return;
+    }
+
+  g_hash_table_replace(self->executable_paths,
+                       g_strdup("qbox"),
+                       g_strdup(gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))));
+
+  warnings = g_string_new("");
+  if (!gdis_qbox_write_prepared_input(self,
+                                      tool,
+                                      TRUE,
+                                      &workdir,
+                                      &input_path,
+                                      &input_name,
+                                      &output_path,
+                                      &stderr_path,
+                                      &copied_files,
+                                      &localized_pseudos,
+                                      warnings,
+                                      &error))
+    {
+      gdis_qbox_set_report(tool->report_buffer,
+                           error ? error->message : "Could not prepare the Qbox run.");
+      gdis_gtk4_window_log(self, "Qbox run setup failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_string_free(warnings, TRUE);
+      g_clear_error(&error);
+      return;
+    }
+
+  launcher = gdis_qbox_entry_text(tool->launcher_entry);
+  quoted_exec = g_shell_quote(gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry)));
+  quoted_input = g_shell_quote(input_name);
+  if (launcher[0])
+    command = g_strdup_printf("%s %s %s", launcher, quoted_exec, quoted_input);
+  else
+    command = g_strdup_printf("%s %s", quoted_exec, quoted_input);
+
+  success = gdis_qbox_run_shell_capture(workdir,
+                                        command,
+                                        output_path,
+                                        stderr_path,
+                                        &stdout_text,
+                                        &stderr_text,
+                                        &error);
+
+  if (gtk_editable_get_text(GTK_EDITABLE(tool->save_entry))[0])
+    save_path = g_build_filename(workdir,
+                                 gtk_editable_get_text(GTK_EDITABLE(tool->save_entry)),
+                                 NULL);
+
+  tail = gdis_qbox_tail_text(stdout_text ? stdout_text : stderr_text, 12000u);
+  last_etotal = gdis_qbox_extract_last_etotal(stdout_text);
+
+  report = g_string_new("");
+  g_string_append_printf(report,
+                         "%s Qbox run.\n"
+                         "Command: %s\n"
+                         "Working directory: %s\n"
+                         "Input file: %s\n"
+                         "Output file: %s\n"
+                         "Saved XML: %s\n"
+                         "Staged local assets: %u\n"
+                         "Localized pseudos: %u\n",
+                         success ? "Completed" : "Failed",
+                         command,
+                         workdir,
+                         input_path,
+                         output_path,
+                         save_path ? save_path : "(not set)",
+                         copied_files,
+                         localized_pseudos);
+  if (stderr_text && stderr_text[0])
+    g_string_append_printf(report, "stderr capture: %s\n", stderr_path);
+  if (last_etotal && last_etotal[0])
+    g_string_append_printf(report, "Last <etotal>: %s\n", last_etotal);
+  if (warnings->len > 0)
+    g_string_append_printf(report, "\nWarnings:\n%s", warnings->str);
+  if (!success)
+    g_string_append_printf(report,
+                           "\nFailure reason: %s\n",
+                           error ? error->message : "unknown error");
+  if (tail && tail[0])
+    g_string_append_printf(report, "\nRecent output:\n%s", tail);
+
+  gdis_qbox_set_last_run_state(self,
+                               workdir,
+                               input_path,
+                               output_path,
+                               stderr_path,
+                               save_path);
+
+  if (success)
+    {
+      GError *import_error = NULL;
+
+      if (save_path && g_file_test(save_path, G_FILE_TEST_EXISTS))
+        {
+          if (gdis_qbox_import_result_into_active_model(self, save_path, &import_error))
+            {
+              gdis_qbox_set_last_summary(self, "run completed and result imported");
+              g_string_append_printf(report,
+                                     "\nResult import: loaded %s back into the active model.\n",
+                                     save_path);
+            }
+          else
+            {
+              gdis_qbox_set_last_summary(self, "run completed but result import failed");
+              g_string_append_printf(report,
+                                     "\nResult import failed: %s\n",
+                                     import_error ? import_error->message : "unknown error");
+              g_clear_error(&import_error);
+            }
+        }
+      else
+        {
+          gdis_qbox_set_last_summary(self, "run completed");
+          if (save_path)
+            g_string_append_printf(report,
+                                   "\nResult import skipped because %s was not created.\n",
+                                   save_path);
+        }
+      gdis_gtk4_window_log(self, "Qbox run completed: %s\n", output_path);
+    }
+  else
+    {
+      gdis_qbox_set_last_summary(self, "run failed");
+      gdis_gtk4_window_log(self, "Qbox run failed: %s\n",
+                           error ? error->message : "unknown error");
+      g_clear_error(&error);
+    }
+
+  gdis_qbox_set_report(tool->report_buffer, report->str);
+  g_string_free(report, TRUE);
+  g_string_free(warnings, TRUE);
+
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_gtk4_window_refresh_executable_paths_tool(self);
+  gdis_gtk4_window_refresh_task_manager_tool(self);
+}
+
+static void
+gdis_qbox_maybe_run_startup_write(GdisGtk4Window *self)
+{
+  const gchar *flag;
+
+  g_return_if_fail(self != NULL);
+
+  if (qbox_startup_write_consumed || !self->qbox_tool)
+    return;
+
+  flag = g_getenv("GDIS_GTK4_QBOX_AUTOWRITE");
+  if (!flag || !flag[0] || g_strcmp0(flag, "0") == 0 ||
+      g_ascii_strcasecmp(flag, "false") == 0)
+    return;
+
+  qbox_startup_write_consumed = TRUE;
+  on_qbox_write_clicked(NULL, self);
+}
+
+static void
+gdis_qbox_maybe_run_startup_run(GdisGtk4Window *self)
+{
+  const gchar *flag;
+
+  g_return_if_fail(self != NULL);
+
+  if (qbox_startup_run_consumed || !self->qbox_tool)
+    return;
+
+  flag = g_getenv("GDIS_GTK4_QBOX_AUTORUN");
+  if (!flag || !flag[0] || g_strcmp0(flag, "0") == 0 ||
+      g_ascii_strcasecmp(flag, "false") == 0)
+    return;
+
+  qbox_startup_run_consumed = TRUE;
+  on_qbox_run_clicked(NULL, self);
+}
+
+static void
+gdis_gtk4_window_present_qbox_tool(GdisGtk4Window *self)
+{
+  GdisQboxTool *tool;
+  GtkWidget *window;
+  GtkWidget *root;
+  GtkWidget *top_box;
+  GtkWidget *top_scroller;
+  GtkWidget *frame;
+  GtkWidget *grid;
+  GtkWidget *label;
+  GtkWidget *row;
+  GtkWidget *button;
+  GtkWidget *scroller;
+  GtkWidget *text_view;
+  GtkWidget *paned;
+
+  g_return_if_fail(self != NULL);
+
+  if (self->qbox_tool && GTK_IS_WINDOW(self->qbox_tool->window))
+    {
+      gdis_gtk4_window_refresh_qbox_tool(self);
+      gtk_window_present(GTK_WINDOW(self->qbox_tool->window));
+      return;
+    }
+
+  tool = g_new0(GdisQboxTool, 1);
+  tool->owner = self;
+
+  window = GTK_WIDGET(gtk_application_window_new(self->app));
+  tool->window = window;
+#ifdef __APPLE__
+  gtk_window_set_modal(GTK_WINDOW(window), FALSE);
+#else
+  gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+#endif
+  gtk_window_set_title(GTK_WINDOW(window), "Qbox");
+  gtk_window_set_default_size(GTK_WINDOW(window), 1260, 980);
+  gtk_window_set_resizable(GTK_WINDOW(window), TRUE);
+
+  root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(root, 12);
+  gtk_widget_set_margin_end(root, 12);
+  gtk_widget_set_margin_top(root, 12);
+  gtk_widget_set_margin_bottom(root, 12);
+  gtk_window_set_child(GTK_WINDOW(window), root);
+
+  top_scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(top_scroller, TRUE);
+  gtk_widget_set_vexpand(top_scroller, FALSE);
+  gtk_widget_set_size_request(top_scroller, -1, 360);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(top_scroller),
+                                 GTK_POLICY_NEVER,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_box_append(GTK_BOX(root), top_scroller);
+
+  top_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(top_scroller), top_box);
+
+  tool->summary_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_wrap(tool->summary_label, TRUE);
+  gtk_label_set_xalign(tool->summary_label, 0.0f);
+  gtk_box_append(GTK_BOX(top_box), GTK_WIDGET(tool->summary_label));
+
+  frame = gtk_frame_new("Qbox Setup");
+  gtk_box_append(GTK_BOX(top_box), frame);
+
+  grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+  gtk_widget_set_margin_start(grid, 10);
+  gtk_widget_set_margin_end(grid, 10);
+  gtk_widget_set_margin_top(grid, 10);
+  gtk_widget_set_margin_bottom(grid, 10);
+  gtk_frame_set_child(GTK_FRAME(frame), grid);
+
+  label = gtk_label_new("Job name");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+  tool->job_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->job_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->job_entry, 1, 0, 1, 1);
+
+  label = gtk_label_new("Working directory");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 0, 1, 1);
+  tool->workdir_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->workdir_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->workdir_entry, 3, 0, 3, 1);
+
+  label = gtk_label_new("Input file");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+  tool->input_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->input_entry, 1, 1, 1, 1);
+
+  label = gtk_label_new("Output file");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 1, 1, 1);
+  tool->output_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->output_entry, 3, 1, 1, 1);
+
+  label = gtk_label_new("Save XML");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 4, 1, 1, 1);
+  tool->save_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->save_entry, 5, 1, 1, 1);
+
+  label = gtk_label_new("Executable");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+  tool->exec_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->exec_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->exec_entry, 1, 2, 3, 1);
+  button = gtk_button_new_with_label("Detect");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_detect_exec_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 4, 2, 1, 1);
+  button = gtk_button_new_with_label("Executable Paths");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_exec_paths_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 5, 2, 1, 1);
+
+  label = gtk_label_new("Launcher prefix");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 3, 1, 1);
+  tool->launcher_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->launcher_entry, TRUE);
+  gtk_widget_set_tooltip_text(tool->launcher_entry, "Optional, for example: mpirun -np 4");
+  gtk_grid_attach(GTK_GRID(grid), tool->launcher_entry, 1, 3, 5, 1);
+
+  label = gtk_label_new("Pseudo dir / URL");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 4, 1, 1);
+  tool->pseudo_dir_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->pseudo_dir_entry, TRUE);
+  gtk_grid_attach(GTK_GRID(grid), tool->pseudo_dir_entry, 1, 4, 3, 1);
+  button = gtk_button_new_with_label("Setup Local Pseudos");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_setup_local_pseudos_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 4, 4, 2, 1);
+
+  label = gtk_label_new("Restart XML");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 5, 1, 1);
+  tool->restart_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(tool->restart_entry, TRUE);
+  gtk_widget_set_tooltip_text(tool->restart_entry, "Optional local restart XML or URI");
+  gtk_grid_attach(GTK_GRID(grid), tool->restart_entry, 1, 5, 3, 1);
+  button = gtk_button_new_with_label("Use Last XML");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_use_last_xml_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 4, 5, 1, 1);
+  button = gtk_button_new_with_label("Continue Last");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_continue_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 5, 5, 1, 1);
+
+  label = gtk_label_new("XC");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 6, 1, 1);
+  tool->xc_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->xc_entry, 1, 6, 1, 1);
+
+  label = gtk_label_new("WF dyn");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 6, 1, 1);
+  tool->wf_dyn_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->wf_dyn_entry, 3, 6, 1, 1);
+
+  label = gtk_label_new("Atoms dyn");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 4, 6, 1, 1);
+  tool->atoms_dyn_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->atoms_dyn_entry, 5, 6, 1, 1);
+
+  label = gtk_label_new("SCF tol");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 7, 1, 1);
+  tool->scf_tol_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), tool->scf_tol_entry, 1, 7, 1, 1);
+
+  label = gtk_label_new("Ecut");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 7, 1, 1);
+  tool->ecut_spin = gtk_spin_button_new_with_range(5.0, 500.0, 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->ecut_spin, 3, 7, 1, 1);
+
+  label = gtk_label_new("Net charge");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 4, 7, 1, 1);
+  tool->charge_spin = gtk_spin_button_new_with_range(-20.0, 20.0, 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->charge_spin, 5, 7, 1, 1);
+
+  label = gtk_label_new("SCF steps");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 8, 1, 1);
+  tool->scf_steps_spin = gtk_spin_button_new_with_range(1.0, 5000.0, 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->scf_steps_spin, 1, 8, 1, 1);
+
+  label = gtk_label_new("Ionic steps");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 2, 8, 1, 1);
+  tool->ionic_steps_spin = gtk_spin_button_new_with_range(0.0, 2000.0, 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->ionic_steps_spin, 3, 8, 1, 1);
+
+  label = gtk_label_new("Density update");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 4, 8, 1, 1);
+  tool->density_update_spin = gtk_spin_button_new_with_range(1.0, 500.0, 1.0);
+  gtk_grid_attach(GTK_GRID(grid), tool->density_update_spin, 5, 8, 1, 1);
+
+  label = gtk_label_new("Padding (A)");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 9, 1, 1);
+  tool->padding_spin = gtk_spin_button_new_with_range(1.0, 40.0, 0.5);
+  gtk_grid_attach(GTK_GRID(grid), tool->padding_spin, 1, 9, 1, 1);
+
+  tool->use_cell_toggle = gtk_check_button_new_with_label("Use model periodic cell when available");
+  gtk_grid_attach(GTK_GRID(grid), tool->use_cell_toggle, 2, 9, 2, 1);
+  tool->atomic_density_toggle = gtk_check_button_new_with_label("Use -atomic_density startup");
+  gtk_grid_attach(GTK_GRID(grid), tool->atomic_density_toggle, 4, 9, 2, 1);
+  tool->randomize_toggle = gtk_check_button_new_with_label("Add randomize_wf for fresh starts");
+  gtk_grid_attach(GTK_GRID(grid), tool->randomize_toggle, 2, 10, 4, 1);
+
+  frame = gtk_frame_new("Species Mapping");
+  gtk_box_append(GTK_BOX(top_box), frame);
+  tool->species_scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(tool->species_scroller, TRUE);
+  gtk_widget_set_size_request(tool->species_scroller, -1, 220);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(tool->species_scroller),
+                                 GTK_POLICY_AUTOMATIC,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_frame_set_child(GTK_FRAME(frame), tool->species_scroller);
+
+  paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+  gtk_widget_set_vexpand(paned, TRUE);
+  gtk_paned_set_wide_handle(GTK_PANED(paned), TRUE);
+  gtk_paned_set_resize_start_child(GTK_PANED(paned), TRUE);
+  gtk_paned_set_shrink_start_child(GTK_PANED(paned), FALSE);
+  gtk_paned_set_resize_end_child(GTK_PANED(paned), TRUE);
+  gtk_paned_set_shrink_end_child(GTK_PANED(paned), FALSE);
+  gtk_paned_set_position(GTK_PANED(paned), 520);
+  gtk_box_append(GTK_BOX(root), paned);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                 GTK_POLICY_AUTOMATIC,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_paned_set_start_child(GTK_PANED(paned), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_NONE);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->deck_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(scroller, TRUE);
+  gtk_widget_set_vexpand(scroller, TRUE);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                 GTK_POLICY_AUTOMATIC,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_paned_set_end_child(GTK_PANED(paned), scroller);
+
+  text_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text_view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text_view), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(text_view), TRUE);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(text_view), 12);
+  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(text_view), 12);
+  tool->report_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
+
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(row, GTK_ALIGN_END);
+  gtk_box_append(GTK_BOX(root), row);
+
+  button = gtk_button_new_with_label("Guess Pseudos");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_guess_pseudos_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Regenerate");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_regenerate_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Write Input");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_write_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Run");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_run_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Import Result");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_import_result_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Results");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_results_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("Close");
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  gtk_box_append(GTK_BOX(row), button);
+
+  g_signal_connect(tool->deck_buffer, "changed", G_CALLBACK(on_qbox_deck_buffer_changed), tool);
+  g_signal_connect(window, "destroy", G_CALLBACK(on_qbox_tool_destroy), tool);
+
+  self->qbox_tool = tool;
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Generate a Qbox starter deck for the active model, then edit, write, or run it here.\n"
+                       "This GTK4 tool stages local pseudo files into the job directory and preserves manual deck edits.");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  if (self->active_model)
+    on_qbox_regenerate_clicked(NULL, self);
+  gdis_qbox_maybe_run_startup_write(self);
+  gdis_qbox_maybe_run_startup_run(self);
+  gtk_window_present(GTK_WINDOW(window));
+}
+
 static void
 on_periodic_table_tool_destroy(GtkWindow *window, gpointer user_data)
 {
@@ -7353,18 +10140,19 @@ gdis_gtk4_window_present_periodic_table_tool(GdisGtk4Window *self)
   gtk_window_present(GTK_WINDOW(window));
 }
 
-typedef struct
+struct _GdisExecutableSpec
 {
   const char *id;
   const char *label;
   const char *probe_a;
   const char *probe_b;
-} GdisExecutableSpec;
+};
 
 static const GdisExecutableSpec gdis_executable_specs[] = {
   {"gulp", "GULP", "gulp", NULL},
   {"gamess", "GAMESS", "rungms", "gamess"},
   {"monty", "Monty", "monty", NULL},
+  {"qbox", "Qbox", "qbox", "qb"},
   {"siesta", "SIESTA", "siesta", NULL},
   {"vasp", "VASP", "vasp_std", "vasp"},
   {"uspex", "USPEX", "USPEX", "uspex"},
@@ -7387,12 +10175,43 @@ static gchar *
 gdis_executable_detect_path(const GdisExecutableSpec *spec)
 {
   gchar *path;
+  const char *probes[3];
 
   g_return_val_if_fail(spec != NULL, NULL);
 
   path = g_find_program_in_path(spec->probe_a);
   if (!path && spec->probe_b)
     path = g_find_program_in_path(spec->probe_b);
+  if (path)
+    return path;
+
+  probes[0] = spec->probe_a;
+  probes[1] = spec->probe_b;
+  probes[2] = NULL;
+  for (guint i = 0; probes[i] != NULL && !path; i++)
+    {
+      const char *probe;
+
+      probe = probes[i];
+      if (!probe || probe[0] == '\0')
+        continue;
+
+      {
+        g_autofree gchar *homebrew_candidate = NULL;
+        g_autofree gchar *local_candidate = NULL;
+
+        homebrew_candidate = g_build_filename("/opt/homebrew/bin", probe, NULL);
+        if (g_file_test(homebrew_candidate, G_FILE_TEST_IS_EXECUTABLE))
+          path = g_strdup(homebrew_candidate);
+
+        if (!path)
+          {
+            local_candidate = g_build_filename("/usr/local/bin", probe, NULL);
+            if (g_file_test(local_candidate, G_FILE_TEST_IS_EXECUTABLE))
+              path = g_strdup(local_candidate);
+          }
+      }
+    }
   return path;
 }
 
@@ -7454,6 +10273,7 @@ gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self)
   g_string_append_printf(text, "  Surface builder: %s\n", self->surface_tool ? "open" : "closed");
   g_string_append_printf(text, "  Iso-surfaces: %s\n", self->isosurface_tool ? "open" : "closed");
   g_string_append_printf(text, "  Animation: %s\n", self->animation_tool ? "open" : "closed");
+  g_string_append_printf(text, "  Qbox: %s\n", self->qbox_tool ? "open" : "closed");
   g_string_append_printf(text, "  Periodic table: %s\n", self->periodic_table_tool ? "open" : "closed");
   g_string_append_printf(text, "  Executable paths: %s\n", self->exec_paths_tool ? "open" : "closed");
 
@@ -7474,6 +10294,12 @@ gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self)
   g_string_append_printf(text,
                          "\nConfigured executable paths: %u\n",
                          self->executable_paths ? g_hash_table_size(self->executable_paths) : 0u);
+  if (self->qbox_last_summary && self->qbox_last_summary[0])
+    g_string_append_printf(text, "Last Qbox activity: %s\n", self->qbox_last_summary);
+  if (self->qbox_last_workdir)
+    g_string_append_printf(text, "Last Qbox workdir: %s\n", self->qbox_last_workdir);
+  if (self->qbox_last_save_path)
+    g_string_append_printf(text, "Last Qbox XML: %s\n", self->qbox_last_save_path);
   gtk_text_buffer_set_text(tool->buffer, text->str, -1);
   g_string_free(text, TRUE);
 }
@@ -7497,6 +10323,8 @@ on_task_manager_action_clicked(GtkButton *button, gpointer user_data)
     gdis_gtk4_window_present_measure_tool(self);
   else if (g_strcmp0(action, "isosurface") == 0)
     gdis_gtk4_window_present_isosurface_tool(self);
+  else if (g_strcmp0(action, "qbox") == 0)
+    gdis_gtk4_window_present_qbox_tool(self);
   else if (g_strcmp0(action, "exec-paths") == 0)
     gdis_gtk4_window_present_executable_paths_tool(self, NULL);
   else if (g_strcmp0(action, "close-model") == 0)
@@ -7560,7 +10388,7 @@ gdis_gtk4_window_present_task_manager_tool(GdisGtk4Window *self)
   actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   gtk_box_append(GTK_BOX(root), actions);
 
-  for (guint i = 0; i < 6; i++)
+  for (guint i = 0; i < 7; i++)
     {
       const char *label;
       const char *action;
@@ -7590,6 +10418,10 @@ gdis_gtk4_window_present_task_manager_tool(GdisGtk4Window *self)
           action = "exec-paths";
           break;
         case 5:
+          label = "Qbox";
+          action = "qbox";
+          break;
+        case 6:
           label = "Close Model";
           action = "close-model";
           break;
@@ -7627,6 +10459,7 @@ on_exec_paths_tool_destroy(GtkWindow *window, gpointer user_data)
 
   if (tool->owner)
     tool->owner->exec_paths_tool = NULL;
+  g_clear_pointer(&tool->entries, g_free);
   g_clear_pointer(&tool->focus_backend, g_free);
   g_free(tool);
 }
@@ -7666,15 +10499,25 @@ gdis_gtk4_window_refresh_executable_paths_tool(GdisGtk4Window *self)
       const char *path_text;
 
       path_text = gtk_editable_get_text(GTK_EDITABLE(tool->entries[focus_spec - gdis_executable_specs]));
-      g_string_append_printf(preview,
-                             "Focused backend: %s\n"
-                             "Executable: %s\n"
-                             "Active model: %s\n\n"
-                             "The GTK4 rebuild now restores executable-path management here. Native diffraction and surface workflows already run directly in GTK4; backend-specific input-deck editors for %s are still a later port, but this window is now where the session executable path lives.\n",
-                             focus_spec->label,
-                             (path_text && path_text[0]) ? path_text : "(not set)",
-                             self->active_model ? self->active_model->basename : "none",
-                             focus_spec->label);
+      if (g_strcmp0(focus_spec->id, "qbox") == 0)
+        g_string_append_printf(preview,
+                               "Focused backend: %s\n"
+                               "Executable: %s\n"
+                               "Active model: %s\n\n"
+                               "Qbox now has a native GTK4 deck editor and run window. This executable-path page still matters because the Qbox tool reads the session path stored here when it launches.\n",
+                               focus_spec->label,
+                               (path_text && path_text[0]) ? path_text : "(not set)",
+                               self->active_model ? self->active_model->basename : "none");
+      else
+        g_string_append_printf(preview,
+                               "Focused backend: %s\n"
+                               "Executable: %s\n"
+                               "Active model: %s\n\n"
+                               "The GTK4 rebuild now restores executable-path management here. Native diffraction and surface workflows already run directly in GTK4; backend-specific input-deck editors for %s are still a later port, but this window is now where the session executable path lives.\n",
+                               focus_spec->label,
+                               (path_text && path_text[0]) ? path_text : "(not set)",
+                               self->active_model ? self->active_model->basename : "none",
+                               focus_spec->label);
     }
   else
     {
@@ -7786,6 +10629,8 @@ gdis_gtk4_window_present_executable_paths_tool(GdisGtk4Window *self,
 
   tool = g_new0(GdisExecutablePathsTool, 1);
   tool->owner = self;
+  tool->entry_count = G_N_ELEMENTS(gdis_executable_specs);
+  tool->entries = g_new0(GtkWidget *, tool->entry_count);
   tool->focus_backend = g_strdup(focus_backend);
 
   window = gtk_window_new();
@@ -8256,6 +11101,7 @@ gdis_gtk4_window_set_active_model(GdisGtk4Window *self, GdisModel *model)
   gdis_gtk4_window_refresh_surface_tool(self);
   gdis_gtk4_window_refresh_isosurface_tool(self);
   gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_qbox_tool(self);
   gdis_gtk4_window_refresh_periodic_table_tool(self);
   gdis_gtk4_window_refresh_task_manager_tool(self);
   gdis_gtk4_window_update_undo_action(self);
@@ -8524,6 +11370,7 @@ gdis_gtk4_window_remove_model(GdisGtk4Window *self, GdisModel *model)
   gdis_gtk4_window_refresh_edit_tool(self);
   gdis_gtk4_window_refresh_measure_tool(self);
   gdis_gtk4_window_refresh_animation_tool(self);
+  gdis_gtk4_window_refresh_qbox_tool(self);
   gdis_gtk4_window_refresh_task_manager_tool(self);
 }
 
@@ -11341,13 +14188,13 @@ build_viewer_area(GdisGtk4Window *self)
   gtk_widget_add_css_class(frame, "gdis-viewer-frame");
   gtk_widget_set_hexpand(frame, TRUE);
   gtk_widget_set_vexpand(frame, TRUE);
-  gtk_widget_set_size_request(frame, 820, 540);
+  gtk_widget_set_size_request(frame, GDIS_VIEWER_MIN_WIDTH, GDIS_VIEWER_MIN_HEIGHT);
 
   drawing_area = gtk_drawing_area_new();
   gtk_widget_set_hexpand(drawing_area, TRUE);
   gtk_widget_set_vexpand(drawing_area, TRUE);
-  gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(drawing_area), 820);
-  gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(drawing_area), 540);
+  gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(drawing_area), GDIS_VIEWER_MIN_WIDTH);
+  gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(drawing_area), GDIS_VIEWER_MIN_HEIGHT);
   gtk_widget_set_cursor_from_name(drawing_area, "crosshair");
   self->viewer_area = drawing_area;
   gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(drawing_area), viewer_draw, self, NULL);
@@ -11392,8 +14239,8 @@ build_status_view(GdisGtk4Window *self)
   gtk_widget_add_css_class(scroller, "gdis-status");
   gtk_widget_set_vexpand(scroller, TRUE);
   gtk_widget_set_hexpand(scroller, TRUE);
-  gtk_widget_set_size_request(scroller, 760, 150);
-  gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroller), 150);
+  gtk_widget_set_size_request(scroller, 760, GDIS_STATUS_MIN_HEIGHT);
+  gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroller), GDIS_STATUS_MIN_HEIGHT);
 
   text_view = gtk_text_view_new();
   gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
@@ -11416,33 +14263,45 @@ build_main_content(GdisGtk4Window *self)
 {
   GtkWidget *main_paned;
   GtkWidget *right_paned;
+  GtkWidget *sidebar;
+  GtkWidget *sidebar_scroller;
   GtkWidget *viewer;
   GtkWidget *status;
 
   main_paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
   gtk_widget_set_hexpand(main_paned, TRUE);
   gtk_widget_set_vexpand(main_paned, TRUE);
-  gtk_widget_set_size_request(main_paned, 1180, 760);
+  gtk_widget_set_size_request(main_paned, GDIS_MAIN_ROOT_WIDTH, GDIS_MAIN_ROOT_HEIGHT);
   gtk_paned_set_wide_handle(GTK_PANED(main_paned), TRUE);
   self->main_paned = main_paned;
 
   right_paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
   gtk_widget_set_hexpand(right_paned, TRUE);
   gtk_widget_set_vexpand(right_paned, TRUE);
-  gtk_widget_set_size_request(right_paned, 820, 720);
+  gtk_widget_set_size_request(right_paned, GDIS_VIEWER_MIN_WIDTH, 640);
   gtk_paned_set_wide_handle(GTK_PANED(right_paned), TRUE);
   self->right_paned = right_paned;
+
+  sidebar = build_sidebar(self);
+  sidebar_scroller = gtk_scrolled_window_new();
+  gtk_widget_set_hexpand(sidebar_scroller, FALSE);
+  gtk_widget_set_vexpand(sidebar_scroller, TRUE);
+  gtk_widget_set_size_request(sidebar_scroller, GDIS_MAIN_SIDEBAR_WIDTH, -1);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroller),
+                                 GTK_POLICY_NEVER,
+                                 GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sidebar_scroller), sidebar);
 
   viewer = build_viewer_area(self);
   status = build_status_view(self);
 
-  gtk_paned_set_start_child(GTK_PANED(main_paned), build_sidebar(self));
+  gtk_paned_set_start_child(GTK_PANED(main_paned), sidebar_scroller);
   gtk_paned_set_end_child(GTK_PANED(main_paned), right_paned);
   gtk_paned_set_resize_start_child(GTK_PANED(main_paned), FALSE);
   gtk_paned_set_shrink_start_child(GTK_PANED(main_paned), FALSE);
   gtk_paned_set_resize_end_child(GTK_PANED(main_paned), TRUE);
   gtk_paned_set_shrink_end_child(GTK_PANED(main_paned), FALSE);
-  gtk_paned_set_position(GTK_PANED(main_paned), 320);
+  gtk_paned_set_position(GTK_PANED(main_paned), GDIS_MAIN_SIDEBAR_WIDTH);
 
   gtk_paned_set_start_child(GTK_PANED(right_paned), viewer);
   gtk_paned_set_end_child(GTK_PANED(right_paned), status);
@@ -11450,7 +14309,7 @@ build_main_content(GdisGtk4Window *self)
   gtk_paned_set_shrink_start_child(GTK_PANED(right_paned), FALSE);
   gtk_paned_set_resize_end_child(GTK_PANED(right_paned), FALSE);
   gtk_paned_set_shrink_end_child(GTK_PANED(right_paned), FALSE);
-  gtk_paned_set_position(GTK_PANED(right_paned), 690);
+  gtk_paned_set_position(GTK_PANED(right_paned), GDIS_RIGHT_PANED_POSITION);
 
   return main_paned;
 }
@@ -11461,10 +14320,10 @@ gdis_gtk4_window_restore_layout(GdisGtk4Window *self)
   g_return_if_fail(self != NULL);
 
   if (self->main_paned)
-    gtk_paned_set_position(GTK_PANED(self->main_paned), 320);
+    gtk_paned_set_position(GTK_PANED(self->main_paned), GDIS_MAIN_SIDEBAR_WIDTH);
 
   if (self->right_paned)
-    gtk_paned_set_position(GTK_PANED(self->right_paned), 690);
+    gtk_paned_set_position(GTK_PANED(self->right_paned), GDIS_RIGHT_PANED_POSITION);
 }
 
 static gboolean
@@ -11490,7 +14349,9 @@ gdis_gtk4_window_restore_layout_tick(GtkWidget *widget,
   width = gtk_widget_get_width(self->window);
   height = gtk_widget_get_height(self->window);
   if (width < 1000 || height < 700)
-    gtk_window_set_default_size(GTK_WINDOW(self->window), 1480, 920);
+    gtk_window_set_default_size(GTK_WINDOW(self->window),
+                                GDIS_MAIN_WINDOW_WIDTH,
+                                GDIS_MAIN_WINDOW_HEIGHT);
 
   gdis_gtk4_window_restore_layout(self);
 
@@ -11594,6 +14455,7 @@ build_menu_bar_model(void)
   g_menu_append(computation_menu, "GULP...", "app.gulp");
   g_menu_append(computation_menu, "GAMESS...", "app.gamess");
   g_menu_append(computation_menu, "Monty...", "app.monty");
+  g_menu_append(computation_menu, "Qbox...", "app.qbox");
   g_menu_append(computation_menu, "SIESTA...", "app.siesta");
   g_menu_append(computation_menu, "VASP...", "app.vasp");
   g_menu_append(computation_menu, "USPEX...", "app.uspex");
@@ -11781,8 +14643,9 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
         "  7. Use Tools > Visualization > Iso-surfaces for molecular, promolecule, Hirshfeld-style, or analytic electron-density surfaces.\n"
         "  8. Use Tools > Building > Zmatrix to rebuild an internal-coordinate editor from the whole model or current selection, then Recompute Geometry to apply edits.\n"
         "  9. Use Tools > Building > Dislocations or Docking for the restored native builders.\n"
-        " 10. Use Tools > Visualization > Animation for the tabbed playback panel, then open Record to export PNG snapshots, sequences, MP4 movies, or animated GIFs.\n"
-        " 11. Use View > Reset Model Images for periodic image cleanup.\n\n"
+        " 10. Use Tools > Computation > Qbox to generate an editable starter deck, write it into a working directory, and launch the configured qbox/qb executable.\n"
+        " 11. Use Tools > Visualization > Animation for the tabbed playback panel, then open Record to export PNG snapshots, sequences, MP4 movies, or animated GIFs.\n"
+        " 12. Use View > Reset Model Images for periodic image cleanup.\n\n"
         "Current GTK4-native tools:\n"
         "  - Editing\n"
         "  - Measurements\n"
@@ -11794,7 +14657,8 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
         "  - Z-matrix editor with explicit geometry rebuild\n"
         "  - Dislocation builder\n"
         "  - Docking project generator\n"
-        "  - Executable Paths / Task Manager\n\n"
+        "  - Qbox deck editor / runner plus session executable-path integration\n"
+        "  - Executable Paths / Task Manager, including GULP, GAMESS, Monty, Qbox, SIESTA, VASP, and USPEX session paths\n\n"
         "Detailed parity audit:\n"
         "  gtk4_rebuild/RESTORATION_AUDIT.md\n\n"
         "Legacy reference:\n"
@@ -11864,6 +14728,45 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
     {
       gdis_gtk4_window_present_docking_tool(self);
       gdis_gtk4_window_log(self, "Opened docking tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "qbox") == 0)
+    {
+      gdis_gtk4_window_present_qbox_tool(self);
+      gdis_gtk4_window_log(self, "Opened Qbox tool.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "qbox-use-last-xml") == 0)
+    {
+      gdis_gtk4_window_present_qbox_tool(self);
+      on_qbox_use_last_xml_clicked(NULL, self);
+      gdis_gtk4_window_log(self, "Triggered Qbox: Use Last XML.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "qbox-continue-last") == 0)
+    {
+      gdis_gtk4_window_present_qbox_tool(self);
+      on_qbox_continue_clicked(NULL, self);
+      gdis_gtk4_window_log(self, "Triggered Qbox: Continue Last.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "qbox-import-result") == 0)
+    {
+      gdis_gtk4_window_present_qbox_tool(self);
+      on_qbox_import_result_clicked(NULL, self);
+      gdis_gtk4_window_log(self, "Triggered Qbox: Import Result.\n");
+      return;
+    }
+
+  if (g_strcmp0(name, "qbox-results") == 0)
+    {
+      gdis_gtk4_window_present_qbox_tool(self);
+      on_qbox_results_clicked(NULL, self);
+      gdis_gtk4_window_log(self, "Triggered Qbox: Results.\n");
       return;
     }
 
@@ -12029,6 +14932,11 @@ install_actions(GtkApplication *app)
     {.name = "gulp", .activate = action_dispatch},
     {.name = "gamess", .activate = action_dispatch},
     {.name = "monty", .activate = action_dispatch},
+    {.name = "qbox", .activate = action_dispatch},
+    {.name = "qbox-use-last-xml", .activate = action_dispatch},
+    {.name = "qbox-continue-last", .activate = action_dispatch},
+    {.name = "qbox-import-result", .activate = action_dispatch},
+    {.name = "qbox-results", .activate = action_dispatch},
     {.name = "siesta", .activate = action_dispatch},
     {.name = "vasp", .activate = action_dispatch},
     {.name = "uspex", .activate = action_dispatch},
@@ -12071,6 +14979,14 @@ install_actions(GtkApplication *app)
                                         (const char *[]) {"<Primary>d", NULL});
   gtk_application_set_accels_for_action(app, "app.reset-images",
                                         (const char *[]) {"<Primary>r", NULL});
+  gtk_application_set_accels_for_action(app, "app.qbox-use-last-xml",
+                                        (const char *[]) {"<Primary><Shift>u", NULL});
+  gtk_application_set_accels_for_action(app, "app.qbox-continue-last",
+                                        (const char *[]) {"<Primary><Shift>c", NULL});
+  gtk_application_set_accels_for_action(app, "app.qbox-import-result",
+                                        (const char *[]) {"<Primary><Shift>i", NULL});
+  gtk_application_set_accels_for_action(app, "app.qbox-results",
+                                        (const char *[]) {"<Primary><Shift>t", NULL});
 
   {
     GAction *undo_action;
@@ -12123,15 +15039,21 @@ gdis_gtk4_window_new(GtkApplication *app)
 
   self->window = gtk_application_window_new(app);
   gtk_window_set_title(GTK_WINDOW(self->window), "GDIS GTK4");
-  gtk_window_set_default_size(GTK_WINDOW(self->window), 1480, 920);
+  gtk_window_set_default_size(GTK_WINDOW(self->window),
+                              GDIS_MAIN_WINDOW_WIDTH,
+                              GDIS_MAIN_WINDOW_HEIGHT);
   gdis_gtk4_window_install_css(self->window);
 
   root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class(root, "gdis-root");
-  gtk_widget_set_size_request(root, 1180, 760);
+  gtk_widget_set_size_request(root, GDIS_MAIN_ROOT_WIDTH, GDIS_MAIN_ROOT_HEIGHT);
   gtk_window_set_child(GTK_WINDOW(self->window), root);
 
   menu_model = build_menu_bar_model();
+#ifdef __APPLE__
+  gtk_application_set_menubar(app, menu_model);
+  gdis_macos_menu_install(app);
+#endif
   menu_bar = gtk_popover_menu_bar_new_from_model(menu_model);
   g_object_unref(menu_model);
 
@@ -12157,7 +15079,9 @@ gdis_gtk4_window_present(GdisGtk4Window *self)
   g_return_if_fail(self != NULL);
   g_return_if_fail(GTK_IS_WINDOW(self->window));
 
-  gtk_window_set_default_size(GTK_WINDOW(self->window), 1480, 920);
+  gtk_window_set_default_size(GTK_WINDOW(self->window),
+                              GDIS_MAIN_WINDOW_WIDTH,
+                              GDIS_MAIN_WINDOW_HEIGHT);
   gdis_gtk4_window_restore_layout(self);
   gtk_window_present(GTK_WINDOW(self->window));
   if (self->layout_restore_tick_id == 0)
@@ -12177,6 +15101,19 @@ gdis_gtk4_window_get_window(GdisGtk4Window *self)
   g_return_val_if_fail(GTK_IS_WINDOW(self->window), NULL);
 
   return GTK_WINDOW(self->window);
+}
+
+void
+gdis_gtk4_window_activate_action(GdisGtk4Window *self, const char *action_name)
+{
+  g_return_if_fail(self != NULL);
+  g_return_if_fail(self->app != NULL);
+  g_return_if_fail(action_name != NULL);
+
+  if (!action_name[0])
+    return;
+
+  g_action_group_activate_action(G_ACTION_GROUP(self->app), action_name, NULL);
 }
 
 void

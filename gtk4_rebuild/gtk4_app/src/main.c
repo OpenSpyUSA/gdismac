@@ -3,6 +3,22 @@
 #include "gdis_gtk4_window.h"
 
 static const char *const WINDOW_DATA_KEY = "gdis-gtk4-window";
+static gboolean startup_action_consumed = FALSE;
+
+static void maybe_activate_startup_action(GdisGtk4Window *window)
+{
+  const gchar *action_name;
+
+  if (startup_action_consumed || !window)
+    return;
+
+  action_name = g_getenv("GDIS_GTK4_STARTUP_ACTION");
+  if (!action_name || !action_name[0])
+    return;
+
+  startup_action_consumed = TRUE;
+  gdis_gtk4_window_activate_action(window, action_name);
+}
 
 static GdisGtk4Window *lookup_active_window_wrapper(GtkApplication *app)
 {
@@ -25,6 +41,7 @@ static void on_activate(GtkApplication *app, gpointer user_data)
   if (!window)
     window = gdis_gtk4_window_new(app);
   gdis_gtk4_window_present(window);
+  maybe_activate_startup_action(window);
 }
 
 static void on_open(GApplication *app,
@@ -58,6 +75,7 @@ static void on_open(GApplication *app,
   gdis_gtk4_window_open_startup_paths(window, (const char *const *) paths->pdata);
   g_ptr_array_free(paths, TRUE);
   gdis_gtk4_window_present(window);
+  maybe_activate_startup_action(window);
 }
 
 int main(int argc, char **argv)

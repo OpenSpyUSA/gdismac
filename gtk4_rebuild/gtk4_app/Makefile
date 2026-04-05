@@ -15,7 +15,20 @@ GTK4_CFLAGS := $(shell pkg-config --cflags gtk4 2>/dev/null)
 GTK4_LIBS := $(shell pkg-config --libs gtk4 2>/dev/null)
 
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wno-extra-semi -g
+OBJCFLAGS += -Wall -Wextra -g
+LDFLAGS +=
+LDLIBS += $(GTK4_LIBS)
 ARGS ?=
+
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+SOURCES += $(SRC_DIR)/gdis_macos_menu.m
+LDLIBS += -framework AppKit -framework Foundation
+endif
+
+OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(filter %.c,$(SOURCES)))
+OBJECTS += $(patsubst $(SRC_DIR)/%.m,$(BUILD_DIR)/%.o,$(filter %.m,$(SOURCES)))
 
 .PHONY: all clean run doctor
 
@@ -33,9 +46,17 @@ doctor:
 		exit 1; \
 	fi
 
-$(BUILD_DIR)/$(APP): $(SOURCES)
+$(BUILD_DIR)/$(APP): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(GTK4_CFLAGS) $(SOURCES) -o $@ $(GTK4_LIBS)
+	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LDLIBS)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(GTK4_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.m
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(OBJCFLAGS) $(GTK4_CFLAGS) -c $< -o $@
 
 run: all
 	./$(BUILD_DIR)/$(APP) $(ARGS)

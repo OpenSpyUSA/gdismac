@@ -1,6 +1,6 @@
 # GTK4 Restoration Audit
 
-Last checked: 2026-04-03
+Last checked: 2026-04-05
 
 This audit compares the legacy Linux-oriented GDIS menu surface in:
 
@@ -38,7 +38,7 @@ Status legend:
 
 | Legacy feature | Legacy callback | GTK4 status | Notes |
 | --- | --- | --- | --- |
-| Undo | `undo_active` | `Missing` | No undo stack exists in the GTK4 model bridge yet. |
+| Undo | `undo_active` | `Restored` | GTK4 now keeps per-model undo snapshots for structural edits and restores the previous model, selection, picks, and saved measurements. |
 | Copy | `select_copy` | `Missing` | No GTK4 clipboard serialization for atom selections yet. |
 | Paste | `select_paste` | `Missing` | No GTK4 clipboard import path yet. |
 | Colour | `select_colour` | `Missing` | The GTK4 bridge has no per-atom display override state yet. |
@@ -53,32 +53,33 @@ Status legend:
 
 | Legacy feature | Legacy callback | GTK4 status | Notes |
 | --- | --- | --- | --- |
-| Animation | `gui_animate_dialog` | `Missing` | No trajectory or animation dialog in the GTK4 app yet. |
-| Iso-surfaces | `gui_isosurf_dialog` | `Blocked` | GTK4 only shows a status report. Real parity needs volumetric grid loaders, scalar-field storage, surface extraction, and mesh rendering. |
-| Periodic table | `gui_gperiodic_dialog` | `Missing` | No GTK4 periodic table dialog yet. |
+| Animation | `gui_animate_dialog` | `Partial` | GTK4 now has a native animation panel with playback and recording export, but it is still narrower than the legacy workflow. |
+| Iso-surfaces | `gui_isosurf_dialog` | `Partial` | GTK4 now has a native iso-surface tool with in-viewer preview for molecular, promolecule, Hirshfeld-style selected-fragment, and analytic electron-density surfaces. True volumetric-grid import/render remains a later port. |
+| Periodic table | `gui_gperiodic_dialog` | `Partial` | GTK4 restores a native periodic-table picker with copy/apply actions, but not the full legacy dialog surface. |
 
 ## Tools / Building
 
 | Legacy feature | Legacy callback | GTK4 status | Notes |
 | --- | --- | --- | --- |
 | Editing | `gui_edit_dialog` | `Partial` | GTK4 editor supports label/element/coordinate edits, atom add/delete, bond add/remove, and pick-driven bond editing. The full legacy editing surface is still larger. |
-| Dislocations | `gui_defect_dialog` | `Missing` | No GTK4 defect/dislocation workflow yet. |
-| Docking | `gui_dock_dialog` | `Missing` | No GTK4 docking workflow yet. |
+| Dislocations | `gui_defect_dialog` | `Partial` | GTK4 restores a native dislocation transform workflow, but not the entire legacy defect toolbox. |
+| Docking | `gui_dock_dialog` | `Partial` | GTK4 restores docking project generation, but not the broader legacy docking environment. |
 | Dynamics | `gui_mdi_dialog` | `Missing` | No GTK4 structure-building dynamics dialog yet. |
 | Surfaces | `surface_dialog` | `Partial` | GTK4 computes low-index planes and d-spacings, but not the full slab-construction workflow from the legacy dialog. |
-| Zmatrix | `gui_zmat_dialog` | `Missing` | No GTK4 Z-matrix editor yet. |
+| Zmatrix | `gui_zmat_dialog` | `Partial` | GTK4 restores a native Z-matrix editor with geometry rebuild, but not the full legacy notebook workflow. |
 
 ## Tools / Computation
 
 | Legacy feature | Legacy callback | GTK4 status | Notes |
 | --- | --- | --- | --- |
 | Diffraction | `gui_diffract_dialog` | `Partial` | GTK4 now has a real setup dialog, calculation backend, export path, and plot window. It is still a narrower workflow than the legacy tool. |
-| GULP | `gulp_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
-| GAMESS | `gamess_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
-| Monty | `monty_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
-| SIESTA | `gui_siesta_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
-| VASP | `gui_vasp_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
-| USPEX | `gui_uspex_dialog` | `Missing` | No GTK4 external-code runner dialog yet. |
+| GULP | `gulp_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
+| GAMESS | `gamess_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
+| Monty | `monty_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
+| Qbox | `qbox_dialog` | `Partial` | GTK4 now has a native deck editor with species mapping, staged local pseudo/restart assets, working-directory export, optional launcher-prefix support, direct `qbox` / `qb` launch flow, session results reporting, and import of saved XML results back into the active model. It is still narrower than the legacy external-code dialog family. |
+| SIESTA | `gui_siesta_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
+| VASP | `gui_vasp_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
+| USPEX | `gui_uspex_dialog` | `Partial` | GTK4 restores per-session executable-path setup through the shared backend window, but not the legacy input-deck editor or runner dialog yet. |
 
 ## Tools / Analysis
 
@@ -94,11 +95,11 @@ Status legend:
 | --- | --- | --- | --- |
 | Display properties | `gui_render_dialog` | `Partial` | GTK4 now opens a native display-properties window with viewer toggles, view presets, and image reset. The deeper legacy render pages are still missing. |
 | Reset model images | `space_image_widget_reset` | `Restored` | GTK4 now exposes the image-range reset directly from the menu. |
-| Normal mode | `gui_mode_default` | `Missing` | No GTK4 mode-switch path yet. |
-| Recording mode | `gui_mode_record` | `Missing` | No GTK4 recording mode path yet. |
-| Task manager | `task_dialog` | `Missing` | No GTK4 task manager yet. |
+| Normal mode | `gui_mode_default` | `Partial` | GTK4 exposes the menu entry and keeps the standard viewer interaction model as the default path, but it does not restore the original legacy mode-switch semantics as a separate tool state. |
+| Recording mode | `gui_mode_record` | `Partial` | GTK4 restores recording export and a recording tool, but not the original legacy mode semantics exactly. |
+| Task manager | `task_dialog` | `Partial` | GTK4 now exposes a native task-manager window, but it is a lighter session-state monitor than the legacy dialog. |
 | Grid manager | `gui_grid_dialog` | `Missing` | Optional legacy feature not ported. |
-| Executable paths | `gui_setup_dialog` | `Missing` | No GTK4 setup dialog for external code paths yet. |
+| Executable paths | `gui_setup_dialog` | `Partial` | GTK4 restores session-scoped executable-path management through a shared backend setup window. |
 
 ## Help
 
@@ -116,11 +117,14 @@ The GTK4 rebuild is already usable for this workflow:
 - switch models inside the same session
 - select atoms using the major legacy selection modes
 - edit atom labels, elements, coordinates, and bonds
+- undo the most recent structural edits
 - delete selected atoms or selected groups
 - inspect distances, angles, and torsions
 - work with periodic image ranges and crystal cell cleanup
-- inspect low-index surface planes
+- inspect low-index surface planes and build slab models
 - generate a lightweight powder diffraction plot for 3D periodic models
+- generate native GTK4 iso-surface previews for the supported non-grid modes
+- prepare, run, inspect, and re-import Qbox session results
 
 ## Behavioral Mismatches Still Visible To Users
 
@@ -130,8 +134,8 @@ These are the places where a legacy user will still feel that the GTK4 rebuild b
 2. Selection and pick history are still coupled: ordinary selection clicks also mutate the shared pick history used by measurement and bond-edit workflows.
 3. Measurements are still a reduced workflow: GTK4 computes real values, but it does not yet restore the legacy measurement list, search mode, select/delete/dump actions, or editable measurement objects.
 4. Editing is still a subset: the GTK4 editor restores direct atom/bond editing, but not the wider legacy notebook surface such as transformations, regions, labelling/library pages, click-to-place atom editing, or midpoint bond deletion.
-5. Surface is still a report, not the full slab-construction environment from legacy GDIS.
-6. Diffraction is the closest advanced-tool match, but it still lacks the broader legacy graph workflow and all-frames style behavior.
+5. Surface is still narrower than the legacy slab-construction notebook, even though GTK4 now builds practical slab models.
+6. Diffraction is one of the stronger advanced-tool matches, but it still lacks the broader legacy graph workflow and all-frames style behavior.
 7. Region selection is still unavailable because the GTK4 bridge does not yet load region-labelled model data.
 
 ## Highest-Impact Remaining Gaps
@@ -141,7 +145,7 @@ The next sensible restoration targets are:
 1. Restore the legacy interaction model better: additive/toggle selection, cleaner separation of selection vs measurement picks, and box selection.
 2. Hidden/unhidden atom display state, so `Hide selected`, `Hide unselected`, and `Unhide all` become real again.
 3. A fuller GTK4 `Display properties` port that restores the deeper legacy render pages beyond the current everyday subset window.
-4. A full surface-construction dialog instead of the current plane-ranking report.
+4. A fuller surface-construction dialog that matches the legacy notebook workflow more closely.
 5. Plot windows and the remaining analysis tools.
-6. External-code dialogs and path setup for GULP, GAMESS, Monty, SIESTA, VASP, and USPEX.
-7. The deeper iso-surface engine port.
+6. Native external-code dialogs beyond the shared executable-path setup for GULP, GAMESS, Monty, SIESTA, VASP, and USPEX.
+7. The deeper volumetric-grid iso-surface engine port.

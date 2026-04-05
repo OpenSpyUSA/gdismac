@@ -26,6 +26,25 @@ typedef struct
 
 typedef struct
 {
+  GdisModel *model;
+  GHashTable *species_symbols;
+  gchar *current_species_name;
+  gchar *current_atom_name;
+  gchar *current_atom_species;
+  GString *text;
+  gdouble current_atom_position[3];
+  gdouble a_vec[3];
+  gdouble b_vec[3];
+  gdouble c_vec[3];
+  gboolean inside_species_symbol;
+  gboolean inside_atom_position;
+  gboolean have_current_atom_position;
+  gboolean have_cell;
+  gboolean looks_like_qbox;
+} GdisQboxXmlParseState;
+
+typedef struct
+{
   const char *symbol;
   gdouble radius;
 } GdisRadiusEntry;
@@ -44,6 +63,7 @@ static gboolean gdis_model_load_arc_like(GdisModel *model,
                                          GdisModelFormat format,
                                          GError **error);
 static gboolean gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error);
 static gchar *gdis_model_write_xyz(const GdisModel *model);
 static gchar *gdis_model_write_pdb(const GdisModel *model);
 static gchar *gdis_model_write_arc_like(const GdisModel *model, GdisModelFormat format);
@@ -107,6 +127,8 @@ static gboolean gdis_cif_parse_value_line(const gchar *line, gchar **tag_out, gc
 static gdouble gdis_parse_cif_number(const gchar *text);
 static gboolean gdis_cif_is_control_line(const gchar *line);
 static gdouble gdis_lookup_covalent_radius(const gchar *element);
+static const gchar *gdis_xml_local_name(const gchar *name);
+static gboolean gdis_parse_vector3_text(const gchar *text, gdouble vector[3]);
 static void gdis_vec3_set(gdouble vector[3], gdouble x, gdouble y, gdouble z);
 static void gdis_vec3_copy(gdouble dest[3], const gdouble src[3]);
 static void gdis_vec3_add_scaled(gdouble vector[3], const gdouble addend[3], gdouble scale);
@@ -126,6 +148,21 @@ static gboolean gdis_surface_build_cell_from_vectors(const gdouble a_vec[3],
                                                      const gdouble c_vec[3],
                                                      gdouble lengths[3],
                                                      gdouble angles[3]);
+static void gdis_qbox_xml_start_element(GMarkupParseContext *context,
+                                        const gchar         *element_name,
+                                        const gchar        **attribute_names,
+                                        const gchar        **attribute_values,
+                                        gpointer             user_data,
+                                        GError             **parse_error);
+static void gdis_qbox_xml_end_element(GMarkupParseContext *context,
+                                      const gchar         *element_name,
+                                      gpointer             user_data,
+                                      GError             **parse_error);
+static void gdis_qbox_xml_text(GMarkupParseContext *context,
+                               const gchar         *text,
+                               gsize                text_len,
+                               gpointer             user_data,
+                               GError             **parse_error);
 static gchar *gdis_model_surface_default_path(const GdisModel *source,
                                               gint h,
                                               gint k,
@@ -205,6 +242,9 @@ gdis_model_load(const char *path, GError **error)
       break;
     case GDIS_MODEL_FORMAT_CIF:
       ok = gdis_model_load_cif(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_QBOX_XML:
+      ok = gdis_model_load_qbox_xml(model, contents, error);
       break;
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
@@ -403,6 +443,12 @@ gdis_model_save(GdisModel *model, const char *path, GError **error)
       break;
     case GDIS_MODEL_FORMAT_CIF:
       contents = gdis_model_write_cif(model, error);
+      break;
+    case GDIS_MODEL_FORMAT_QBOX_XML:
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
+                  "Saving Qbox XML is not supported from the GTK4 rebuild yet.");
       break;
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
@@ -1792,6 +1838,8 @@ gdis_model_format_from_path(const char *path)
     format = GDIS_MODEL_FORMAT_CAR;
   else if (g_str_equal(lower, "cif"))
     format = GDIS_MODEL_FORMAT_CIF;
+  else if (g_str_equal(lower, "xml"))
+    format = GDIS_MODEL_FORMAT_QBOX_XML;
 
   g_free(lower);
   return format;
@@ -1812,6 +1860,8 @@ gdis_model_format_label(GdisModelFormat format)
       return "BIOSYM CAR";
     case GDIS_MODEL_FORMAT_CIF:
       return "CIF";
+    case GDIS_MODEL_FORMAT_QBOX_XML:
+      return "Qbox XML";
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
       return "Unknown";
@@ -3250,6 +3300,346 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
     }
 
   return TRUE;
+}
+
+static gboolean
+gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error)
+{
+  GdisQboxXmlParseState state = {0};
+  GMarkupParser parser = {
+    gdis_qbox_xml_start_element,
+    gdis_qbox_xml_end_element,
+    gdis_qbox_xml_text,
+    NULL,
+    NULL
+  };
+  GMarkupParseContext *context;
+  gboolean ok;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  state.model = model;
+  state.species_symbols = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+  state.text = g_string_new("");
+
+  context = g_markup_parse_context_new(&parser, G_MARKUP_TREAT_CDATA_AS_TEXT, &state, NULL);
+  ok = g_markup_parse_context_parse(context, contents, strlen(contents), error);
+  if (ok)
+    ok = g_markup_parse_context_end_parse(context, error);
+  g_markup_parse_context_free(context);
+
+  g_clear_pointer(&state.current_species_name, g_free);
+  g_clear_pointer(&state.current_atom_name, g_free);
+  g_clear_pointer(&state.current_atom_species, g_free);
+  if (state.text)
+    g_string_free(state.text, TRUE);
+  g_clear_pointer(&state.species_symbols, g_hash_table_unref);
+
+  if (!ok)
+    return FALSE;
+
+  if (!state.looks_like_qbox)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
+                  "'%s' is not a supported Qbox XML result file.",
+                  model->path);
+      return FALSE;
+    }
+
+  if (state.have_cell)
+    {
+      gdouble lengths[3];
+      gdouble angles[3];
+
+      if (!gdis_surface_build_cell_from_vectors(state.a_vec, state.b_vec, state.c_vec, lengths, angles))
+        {
+          g_set_error(error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "Qbox XML cell vectors in '%s' are invalid.",
+                      model->path);
+          return FALSE;
+        }
+
+      model->periodic = TRUE;
+      model->periodicity = 3;
+      memcpy(model->cell_lengths, lengths, sizeof(lengths));
+      memcpy(model->cell_angles, angles, sizeof(angles));
+    }
+
+  if (model->atoms->len == 0)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No atoms were parsed from Qbox XML '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static void
+gdis_qbox_xml_start_element(GMarkupParseContext *context,
+                            const gchar         *element_name,
+                            const gchar        **attribute_names,
+                            const gchar        **attribute_values,
+                            gpointer             user_data,
+                            GError             **parse_error)
+{
+  GdisQboxXmlParseState *state;
+  const gchar *local_name;
+
+  (void) context;
+
+  state = user_data;
+  local_name = gdis_xml_local_name(element_name);
+  if (!local_name)
+    return;
+
+  if (g_str_equal(local_name, "sample") || g_str_equal(local_name, "simulation"))
+    state->looks_like_qbox = TRUE;
+
+  if (g_str_equal(local_name, "unit_cell"))
+    {
+      const gchar *attr_a = NULL;
+      const gchar *attr_b = NULL;
+      const gchar *attr_c = NULL;
+
+      for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
+        {
+          const gchar *attr_local_name;
+
+          attr_local_name = gdis_xml_local_name(attribute_names[i]);
+          if (g_str_equal(attr_local_name, "a"))
+            attr_a = attribute_values[i];
+          else if (g_str_equal(attr_local_name, "b"))
+            attr_b = attribute_values[i];
+          else if (g_str_equal(attr_local_name, "c"))
+            attr_c = attribute_values[i];
+        }
+
+      if (!attr_a || !attr_b || !attr_c ||
+          !gdis_parse_vector3_text(attr_a, state->a_vec) ||
+          !gdis_parse_vector3_text(attr_b, state->b_vec) ||
+          !gdis_parse_vector3_text(attr_c, state->c_vec))
+        {
+          g_set_error(parse_error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "Qbox XML unit_cell in '%s' is missing or invalid.",
+                      state->model->path);
+          return;
+        }
+
+      for (guint axis = 0; axis < 3; axis++)
+        {
+          state->a_vec[axis] *= 0.529177210903;
+          state->b_vec[axis] *= 0.529177210903;
+          state->c_vec[axis] *= 0.529177210903;
+        }
+      state->have_cell = TRUE;
+      return;
+    }
+
+  if (g_str_equal(local_name, "species"))
+    {
+      g_clear_pointer(&state->current_species_name, g_free);
+      for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
+        {
+          if (g_str_equal(gdis_xml_local_name(attribute_names[i]), "name"))
+            {
+              state->current_species_name = g_strdup(attribute_values[i]);
+              break;
+            }
+        }
+      return;
+    }
+
+  if (g_str_equal(local_name, "symbol"))
+    {
+      state->inside_species_symbol = TRUE;
+      g_string_truncate(state->text, 0);
+      return;
+    }
+
+  if (g_str_equal(local_name, "atom"))
+    {
+      g_clear_pointer(&state->current_atom_name, g_free);
+      g_clear_pointer(&state->current_atom_species, g_free);
+      state->have_current_atom_position = FALSE;
+
+      for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
+        {
+          const gchar *attr_local_name;
+
+          attr_local_name = gdis_xml_local_name(attribute_names[i]);
+          if (g_str_equal(attr_local_name, "name"))
+            state->current_atom_name = g_strdup(attribute_values[i]);
+          else if (g_str_equal(attr_local_name, "species"))
+            state->current_atom_species = g_strdup(attribute_values[i]);
+        }
+      return;
+    }
+
+  if (g_str_equal(local_name, "position"))
+    {
+      state->inside_atom_position = TRUE;
+      g_string_truncate(state->text, 0);
+    }
+}
+
+static void
+gdis_qbox_xml_end_element(GMarkupParseContext *context,
+                          const gchar         *element_name,
+                          gpointer             user_data,
+                          GError             **parse_error)
+{
+  GdisQboxXmlParseState *state;
+  const gchar *local_name;
+
+  (void) context;
+
+  state = user_data;
+  local_name = gdis_xml_local_name(element_name);
+  if (!local_name)
+    return;
+
+  if (g_str_equal(local_name, "symbol"))
+    {
+      g_autofree gchar *symbol = NULL;
+
+      state->inside_species_symbol = FALSE;
+      symbol = gdis_normalize_element_symbol(state->text->str);
+      if (state->current_species_name && symbol && symbol[0])
+        g_hash_table_replace(state->species_symbols,
+                             g_strdup(state->current_species_name),
+                             g_steal_pointer(&symbol));
+      return;
+    }
+
+  if (g_str_equal(local_name, "position"))
+    {
+      state->inside_atom_position = FALSE;
+      if (!gdis_parse_vector3_text(state->text->str, state->current_atom_position))
+        {
+          g_set_error(parse_error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "Qbox XML atom position in '%s' is invalid.",
+                      state->model->path);
+          return;
+        }
+      for (guint axis = 0; axis < 3; axis++)
+        state->current_atom_position[axis] *= 0.529177210903;
+      state->have_current_atom_position = TRUE;
+      return;
+    }
+
+  if (g_str_equal(local_name, "atom"))
+    {
+      g_autofree gchar *species_symbol = NULL;
+      const gchar *mapped_symbol;
+      const gchar *element_text;
+      const gchar *label_text;
+
+      if (!state->have_current_atom_position)
+        {
+          g_set_error(parse_error,
+                      GDIS_MODEL_ERROR,
+                      GDIS_MODEL_ERROR_PARSE,
+                      "Qbox XML atom in '%s' is missing a position.",
+                      state->model->path);
+          return;
+        }
+
+      mapped_symbol = state->current_atom_species ?
+        g_hash_table_lookup(state->species_symbols, state->current_atom_species) :
+        NULL;
+      species_symbol = gdis_normalize_element_symbol(mapped_symbol ? mapped_symbol : state->current_atom_species);
+      element_text = (species_symbol && species_symbol[0]) ? species_symbol : "X";
+      label_text = (state->current_atom_name && state->current_atom_name[0]) ?
+        state->current_atom_name : element_text;
+
+      g_ptr_array_add(state->model->atoms,
+                      gdis_atom_new(label_text,
+                                    element_text,
+                                    element_text,
+                                    state->current_atom_position[0],
+                                    state->current_atom_position[1],
+                                    state->current_atom_position[2],
+                                    1.0,
+                                    -1,
+                                    state->model->atoms->len + 1));
+
+      g_clear_pointer(&state->current_atom_name, g_free);
+      g_clear_pointer(&state->current_atom_species, g_free);
+      state->have_current_atom_position = FALSE;
+      return;
+    }
+
+  if (g_str_equal(local_name, "species"))
+    g_clear_pointer(&state->current_species_name, g_free);
+}
+
+static void
+gdis_qbox_xml_text(GMarkupParseContext *context,
+                   const gchar         *text,
+                   gsize                text_len,
+                   gpointer             user_data,
+                   GError             **parse_error)
+{
+  GdisQboxXmlParseState *state;
+
+  (void) context;
+  (void) parse_error;
+
+  state = user_data;
+  if (state->inside_species_symbol || state->inside_atom_position)
+    g_string_append_len(state->text, text, text_len);
+}
+
+static const gchar *
+gdis_xml_local_name(const gchar *name)
+{
+  const gchar *colon;
+
+  if (!name)
+    return NULL;
+
+  colon = strrchr(name, ':');
+  if (colon && colon[1] != '\0')
+    return colon + 1;
+
+  return name;
+}
+
+static gboolean
+gdis_parse_vector3_text(const gchar *text, gdouble vector[3])
+{
+  g_auto(GStrv) tokens = NULL;
+  guint token_count = 0u;
+
+  g_return_val_if_fail(vector != NULL, FALSE);
+
+  if (!text)
+    return FALSE;
+
+  tokens = g_strsplit_set(text, " \t\r\n,", -1);
+  for (guint i = 0; tokens && tokens[i] != NULL; i++)
+    {
+      if (!tokens[i][0])
+        continue;
+      if (token_count >= 3u || !gdis_try_parse_double(tokens[i], &vector[token_count]))
+        return FALSE;
+      token_count++;
+    }
+
+  return token_count == 3u;
 }
 
 static gboolean

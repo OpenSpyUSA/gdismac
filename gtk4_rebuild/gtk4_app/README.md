@@ -1,164 +1,185 @@
-GTK4 app workspace
+# GDIS GTK4 Rebuild
 
-This is the new GTK4 rebuild target for GDIS.
+This directory contains the GTK4-based rebuild of GDIS for modern macOS and Linux desktops.
 
-Current state:
-- A real GTK4 application scaffold exists here.
-- The scaffold mirrors the legacy Linux single-window layout:
-  - menu bar
-  - toolbar
-  - left model/property pane
-  - right viewer pane
-  - bottom status/log pane
-- Legacy reference files remain available in `../legacy_snapshot/`.
-- The app now builds locally on this Mac with GTK4 installed.
-- `Open` uses a real GTK4 file dialog and adds the chosen file to the model list.
-- `Save` now writes the active model back out using the loader/writer bridge.
-- `Save As` now opens a real GTK4 save dialog even for already-opened files.
-- `Close` now removes the active model from the session and selects a sensible neighbor.
-- `Edit > New Model` now creates an empty model and opens the model editor immediately.
-- Startup file arguments are accepted, so shell-expanded paths like `models/*` are no longer ignored.
-- Legacy-derived model loading now works for:
-  - `XYZ`
-  - `PDB`
-  - `ARC/CAR`
-  - `CIF`
-- Legacy-derived `ARC/CAR` handling now also preserves:
-  - old BIOSYM-style atom records where field 5 is not literally `CORE`
-  - `PBC=2D` headers
-  - short 2D `PBC a b gamma` records
-  - title lines before `!DATE`
-- The viewer supports:
-  - rotate by dragging
-  - zoom by scroll wheel / trackpad
-  - atom picking by click
-  - atom / bond / cell / label toggles
-- Most of the practical legacy selection modes in the sidebar are now live:
-  - `Atoms`
-  - `Atom Label`
-  - `Atom FF Type`
-  - `Elements`
-  - `Elements in Molecule`
-  - `Molecules`
-  - `Molecule Fragments` via a 2-pick bonded path selection
-- `Regions` is still shown as legacy reference, but remains disabled until region-labelled model data is ported into the GTK4 bridge.
-- The viewer now honours the model image-range state when drawing periodic crystal images.
-- Tool actions with real GTK4-native output now include:
-  - `Measure`
-  - `Surface`
-  - `Diffraction`
-- `Edit` now opens a model editor window with:
-  - apply changes to the selected atom
-  - add atom from the current fields
-  - delete selected atom
-  - delete the current selected set
-  - delete picked atoms
-  - add bond between the last 2 picked atoms
-  - remove bond between the last 2 picked atoms
-  - pick-driven bond add/remove modes from the viewer
-  - clear pick history
-- The `Images` page now has working crystal controls for:
-  - periodic image ranges
-  - `Confine To Cell`
-  - `Force P1`
-  - `Bake Supercell`
-- Empty models now show an in-view hint telling you to add atoms from the editor and then save.
-- `Iso-surfaces` now opens a concrete status window that explains the remaining engine work instead of doing nothing.
+The goal of this rebuild is practical usability first:
 
-Local prerequisites:
+- keep the legacy GDIS model-loading and chemistry workflows available
+- restore the familiar single main window layout
+- provide a native GTK4 application that builds cleanly on current systems
+- make the macOS experience workable without requiring the old Linux-only stack
+
+Legacy reference sources remain available in [../legacy_snapshot](../legacy_snapshot), and the current restoration status is tracked in [../RESTORATION_AUDIT.md](../RESTORATION_AUDIT.md).
+
+## Current State
+
+The GTK4 rebuild is no longer just a scaffold. It now includes:
+
+- a real application window with menu bar, toolbar, sidebar, viewer, and status area
+- native file open/save/save-as flows
+- startup-file handling from the CLI
+- restored structure loading for common legacy formats
+- a working 3D viewer with rotate, zoom, picking, and display toggles
+- native GTK4 tools for editing, measurement, diffraction, surface analysis, periodic table, animation, recording, executable paths, task management, and Qbox deck setup
+
+On macOS, the rebuild also includes a native Qbox menu bridge so Qbox actions are reachable from the system menu bar.
+
+## What Works
+
+### File and Session
+
+- `File > New` creates an empty model and opens the editor
+- `File > Open` uses the native GTK4 file dialog
+- `File > Save` and `File > Save As` write through the GTK4 model bridge
+- `File > Close` removes the active model from the session
+- shell startup paths are accepted, including multiple files
+
+### Supported Model Formats
+
+Current loader coverage includes:
+
+- `XYZ`
+- `PDB`
+- `ARC`
+- `CAR`
+- `CIF`
+
+Current write targets follow the filename extension:
+
+- `.xyz`
+- `.pdb`
+- `.arc`
+- `.car`
+- `.cif`
+
+### Viewer
+
+The viewer currently supports:
+
+- rotate by drag
+- zoom by scroll or trackpad gesture
+- atom picking by click
+- selection-mode switching from the sidebar
+- atom, bond, label, and cell display toggles
+- periodic image-range drawing
+
+### Editing and Analysis
+
+The rebuild already provides practical native workflows for:
+
+- atom label, element, and coordinate editing
+- atom add/delete
+- delete selected atoms
+- bond add/remove
+- pick-driven bond editing
+- undo for model edits
+- distance, angle, and torsion measurement
+- periodic image controls
+- low-index surface inspection
+- lightweight powder diffraction setup and plot flow
+
+### Computation Tools
+
+`Tools > Computation > Qbox...` opens a native GTK4 Qbox window with:
+
+- species mapping
+- starter-deck generation
+- working-directory export
+- pseudo and restart asset staging
+- optional launcher prefix
+- direct `qbox` / `qb` launch support
+- result/report session tracking
+
+Other computation entries currently use the shared executable-path setup window:
+
+- `GULP`
+- `GAMESS`
+- `Monty`
+- `SIESTA`
+- `VASP`
+- `USPEX`
+
+## What Is Still Incomplete
+
+This rebuild is usable, but it is not yet full legacy parity.
+
+Important remaining gaps include:
+
+- some legacy interaction details such as full box-selection behavior and deeper selection semantics
+- broader legacy notebook-style editing pages
+- full slab/surface construction parity
+- deeper plotting and analysis workflows
+- complete external-code dialogs for non-Qbox backends
+- full iso-surface engine parity
+- some legacy feature families such as import/export branches, hidden-atom workflows, and specialized niche dialogs
+
+For a more detailed feature-by-feature comparison, see [../RESTORATION_AUDIT.md](../RESTORATION_AUDIT.md).
+
+## Prerequisites
+
+You need:
+
+- a C compiler
 - `pkg-config`
 - GTK4 development files
-- a C compiler
 
-On macOS with Homebrew, the expected install is:
-- `brew install gtk4 pkgconf`
+On macOS with Homebrew:
 
-Build:
+```sh
+brew install gtk4 pkgconf
+```
+
+## Build
+
+From this directory:
+
 ```sh
 make
 ```
 
-Run:
-```sh
-make run
-```
+Helpful environment check:
 
-Run with startup files:
-```sh
-make run ARGS="../../models/deoxy.pdb"
-make run ARGS="../../examples/water.xyz ../../models/deoxy.pdb"
-./build/gdis-gtk4 ../../models/water.car
-./build/gdis-gtk4 ../../models/deoxy.pdb
-./build/gdis-gtk4 ../../models/*
-```
-
-How to use the current tools:
-- `Edit > New Model` creates an empty working model and opens the model editor.
-- Use `File > Save` to save the active model.
-- Use `File > Save As` to export the current model to a new path/format.
-- Use `File > Close` to remove the active model from the current session.
-- Supported write targets currently follow the filename extension:
-  - `.xyz`
-  - `.pdb`
-  - `.arc`
-  - `.car`
-  - `.cif`
-- Click atoms in the viewer to build a pick history.
-- `Tools > Measure` now opens a measurement tool window with explicit modes:
-  - `Auto`
-  - `Distance`
-  - `Angle`
-  - `Torsion`
-- The main menu now restores more of the legacy interaction surface:
-  - `File > New`
-  - `Edit > Delete Selected`
-  - `Edit > Select All`
-  - `Edit > Invert Selection`
-  - `View > Display Properties`
-  - `View > Reset Model Images`
-  - `Help > Manual`
-- `Tools > Edit` now opens the model editor window.
-- In `Edit`, the fields follow the currently selected atom in the viewer.
-- The viewer selection mode buttons now change what a click selects.
-- `Molecule Fragments` works as a 2-click path selection:
-  - first click sets the fragment anchor
-  - second click selects the bonded path to the new atom
-- You can use the editor to:
-  - change label
-  - change element
-  - change coordinates
-  - add a new atom
-  - delete a whole selected set
-  - create/remove a bond from the last 2 picks
-- `Pick Add Bond` and `Pick Remove Bond` restore a more legacy-like workflow:
-  - click the mode button
-  - pick 2 atoms in the viewer
-  - the bond edit runs automatically
-- Measurement results use the order you picked the atoms.
-- Periodic measurement output now uses minimum-image geometry for periodic cells.
-- The `Images` page now lets you:
-  - change the stored image range for periodic models
-  - confine atoms back into the active cell
-  - force the crystal metadata to `P 1`
-  - bake a true supercell into the loaded model
-- `Tools > Surface` shows low-index planes and d-spacings for periodic models.
-- `Tools > Diffraction` shows a lightweight powder X-ray preview for 3D periodic models.
-- `Tools > Render` now opens a GTK4 display-properties window with viewer toggles, view presets, and image reset.
-- A detailed legacy-vs-GTK4 parity matrix now lives in `../RESTORATION_AUDIT.md`.
-
-Helpful checks:
 ```sh
 make doctor
 ```
 
-Notes:
-- The current rebuild has moved beyond a shell:
-  - file/model bridge is active
-  - the viewer is active
-  - several tool actions now produce real output
-- The next deeper ports are the old full-feature dialogs and engines, especially:
-  - region-labelled selection / region editing
-  - slab/surface construction
-  - full diffraction plotting
-  - volumetric-grid loading for iso-surfaces
-- Legacy file/model port targets are mapped in `PORTING.md`.
+## Run
+
+Run without a startup file:
+
+```sh
+make run
+```
+
+Run with one or more startup files:
+
+```sh
+make run ARGS="../../examples/water.xyz"
+make run ARGS="../../models/deoxy.pdb ../../models/gibb.car"
+./build/gdis-gtk4 ../../examples/water.xyz
+./build/gdis-gtk4 ../../models/deoxy.pdb
+./build/gdis-gtk4 ../../models/*
+```
+
+## Typical Usage
+
+1. Launch the app with or without a startup structure.
+2. Use `File > Open` if you want to load another model into the current session.
+3. Click in the viewer to select atoms and build pick history.
+4. Use `Tools > Building > Editing...` for atom and bond edits.
+5. Use `Tools > Analysis > Measurements...` for distance, angle, and torsion tools.
+6. Use `Tools > Computation > Qbox...` if you want to prepare or run a Qbox job.
+7. Use `View > Executable paths...` to configure backend executables for the current session.
+
+## macOS Notes
+
+- The app builds as a normal GTK4 desktop binary on macOS.
+- Qbox actions are also surfaced through a native macOS menu entry so they remain reachable from the system menu bar.
+- The current layout is tuned for practical Mac usage, but the GTK4 rebuild still differs from the exact old Linux interface in a number of places.
+
+## Reference Files
+
+- Legacy snapshot: [../legacy_snapshot](../legacy_snapshot)
+- Restoration audit: [../RESTORATION_AUDIT.md](../RESTORATION_AUDIT.md)
+- Porting notes: [../gtk4_app/PORTING.md](./PORTING.md)
+
