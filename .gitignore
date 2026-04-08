@@ -9,3 +9,12 @@ src/gdis.xcodeproj/project.xcworkspace/xcuserdata/andrew.xcuserdatad/IDEFindNavi
 src/gdis.xcodeproj/xcuserdata/andrew.xcuserdatad/xcdebugger/Breakpoints_v2.xcbkptlist
 src/gdis.xcodeproj/project.xcworkspace/xcshareddata/
 .DS_Store
+
+# Local homework/export artifacts (keep local; do not push by default)
+Homework5_export/
+Homework6_export/
+output/
+tmp/
+
+# Local screenshots and captures
+Screenshot*.png

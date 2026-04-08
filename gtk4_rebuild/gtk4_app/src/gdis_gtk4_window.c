@@ -236,6 +236,7 @@ typedef struct _GdisQboxTool
   GtkWidget *ecut_spin;
   GtkWidget *charge_spin;
   GtkWidget *padding_spin;
+  GtkWidget *kmesh_spins[3];
   GtkWidget *ionic_steps_spin;
   GtkWidget *scf_steps_spin;
   GtkWidget *density_update_spin;
@@ -434,6 +435,8 @@ static GtkWidget *gdis_gtk4_window_find_model_button(GdisGtk4Window *self,
                                                      const char *path);
 static GdisModel *gdis_gtk4_window_find_model(GdisGtk4Window *self,
                                               const char *path);
+static gint gdis_gtk4_window_compare_models(const GdisModel *left,
+                                            const GdisModel *right);
 static GtkWidget *gdis_gtk4_window_add_loaded_model(GdisGtk4Window *self,
                                                     GdisModel *model,
                                                     gboolean select_after_add);
@@ -505,6 +508,9 @@ static void on_qbox_use_last_xml_clicked(GtkButton *button, gpointer user_data);
 static void on_qbox_continue_clicked(GtkButton *button, gpointer user_data);
 static void on_qbox_import_result_clicked(GtkButton *button, gpointer user_data);
 static void on_qbox_results_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_apply_mp_mesh_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_append_hw5_phonons_clicked(GtkButton *button, gpointer user_data);
+static void on_qbox_append_hw5_homo_lumo_clicked(GtkButton *button, gpointer user_data);
 static void gdis_gtk4_window_refresh_executable_paths_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_sync_display_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_after_model_edit(GdisGtk4Window *self,
@@ -876,14 +882,21 @@ gdis_gtk4_window_log(GdisGtk4Window *self, const char *format, ...)
   char *message;
 
   g_return_if_fail(self != NULL);
-  g_return_if_fail(self->status_buffer != NULL);
+  g_return_if_fail(format != NULL);
 
   va_start(args, format);
   message = g_strdup_vprintf(format, args);
   va_end(args);
 
-  gtk_text_buffer_get_end_iter(self->status_buffer, &end);
-  gtk_text_buffer_insert(self->status_buffer, &end, message, -1);
+  if (self->status_buffer != NULL)
+    {
+      gtk_text_buffer_get_end_iter(self->status_buffer, &end);
+      gtk_text_buffer_insert(self->status_buffer, &end, message, -1);
+    }
+  else
+    {
+      g_printerr("%s", message);
+    }
 
   g_free(message);
 }
@@ -892,7 +905,9 @@ static void
 gdis_gtk4_window_clear_status_log(GdisGtk4Window *self)
 {
   g_return_if_fail(self != NULL);
-  g_return_if_fail(self->status_buffer != NULL);
+
+  if (self->status_buffer == NULL)
+    return;
 
   gtk_text_buffer_set_text(self->status_buffer, "", -1);
 }
@@ -4683,6 +4698,7 @@ static void
 on_isosurface_tool_destroy(GtkWindow *window, gpointer user_data)
 {
   GdisIsosurfaceTool *tool;
+  GdisGtk4Window *owner;
 
   (void) window;
 
@@ -4690,9 +4706,23 @@ on_isosurface_tool_destroy(GtkWindow *window, gpointer user_data)
   if (!tool)
     return;
 
-  if (tool->owner)
-    tool->owner->isosurface_tool = NULL;
-  g_free(tool);
+  owner = tool->owner;
+  if (owner)
+    owner->isosurface_tool = NULL;
+
+  /* The window's child widgets can still emit teardown-time signals that
+   * reference this tool, so invalidate the pointers now and let the window's
+   * object data own the final g_free() once destruction fully completes.
+   */
+  tool->owner = NULL;
+  tool->window = NULL;
+  tool->mode_dropdown = NULL;
+  tool->grid_spin = NULL;
+  tool->blur_spin = NULL;
+  tool->value_spin = NULL;
+  tool->execute_button = NULL;
+  tool->clear_button = NULL;
+  tool->report_buffer = NULL;
 }
 
 static void
@@ -4896,8 +4926,10 @@ gdis_gtk4_window_present_isosurface_tool(GdisGtk4Window *self)
 
   window = gtk_window_new();
   tool->window = window;
+  g_object_set_data_full(G_OBJECT(window), "gdis-isosurface-tool", tool, g_free);
   gtk_window_set_application(GTK_WINDOW(window), self->app);
   gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(self->window));
+  gtk_window_set_hide_on_close(GTK_WINDOW(window), TRUE);
   gtk_window_set_title(GTK_WINDOW(window), "Iso-surfaces");
   gtk_window_set_default_size(GTK_WINDOW(window), 760, 520);
 
@@ -4983,7 +5015,7 @@ gdis_gtk4_window_present_isosurface_tool(GdisGtk4Window *self)
   gtk_box_append(GTK_BOX(button_row), button);
 
   button = gtk_button_new_with_label("Close");
-  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), window);
+  g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_close), window);
   gtk_box_append(GTK_BOX(button_row), button);
 
   g_signal_connect(window, "destroy", G_CALLBACK(on_isosurface_tool_destroy), tool);
@@ -8108,6 +8140,101 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
 }
 
 static gchar *
+gdis_qbox_build_monkhorst_pack_block(guint nx, guint ny, guint nz)
+{
+  GString *block;
+  gdouble weight;
+
+  nx = MAX(nx, 1u);
+  ny = MAX(ny, 1u);
+  nz = MAX(nz, 1u);
+
+  weight = 1.0 / ((gdouble) nx * (gdouble) ny * (gdouble) nz);
+  block = g_string_new(
+    "# Monkhorst-Pack mesh generated by the GTK4 Qbox helper.\n"
+    "kpoint delete 0 0 0\n");
+
+  for (guint ix = 1; ix <= nx; ix++)
+    {
+      gdouble kx = (2.0 * (gdouble) ix - (gdouble) nx - 1.0) / (2.0 * (gdouble) nx);
+
+      for (guint iy = 1; iy <= ny; iy++)
+        {
+          gdouble ky = (2.0 * (gdouble) iy - (gdouble) ny - 1.0) / (2.0 * (gdouble) ny);
+
+          for (guint iz = 1; iz <= nz; iz++)
+            {
+              gdouble kz = (2.0 * (gdouble) iz - (gdouble) nz - 1.0) / (2.0 * (gdouble) nz);
+
+              g_string_append_printf(block,
+                                     "kpoint add %.10f %.10f %.10f %.16f\n",
+                                     kx,
+                                     ky,
+                                     kz,
+                                     weight);
+            }
+        }
+    }
+
+  return g_string_free(block, FALSE);
+}
+
+static gchar *
+gdis_qbox_apply_monkhorst_pack_to_text(const char *deck_text,
+                                       guint nx,
+                                       guint ny,
+                                       guint nz)
+{
+  gchar **lines;
+  g_autofree gchar *block = NULL;
+  GString *result;
+  gboolean inserted;
+
+  block = gdis_qbox_build_monkhorst_pack_block(nx, ny, nz);
+  lines = g_strsplit(deck_text ? deck_text : "", "\n", -1);
+  result = g_string_new("");
+  inserted = FALSE;
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      g_autofree gchar *trimmed = NULL;
+      const gchar *line = lines[i];
+
+      trimmed = g_strdup(line);
+      g_strstrip(trimmed);
+
+      if (trimmed[0] != '\0' && g_str_has_prefix(trimmed, "kpoint "))
+        continue;
+
+      if (!inserted &&
+          (g_str_has_prefix(trimmed, "randomize_wf") ||
+           g_str_has_prefix(trimmed, "run ") ||
+           g_str_has_prefix(trimmed, "save ")))
+        {
+          if (result->len > 0 && result->str[result->len - 1] != '\n')
+            g_string_append_c(result, '\n');
+          g_string_append(result, block);
+          inserted = TRUE;
+        }
+
+      g_string_append(result, line);
+      g_string_append_c(result, '\n');
+    }
+
+  if (!inserted)
+    {
+      if (result->len > 0 && result->str[result->len - 1] != '\n')
+        g_string_append_c(result, '\n');
+      if (result->len > 0)
+        g_string_append_c(result, '\n');
+      g_string_append(result, block);
+    }
+
+  g_strfreev(lines);
+  return g_string_free(result, FALSE);
+}
+
+static gchar *
 gdis_qbox_text_buffer_contents(GtkTextBuffer *buffer)
 {
   GtkTextIter start;
@@ -8144,6 +8271,199 @@ on_qbox_deck_buffer_changed(GtkTextBuffer *buffer, gpointer user_data)
 
   current_text = gdis_qbox_text_buffer_contents(tool->deck_buffer);
   tool->editor_dirty = (g_strcmp0(current_text, tool->last_generated_input) != 0);
+}
+
+static void
+gdis_qbox_append_text_block(GdisQboxTool *tool, const char *text)
+{
+  GtkTextIter end;
+
+  g_return_if_fail(tool != NULL);
+  g_return_if_fail(GTK_IS_TEXT_BUFFER(tool->deck_buffer));
+  g_return_if_fail(text != NULL);
+
+  tool->suppress_input_signal = TRUE;
+  gtk_text_buffer_get_end_iter(tool->deck_buffer, &end);
+  if (!gtk_text_iter_is_start(&end))
+    gtk_text_buffer_insert(tool->deck_buffer, &end, "\n\n", -1);
+  gtk_text_buffer_insert(tool->deck_buffer, &end, text, -1);
+  tool->suppress_input_signal = FALSE;
+  tool->editor_dirty = TRUE;
+}
+
+static void
+on_qbox_apply_mp_mesh_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  guint nx;
+  guint ny;
+  guint nz;
+  g_autofree gchar *deck_text = NULL;
+  g_autofree gchar *updated_text = NULL;
+  g_autofree gchar *report = NULL;
+
+  (void) button;
+
+  self = user_data;
+  if (!self || !self->qbox_tool)
+    return;
+
+  tool = self->qbox_tool;
+  nx = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->kmesh_spins[0]));
+  ny = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->kmesh_spins[1]));
+  nz = (guint) gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(tool->kmesh_spins[2]));
+  deck_text = gdis_qbox_text_buffer_contents(tool->deck_buffer);
+  updated_text = gdis_qbox_apply_monkhorst_pack_to_text(deck_text, nx, ny, nz);
+
+  tool->suppress_input_signal = TRUE;
+  gtk_text_buffer_set_text(tool->deck_buffer, updated_text, -1);
+  tool->suppress_input_signal = FALSE;
+  tool->editor_dirty = TRUE;
+
+  report = g_strdup_printf("Applied a %ux%ux%u Monkhorst-Pack mesh to the current deck.\n"
+                           "Existing kpoint lines were replaced and the generated block was inserted before the first run/save command.",
+                           nx,
+                           ny,
+                           nz);
+  gdis_qbox_set_report(tool->report_buffer, report);
+  gdis_gtk4_window_log(self,
+                       "Inserted a %ux%ux%u Monkhorst-Pack mesh into the Qbox deck.\n",
+                       nx,
+                       ny,
+                       nz);
+}
+
+static void
+on_qbox_append_hw5_phonons_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  GString *block;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool || !self || !self->active_model || !self->active_model->atoms)
+    return;
+
+  block = g_string_new(
+    "# Homework 5 frozen-phonon finite-difference block\n"
+    "# Displacement step: 0.05 bohr\n");
+
+  for (guint i = 0; i < self->active_model->atoms->len; i++)
+    {
+      const GdisAtom *atom;
+      const char *atom_name;
+
+      atom = g_ptr_array_index(self->active_model->atoms, i);
+      atom_name = (atom->label && atom->label[0]) ? atom->label : atom->element;
+      if (!atom_name || !atom_name[0])
+        atom_name = "atom";
+
+      g_string_append_printf(block,
+                             "\n# %s along x\n"
+                             "move %s by 0.05 0 0\n"
+                             "run 0 40\n"
+                             "move %s by -0.05 0 0\n"
+                             "move %s by -0.05 0 0\n"
+                             "run 0 40\n"
+                             "move %s by 0.05 0 0\n",
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name);
+      g_string_append_printf(block,
+                             "\n# %s along y\n"
+                             "move %s by 0 0.05 0\n"
+                             "run 0 40\n"
+                             "move %s by 0 -0.05 0\n"
+                             "move %s by 0 -0.05 0\n"
+                             "run 0 40\n"
+                             "move %s by 0 0.05 0\n",
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name);
+      g_string_append_printf(block,
+                             "\n# %s along z\n"
+                             "move %s by 0 0 0.05\n"
+                             "run 0 40\n"
+                             "move %s by 0 0 -0.05\n"
+                             "move %s by 0 0 -0.05\n"
+                             "run 0 40\n"
+                             "move %s by 0 0 0.05\n",
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name,
+                             atom_name);
+    }
+
+  gdis_qbox_append_text_block(tool, block->str);
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Appended the Homework 5 frozen-phonon displacement block.\n"
+                       "This follows the original +/- 0.05 bohr pattern for every atom and axis, ready to be run from the current Qbox deck.");
+  gdis_gtk4_window_log(self,
+                       "Appended the Homework 5 frozen-phonon block to the Qbox deck.\n");
+  g_string_free(block, TRUE);
+}
+
+static void
+on_qbox_append_hw5_homo_lumo_clicked(GtkButton *button, gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GdisQboxTool *tool;
+  g_autofree gchar *restart_reference = NULL;
+  g_autofree gchar *save_text = NULL;
+  g_autofree gchar *last_save_basename = NULL;
+  g_autofree gchar *load_ref = NULL;
+  GString *block;
+
+  (void) button;
+
+  self = user_data;
+  tool = self ? self->qbox_tool : NULL;
+  if (!tool || !self)
+    return;
+
+  restart_reference = gdis_qbox_restart_reference(tool);
+  save_text = gdis_qbox_entry_text(tool->save_entry);
+  if (self->qbox_last_save_path && self->qbox_last_save_path[0])
+    last_save_basename = g_path_get_basename(self->qbox_last_save_path);
+
+  if (restart_reference && restart_reference[0] &&
+      !g_str_has_prefix(restart_reference, "<"))
+    load_ref = g_strdup(restart_reference);
+  else if (save_text && save_text[0])
+    load_ref = g_strdup(save_text);
+  else if (last_save_basename && last_save_basename[0])
+    load_ref = g_strdup(last_save_basename);
+  else
+    load_ref = g_strdup("<set-restart-xml>");
+
+  block = g_string_new(
+    "# Homework 5 HOMO/LUMO continuation block\n");
+  g_string_append_printf(block,
+                         "load %s\n"
+                         "set nempty 1\n"
+                         "set wf_dyn JD\n"
+                         "run 0 120\n"
+                         "plot -wf 4 HOMO.cube\n"
+                         "plot -wf 5 LUMO.cube\n"
+                         "save ch4_homo_lumo.xml\n",
+                         load_ref);
+
+  gdis_qbox_append_text_block(tool, block->str);
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Appended the Homework 5 HOMO/LUMO continuation block.\n"
+                       "The block loads the current restart XML, adds one empty state, switches to JD, and writes HOMO.cube and LUMO.cube.");
+  gdis_gtk4_window_log(self,
+                       "Appended the Homework 5 HOMO/LUMO block to the Qbox deck.\n");
+  g_string_free(block, TRUE);
 }
 
 static void
@@ -9753,8 +10073,30 @@ gdis_gtk4_window_present_qbox_tool(GdisGtk4Window *self)
   gtk_grid_attach(GTK_GRID(grid), tool->use_cell_toggle, 2, 9, 2, 1);
   tool->atomic_density_toggle = gtk_check_button_new_with_label("Use -atomic_density startup");
   gtk_grid_attach(GTK_GRID(grid), tool->atomic_density_toggle, 4, 9, 2, 1);
+
+  label = gtk_label_new("MP mesh");
+  gtk_widget_set_halign(label, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), label, 0, 10, 1, 1);
+  for (guint i = 0; i < 3; i++)
+    {
+      tool->kmesh_spins[i] = gtk_spin_button_new_with_range(1.0, 24.0, 1.0);
+      gtk_widget_set_hexpand(tool->kmesh_spins[i], FALSE);
+      gtk_grid_attach(GTK_GRID(grid), tool->kmesh_spins[i], 1 + (gint) i, 10, 1, 1);
+    }
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->kmesh_spins[0]), 4.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->kmesh_spins[1]), 4.0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(tool->kmesh_spins[2]), 1.0);
+  gtk_widget_set_tooltip_text(tool->kmesh_spins[0], "Monkhorst-Pack divisions along reciprocal a*.");
+  gtk_widget_set_tooltip_text(tool->kmesh_spins[1], "Monkhorst-Pack divisions along reciprocal b*.");
+  gtk_widget_set_tooltip_text(tool->kmesh_spins[2], "Monkhorst-Pack divisions along reciprocal c*.");
+  button = gtk_button_new_with_label("Apply MP Mesh");
+  gtk_widget_set_tooltip_text(button,
+                              "Replace any existing kpoint lines in the current deck with a generated Monkhorst-Pack mesh.");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_apply_mp_mesh_clicked), self);
+  gtk_grid_attach(GTK_GRID(grid), button, 4, 10, 2, 1);
+
   tool->randomize_toggle = gtk_check_button_new_with_label("Add randomize_wf for fresh starts");
-  gtk_grid_attach(GTK_GRID(grid), tool->randomize_toggle, 2, 10, 4, 1);
+  gtk_grid_attach(GTK_GRID(grid), tool->randomize_toggle, 2, 11, 4, 1);
 
   frame = gtk_frame_new("Species Mapping");
   gtk_box_append(GTK_BOX(top_box), frame);
@@ -9840,6 +10182,18 @@ gdis_gtk4_window_present_qbox_tool(GdisGtk4Window *self)
 
   button = gtk_button_new_with_label("Results");
   g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_results_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("HW5 Frozen Phonons");
+  gtk_widget_set_tooltip_text(button,
+                              "Append the original Homework 5 +/- 0.05 bohr displacement block for every atom and axis.");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_append_hw5_phonons_clicked), self);
+  gtk_box_append(GTK_BOX(row), button);
+
+  button = gtk_button_new_with_label("HW5 HOMO/LUMO");
+  gtk_widget_set_tooltip_text(button,
+                              "Append the Homework 5 continuation block for nempty/JD plus HOMO.cube and LUMO.cube export.");
+  g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_append_hw5_homo_lumo_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   button = gtk_button_new_with_label("Close");
@@ -10732,7 +11086,7 @@ gdis_gtk4_window_update_details(GdisGtk4Window *self)
     {
       if (self->active_summary_buffer)
         gdis_text_buffer_set(self->active_summary_buffer,
-                             "No active model\nOpen a file or choose a sample model.");
+                             "No active model\nOpen a file to load a structure.");
       if (self->content_buffer)
         gdis_text_buffer_set(self->content_buffer, "No active model loaded.");
       if (self->editing_buffer)
@@ -10985,6 +11339,38 @@ gdis_gtk4_window_find_model(GdisGtk4Window *self, const char *path)
     }
 
   return NULL;
+}
+
+static gint
+gdis_gtk4_window_compare_models(const GdisModel *left, const GdisModel *right)
+{
+  const char *left_name;
+  const char *right_name;
+  g_autofree gchar *left_key = NULL;
+  g_autofree gchar *right_key = NULL;
+  gint result;
+
+  if (left == right)
+    return 0;
+  if (!left)
+    return -1;
+  if (!right)
+    return 1;
+
+  left_name = (left->basename && left->basename[0]) ? left->basename : left->path;
+  right_name = (right->basename && right->basename[0]) ? right->basename : right->path;
+  if (!left_name)
+    left_name = "";
+  if (!right_name)
+    right_name = "";
+
+  left_key = g_utf8_collate_key_for_filename(left_name, -1);
+  right_key = g_utf8_collate_key_for_filename(right_name, -1);
+  result = g_strcmp0(left_key, right_key);
+  if (result != 0)
+    return result;
+
+  return g_strcmp0(left->path, right->path);
 }
 
 static gint
@@ -11289,12 +11675,27 @@ gdis_gtk4_window_add_loaded_model(GdisGtk4Window *self,
                                   gboolean select_after_add)
 {
   GtkWidget *button;
+  GtkWidget *previous_button;
   gchar *label;
+  guint insert_index;
 
   g_return_val_if_fail(self != NULL, NULL);
   g_return_val_if_fail(model != NULL, NULL);
 
-  g_ptr_array_add(self->models, model);
+  insert_index = self->models->len;
+  for (guint i = 0; i < self->models->len; i++)
+    {
+      GdisModel *existing_model;
+
+      existing_model = g_ptr_array_index(self->models, i);
+      if (gdis_gtk4_window_compare_models(model, existing_model) < 0)
+        {
+          insert_index = i;
+          break;
+        }
+    }
+  g_ptr_array_insert(self->models, insert_index, model);
+
   label = g_strdup_printf("%s [%s | %u atoms]",
                           model->basename,
                           model->format_label,
@@ -11309,7 +11710,16 @@ gdis_gtk4_window_add_loaded_model(GdisGtk4Window *self,
   g_object_set_data(G_OBJECT(button), "gdis-model", model);
   gtk_widget_set_tooltip_text(button, model->path);
   g_signal_connect(button, "clicked", G_CALLBACK(on_model_button_clicked), self);
-  gtk_box_append(GTK_BOX(self->model_list), button);
+
+  previous_button = NULL;
+  if (insert_index > 0)
+    {
+      GdisModel *previous_model;
+
+      previous_model = g_ptr_array_index(self->models, insert_index - 1);
+      previous_button = gdis_gtk4_window_find_model_button(self, previous_model->path);
+    }
+  gtk_box_insert_child_after(GTK_BOX(self->model_list), button, previous_button);
   g_free(label);
 
   if (select_after_add)
@@ -11769,6 +12179,55 @@ gdis_prepare_projection(GdisGtk4Window *self,
       image_positive[1] = 1;
       image_positive[2] = 1;
     }
+  else if (self->active_model->periodic)
+    {
+      guint periodic_dims;
+      gdouble average_shift[3];
+      gdouble periodic_center[3];
+
+      periodic_dims = self->active_model->periodicity;
+      if (periodic_dims == 0u)
+        periodic_dims = 3u;
+      periodic_dims = MIN(periodic_dims, 3u);
+
+      average_shift[0] = ((gdouble) (image_positive[0] - 1 - image_negative[0])) * 0.5;
+      average_shift[1] = ((gdouble) (image_positive[1] - 1 - image_negative[1])) * 0.5;
+      average_shift[2] = ((gdouble) (image_positive[2] - 1 - image_negative[2])) * 0.5;
+
+      periodic_center[0] = average_shift[0] * a_vec[0] +
+                           average_shift[1] * b_vec[0] +
+                           average_shift[2] * c_vec[0];
+      periodic_center[1] = average_shift[0] * a_vec[1] +
+                           average_shift[1] * b_vec[1] +
+                           average_shift[2] * c_vec[1];
+      periodic_center[2] = average_shift[0] * a_vec[2] +
+                           average_shift[1] * b_vec[2] +
+                           average_shift[2] * c_vec[2];
+
+      if (periodic_dims > 0u)
+        {
+          periodic_center[0] += 0.5 * a_vec[0];
+          periodic_center[1] += 0.5 * a_vec[1];
+          periodic_center[2] += 0.5 * a_vec[2];
+        }
+      if (periodic_dims > 1u)
+        {
+          periodic_center[0] += 0.5 * b_vec[0];
+          periodic_center[1] += 0.5 * b_vec[1];
+          periodic_center[2] += 0.5 * b_vec[2];
+        }
+      if (periodic_dims > 2u)
+        {
+          periodic_center[0] += 0.5 * c_vec[0];
+          periodic_center[1] += 0.5 * c_vec[1];
+          periodic_center[2] += 0.5 * c_vec[2];
+        }
+
+      center_out[0] = periodic_center[0];
+      center_out[1] = periodic_center[1];
+      if (periodic_dims >= 3u)
+        center_out[2] = periodic_center[2];
+    }
 
   cell_count = (guint) (image_negative[0] + image_positive[0]) *
                (guint) (image_negative[1] + image_positive[1]) *
@@ -11843,7 +12302,7 @@ gdis_draw_placeholder(GdisGtk4Window *self, cairo_t *cr, int width, int height)
   const char *line_one;
   const char *line_two;
 
-  line_one = "Open a sample model or use File > Open to load a structure.";
+  line_one = "Use File > Open to load one or more structure files.";
   line_two = "Left-drag atom or Alt-drag anywhere to rotate, left-drag empty space to box select, right-drag anywhere to rotate, and scroll to zoom.";
   if (self && self->active_model && self->active_model->atom_count == 0)
     {
@@ -13888,22 +14347,23 @@ on_viewer_click_released(GtkGestureClick *gesture,
 }
 
 static void
-on_open_dialog_complete(GObject *source_object,
-                        GAsyncResult *result,
-                        gpointer user_data)
+on_open_multiple_dialog_complete(GObject *source_object,
+                                 GAsyncResult *result,
+                                 gpointer user_data)
 {
   GdisGtk4Window *self;
   GtkFileDialog *dialog;
-  GFile *file;
+  GListModel *files;
   GError *error;
-  gchar *path;
+  guint n_files;
+  guint loaded_count;
 
   dialog = GTK_FILE_DIALOG(source_object);
   self = user_data;
 
   error = NULL;
-  file = gtk_file_dialog_open_finish(dialog, result, &error);
-  if (!file)
+  files = gtk_file_dialog_open_multiple_finish(dialog, result, &error);
+  if (!files)
     {
       if (error)
         {
@@ -13916,15 +14376,211 @@ on_open_dialog_complete(GObject *source_object,
       return;
     }
 
-  path = g_file_get_path(file);
+  n_files = g_list_model_get_n_items(files);
+  loaded_count = 0;
+  for (guint i = 0; i < n_files; i++)
+    {
+      GFile *file;
+      gchar *path;
+      gboolean loaded;
+
+      file = g_list_model_get_item(files, i);
+      if (!file)
+        continue;
+
+      path = g_file_get_path(file);
+      if (path)
+        {
+          loaded = gdis_gtk4_window_add_model_from_path(self, path, TRUE);
+          if (loaded)
+            loaded_count++;
+          g_free(path);
+        }
+
+      g_object_unref(file);
+    }
+
+  if (loaded_count > 0)
+    gdis_gtk4_window_log(self, "Loaded %u model file%s from selection.\n",
+                         loaded_count,
+                         loaded_count == 1 ? "" : "s");
+
+  g_object_unref(files);
+  g_object_unref(dialog);
+}
+
+static void
+present_open_dialog(GdisGtk4Window *self)
+{
+  GtkFileDialog *dialog;
+
+  g_return_if_fail(self != NULL);
+
+  dialog = gtk_file_dialog_new();
+  gtk_file_dialog_set_title(dialog, "Open model(s)");
+  gtk_file_dialog_open_multiple(dialog,
+                                GTK_WINDOW(self->window),
+                                NULL,
+                                on_open_multiple_dialog_complete,
+                                self);
+}
+
+static gboolean
+gdis_gtk4_window_model_path_supported(const char *path)
+{
+  g_return_val_if_fail(path != NULL, FALSE);
+
+  return gdis_model_format_from_path(path) != GDIS_MODEL_FORMAT_UNKNOWN;
+}
+
+static guint
+gdis_gtk4_window_open_models_from_directory(GdisGtk4Window *self,
+                                            const char *dir_path,
+                                            gboolean *open_failed_out)
+{
+  GDir *dir;
+  GError *error;
+  const gchar *name;
+  guint loaded_count;
+  guint skipped_unsupported_count;
+  guint failed_count;
+
+  g_return_val_if_fail(self != NULL, 0);
+  g_return_val_if_fail(dir_path != NULL, 0);
+
+  if (open_failed_out)
+    *open_failed_out = FALSE;
+
+  error = NULL;
+  dir = g_dir_open(dir_path, 0, &error);
+  if (!dir)
+    {
+      if (open_failed_out)
+        *open_failed_out = TRUE;
+
+      gdis_gtk4_window_log(self,
+                           "Could not open directory: %s%s%s%s\n",
+                           dir_path,
+                           error ? " (" : "",
+                           error ? error->message : "",
+                           error ? ")" : "");
+      if (error)
+        {
+          gdis_gtk4_window_log(self,
+                               "macOS may block direct folder reads for app bundles in protected locations.\n"
+                               "Use File > Open Models Folder... once and pick this folder to grant access.\n");
+          g_error_free(error);
+        }
+      return 0;
+    }
+
+  loaded_count = 0;
+  skipped_unsupported_count = 0;
+  failed_count = 0;
+  while ((name = g_dir_read_name(dir)) != NULL)
+    {
+      g_autofree gchar *candidate = NULL;
+      gboolean loaded;
+
+      if (name[0] == '.')
+        continue;
+
+      candidate = g_build_filename(dir_path, name, NULL);
+      if (!g_file_test(candidate, G_FILE_TEST_IS_REGULAR))
+        continue;
+      if (!gdis_gtk4_window_model_path_supported(candidate))
+        {
+          skipped_unsupported_count++;
+          continue;
+        }
+
+      loaded = gdis_gtk4_window_add_model_from_path(self, candidate, TRUE);
+      if (loaded)
+        loaded_count++;
+      else
+        failed_count++;
+    }
+
+  g_dir_close(dir);
+  gdis_gtk4_window_log(self,
+                       "Loaded %u model file%s from folder: %s (skipped unsupported: %u, failed to load: %u)\n",
+                       loaded_count,
+                       loaded_count == 1 ? "" : "s",
+                       dir_path,
+                       skipped_unsupported_count,
+                       failed_count);
+  return loaded_count;
+}
+
+static void
+on_open_models_folder_dialog_complete(GObject *source_object,
+                                      GAsyncResult *result,
+                                      gpointer user_data)
+{
+  GdisGtk4Window *self;
+  GtkFileDialog *dialog;
+  GFile *folder;
+  GError *error;
+  gchar *path;
+
+  dialog = GTK_FILE_DIALOG(source_object);
+  self = user_data;
+
+  error = NULL;
+  folder = gtk_file_dialog_select_folder_finish(dialog, result, &error);
+  if (!folder)
+    {
+      if (error)
+        {
+          if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED) &&
+              !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            gdis_gtk4_window_log(self, "Open folder failed: %s\n", error->message);
+          g_error_free(error);
+        }
+      g_object_unref(dialog);
+      return;
+    }
+
+  path = g_file_get_path(folder);
   if (path)
     {
-      gdis_gtk4_window_add_model_from_path(self, path, TRUE);
+      gdis_gtk4_window_open_models_from_directory(self, path, NULL);
       g_free(path);
     }
 
-  g_object_unref(file);
+  g_object_unref(folder);
   g_object_unref(dialog);
+}
+
+static void
+present_open_models_folder_dialog_at(GdisGtk4Window *self,
+                                     const char *initial_dir)
+{
+  GtkFileDialog *dialog;
+
+  g_return_if_fail(self != NULL);
+
+  dialog = gtk_file_dialog_new();
+  gtk_file_dialog_set_title(dialog, "Open all models in folder");
+  if (initial_dir && initial_dir[0] != '\0')
+    {
+      GFile *initial_folder;
+
+      initial_folder = g_file_new_for_path(initial_dir);
+      gtk_file_dialog_set_initial_folder(dialog, initial_folder);
+      g_object_unref(initial_folder);
+    }
+  gtk_file_dialog_select_folder(dialog,
+                                GTK_WINDOW(self->window),
+                                NULL,
+                                on_open_models_folder_dialog_complete,
+                                self);
+}
+
+static void
+present_open_models_folder_dialog(GdisGtk4Window *self)
+{
+  present_open_models_folder_dialog_at(self, NULL);
 }
 
 static void
@@ -13978,22 +14634,6 @@ cleanup:
   g_object_unref(file);
   g_free(context);
   g_object_unref(dialog);
-}
-
-static void
-present_open_dialog(GdisGtk4Window *self)
-{
-  GtkFileDialog *dialog;
-
-  g_return_if_fail(self != NULL);
-
-  dialog = gtk_file_dialog_new();
-  gtk_file_dialog_set_title(dialog, "Open model");
-  gtk_file_dialog_open(dialog,
-                       GTK_WINDOW(self->window),
-                       NULL,
-                       on_open_dialog_complete,
-                       self);
 }
 
 static void
@@ -14066,7 +14706,7 @@ build_active_model_card(GdisGtk4Window *self)
   gtk_box_append(GTK_BOX(box), new_section_button("Active Model"));
   gtk_box_append(GTK_BOX(box), new_readonly_text_view(&self->active_summary_buffer, FALSE, 120));
   gdis_text_buffer_set(self->active_summary_buffer,
-                       "No active model\nOpen a file or choose a sample model.");
+                       "No active model\nOpen a file to load a structure.");
 
   gtk_frame_set_child(GTK_FRAME(frame), box);
 
@@ -14077,15 +14717,11 @@ static GtkWidget *
 build_model_list(GdisGtk4Window *self)
 {
   GtkWidget *list;
-  int i;
 
   list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
   gtk_widget_set_hexpand(list, TRUE);
 
   self->model_list = list;
-
-  for (i = 0; gdis_legacy_model_samples[i] != NULL; i++)
-    gdis_gtk4_window_add_model_from_path(self, gdis_legacy_model_samples[i], FALSE);
 
   if (!self->active_model && self->models->len > 0)
     gdis_gtk4_window_set_active_model(self, g_ptr_array_index(self->models, 0));
@@ -14282,6 +14918,9 @@ build_main_content(GdisGtk4Window *self)
   gtk_paned_set_wide_handle(GTK_PANED(right_paned), TRUE);
   self->right_paned = right_paned;
 
+  viewer = build_viewer_area(self);
+  status = build_status_view(self);
+
   sidebar = build_sidebar(self);
   sidebar_scroller = gtk_scrolled_window_new();
   gtk_widget_set_hexpand(sidebar_scroller, FALSE);
@@ -14291,9 +14930,6 @@ build_main_content(GdisGtk4Window *self)
                                  GTK_POLICY_NEVER,
                                  GTK_POLICY_AUTOMATIC);
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sidebar_scroller), sidebar);
-
-  viewer = build_viewer_area(self);
-  status = build_status_view(self);
 
   gtk_paned_set_start_child(GTK_PANED(main_paned), sidebar_scroller);
   gtk_paned_set_end_child(GTK_PANED(main_paned), right_paned);
@@ -14421,6 +15057,8 @@ build_menu_bar_model(void)
   file_menu = g_menu_new();
   g_menu_append(file_menu, "New", "app.new-model");
   g_menu_append(file_menu, "Open", "app.open");
+  g_menu_append(file_menu, "Open ./models/*", "app.open-models-glob");
+  g_menu_append(file_menu, "Open Models Folder...", "app.open-models-folder");
   g_menu_append(file_menu, "Save", "app.save");
   g_menu_append(file_menu, "Save As", "app.save-as");
   g_menu_append(file_menu, "Close", "app.close-model");
@@ -14533,6 +15171,31 @@ action_dispatch(GSimpleAction *action, GVariant *parameter, gpointer user_data)
   if (g_strcmp0(name, "open") == 0)
     {
       present_open_dialog(self);
+      return;
+    }
+
+  if (g_strcmp0(name, "open-models-folder") == 0)
+    {
+      present_open_models_folder_dialog(self);
+      return;
+    }
+
+  if (g_strcmp0(name, "open-models-glob") == 0)
+    {
+      g_autofree gchar *models_dir = NULL;
+      gboolean open_failed;
+
+      models_dir = gdis_gtk4_window_resolve_path("./models");
+      if (!models_dir || !g_file_test(models_dir, G_FILE_TEST_IS_DIR))
+        {
+          gdis_gtk4_window_log(self, "Could not resolve ./models from this launch location.\n");
+          return;
+        }
+
+      open_failed = FALSE;
+      gdis_gtk4_window_open_models_from_directory(self, models_dir, &open_failed);
+      if (open_failed)
+        present_open_models_folder_dialog_at(self, models_dir);
       return;
     }
 
@@ -14908,6 +15571,8 @@ install_actions(GtkApplication *app)
 {
   const GActionEntry entries[] = {
     {.name = "open", .activate = action_dispatch},
+    {.name = "open-models-glob", .activate = action_dispatch},
+    {.name = "open-models-folder", .activate = action_dispatch},
     {.name = "save", .activate = action_dispatch},
     {.name = "save-as", .activate = action_dispatch},
     {.name = "undo", .activate = action_dispatch},
@@ -14961,6 +15626,10 @@ install_actions(GtkApplication *app)
                                         (const char *[]) {"<Primary>n", NULL});
   gtk_application_set_accels_for_action(app, "app.open",
                                         (const char *[]) {"<Primary>o", NULL});
+  gtk_application_set_accels_for_action(app, "app.open-models-glob",
+                                        (const char *[]) {"<Primary><Shift>o", NULL});
+  gtk_application_set_accels_for_action(app, "app.open-models-folder",
+                                        (const char *[]) {"<Primary><Alt>o", NULL});
   gtk_application_set_accels_for_action(app, "app.save",
                                         (const char *[]) {"<Primary>s", NULL});
   gtk_application_set_accels_for_action(app, "app.undo",

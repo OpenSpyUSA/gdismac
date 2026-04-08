@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+BIN_PATH="${SCRIPT_DIR}/build/gdis-gtk4"
+
+if [ ! -x "$BIN_PATH" ]; then
+  echo "Building gdis-gtk4 first..."
+  make -C "$SCRIPT_DIR"
+fi
+
+exec "$BIN_PATH" "$@"

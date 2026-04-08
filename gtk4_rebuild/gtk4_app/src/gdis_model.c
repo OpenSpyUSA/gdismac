@@ -64,6 +64,15 @@ static gboolean gdis_model_load_arc_like(GdisModel *model,
                                          GError **error);
 static gboolean gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_gulp_input_like(GdisModel *model,
+                                                const gchar *contents,
+                                                GdisModelFormat format,
+                                                GError **error);
+static gboolean gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_qe_input(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_qe_output(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_gamess_input(GdisModel *model, const gchar *contents, GError **error);
 static gchar *gdis_model_write_xyz(const GdisModel *model);
 static gchar *gdis_model_write_pdb(const GdisModel *model);
 static gchar *gdis_model_write_arc_like(const GdisModel *model, GdisModelFormat format);
@@ -95,11 +104,23 @@ static GdisAtom *gdis_atom_new(const gchar *label,
 static void gdis_atom_free(gpointer data);
 static void gdis_cif_atom_record_free(gpointer data);
 static gboolean gdis_model_has_valid_cell(const GdisModel *model);
+static gboolean gdis_build_cell_matrix_from_parameters(const gdouble lengths[3],
+                                                       const gdouble angles[3],
+                                                       gdouble matrix[9],
+                                                       gdouble inverse[9]);
 static gboolean gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble inverse[9]);
 static gboolean gdis_model_invert_matrix3(const gdouble matrix[9], gdouble inverse[9]);
 static void gdis_frac_to_cart(const gdouble matrix[9], const gdouble frac[3], gdouble cart[3]);
 static void gdis_cart_to_frac(const gdouble inverse[9], const gdouble cart[3], gdouble frac[3]);
 static void gdis_model_init_image_limits(GdisModel *model);
+static void gdis_model_wrap_atoms_to_cell(GPtrArray *atoms,
+                                          guint periodicity,
+                                          const gdouble matrix[9],
+                                          const gdouble inverse[9]);
+static gboolean gdis_model_repack_periodic_components(GdisModel *model,
+                                                      const gdouble matrix[9],
+                                                      const gdouble inverse[9]);
+static void gdis_model_normalize_loaded_periodic_geometry(GdisModel *model);
 static guint *gdis_model_build_component_ids(const GdisModel *model, guint *component_count_out);
 static void gdis_model_minimum_image_delta(const GdisModel *model,
                                            const gdouble matrix[9],
@@ -120,7 +141,15 @@ static gchar *gdis_pdb_guess_element(const gchar *atom_name);
 static gboolean gdis_arc_like_type_is_marvin_label(const gchar *text);
 static gint gdis_arc_like_region_from_type(const gchar *text);
 static gboolean gdis_try_parse_double(const gchar *text, gdouble *value);
+static gboolean gdis_try_parse_double_relaxed(const gchar *text, gdouble *value);
 static gboolean gdis_try_parse_uint(const gchar *text, guint *value);
+static guint gdis_collect_doubles_from_line(const gchar *line,
+                                            gdouble *values,
+                                            guint max_values);
+static gboolean gdis_collect_three_doubles_from_tokens(gchar **tokens,
+                                                       gint token_count,
+                                                       gint start_index,
+                                                       gdouble out[3]);
 static gchar **gdis_split_simple(const gchar *line, gint *count);
 static GPtrArray *gdis_tokenize_cif(const gchar *line);
 static gboolean gdis_cif_parse_value_line(const gchar *line, gchar **tag_out, gchar **value_out);
@@ -246,6 +275,24 @@ gdis_model_load(const char *path, GError **error)
     case GDIS_MODEL_FORMAT_QBOX_XML:
       ok = gdis_model_load_qbox_xml(model, contents, error);
       break;
+    case GDIS_MODEL_FORMAT_GULP_INPUT:
+      ok = gdis_model_load_gulp_input_like(model, contents, format, error);
+      break;
+    case GDIS_MODEL_FORMAT_GULP_OUTPUT:
+      ok = gdis_model_load_gulp_output(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_XTL:
+      ok = gdis_model_load_xtl(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_QE_INPUT:
+      ok = gdis_model_load_qe_input(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_QE_OUTPUT:
+      ok = gdis_model_load_qe_output(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_GAMESS_INPUT:
+      ok = gdis_model_load_gamess_input(model, contents, error);
+      break;
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
       g_set_error(error,
@@ -267,6 +314,7 @@ gdis_model_load(const char *path, GError **error)
   model->explicit_bond_count = model->bonds->len;
   if (model->explicit_bond_count == 0)
     gdis_model_infer_bonds(model);
+  gdis_model_normalize_loaded_periodic_geometry(model);
 
   gdis_model_finalize_metadata(model);
 
@@ -449,6 +497,18 @@ gdis_model_save(GdisModel *model, const char *path, GError **error)
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
                   "Saving Qbox XML is not supported from the GTK4 rebuild yet.");
+      break;
+    case GDIS_MODEL_FORMAT_GULP_INPUT:
+    case GDIS_MODEL_FORMAT_GULP_OUTPUT:
+    case GDIS_MODEL_FORMAT_XTL:
+    case GDIS_MODEL_FORMAT_QE_INPUT:
+    case GDIS_MODEL_FORMAT_QE_OUTPUT:
+    case GDIS_MODEL_FORMAT_GAMESS_INPUT:
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
+                  "Saving %s is not supported from the GTK4 rebuild yet.",
+                  gdis_model_format_label(format));
       break;
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
@@ -876,8 +936,6 @@ gdis_model_confine_atoms_to_cell(GdisModel *model, GError **error)
 {
   gdouble matrix[9];
   gdouble inverse[9];
-  guint dims;
-  guint i;
 
   g_return_val_if_fail(model != NULL, FALSE);
 
@@ -899,25 +957,10 @@ gdis_model_confine_atoms_to_cell(GdisModel *model, GError **error)
       return FALSE;
     }
 
-  dims = model->periodicity;
-  if (dims == 0)
-    dims = 3;
-  dims = MIN(dims, 3u);
-
-  for (i = 0; i < model->atoms->len; i++)
-    {
-      GdisAtom *atom;
-      gdouble frac[3];
-      guint axis;
-
-      atom = g_ptr_array_index(model->atoms, i);
-      gdis_cart_to_frac(inverse, atom->position, frac);
-
-      for (axis = 0; axis < dims; axis++)
-        frac[axis] -= floor(frac[axis]);
-
-      gdis_frac_to_cart(matrix, frac, atom->position);
-    }
+  gdis_model_wrap_atoms_to_cell(model->atoms,
+                                model->periodicity,
+                                matrix,
+                                inverse);
 
   gdis_model_discard_frames(model);
   if (model->explicit_bond_count == 0)
@@ -931,13 +974,6 @@ gdis_model_confine_molecules_to_cell(GdisModel *model, GError **error)
 {
   gdouble matrix[9];
   gdouble inverse[9];
-  gdouble *unwrapped_positions;
-  guint *component_ids;
-  guint component_count;
-  guint dims;
-  guint atom_count;
-  guint component;
-  guint i;
 
   g_return_val_if_fail(model != NULL, FALSE);
 
@@ -959,169 +995,11 @@ gdis_model_confine_molecules_to_cell(GdisModel *model, GError **error)
       return FALSE;
     }
 
-  atom_count = model->atoms ? model->atoms->len : 0u;
-  if (atom_count == 0)
-    return TRUE;
-
-  dims = model->periodicity;
-  if (dims == 0)
-    dims = 3;
-  dims = MIN(dims, 3u);
-
-  component_ids = gdis_model_build_component_ids(model, &component_count);
-  if (!component_ids)
-    return TRUE;
-
-  unwrapped_positions = g_new0(gdouble, atom_count * 3u);
-  for (i = 0; i < atom_count; i++)
-    {
-      const GdisAtom *atom;
-
-      atom = g_ptr_array_index(model->atoms, i);
-      unwrapped_positions[3u * i] = atom->position[0];
-      unwrapped_positions[3u * i + 1u] = atom->position[1];
-      unwrapped_positions[3u * i + 2u] = atom->position[2];
-    }
-
-  for (component = 0; component < component_count; component++)
-    {
-      GQueue queue = G_QUEUE_INIT;
-      gboolean *visited;
-      gboolean found_start;
-      guint start_index;
-      guint count;
-      gdouble centroid[3];
-      gdouble centroid_frac[3];
-      gdouble wrapped_frac[3];
-      gdouble shift_frac[3];
-      gdouble shift_cart[3];
-
-      visited = g_new0(gboolean, atom_count);
-      found_start = FALSE;
-      start_index = 0;
-      count = 0;
-      centroid[0] = 0.0;
-      centroid[1] = 0.0;
-      centroid[2] = 0.0;
-
-      for (i = 0; i < atom_count; i++)
-        {
-          if (component_ids[i] == component)
-            {
-              start_index = i;
-              found_start = TRUE;
-              break;
-            }
-        }
-
-      if (!found_start)
-        {
-          g_free(visited);
-          continue;
-        }
-
-      visited[start_index] = TRUE;
-      g_queue_push_tail(&queue, GUINT_TO_POINTER(start_index));
-
-      while (!g_queue_is_empty(&queue))
-        {
-          guint atom_index;
-          guint bond_index;
-
-          atom_index = GPOINTER_TO_UINT(g_queue_pop_head(&queue));
-
-          for (bond_index = 0; bond_index < model->bonds->len; bond_index++)
-            {
-              const GdisBond *bond;
-              guint neighbor;
-
-              bond = &g_array_index(model->bonds, GdisBond, bond_index);
-              if (bond->atom_index_a == atom_index)
-                neighbor = bond->atom_index_b;
-              else if (bond->atom_index_b == atom_index)
-                neighbor = bond->atom_index_a;
-              else
-                continue;
-
-              if (neighbor >= atom_count ||
-                  component_ids[neighbor] != component ||
-                  visited[neighbor])
-                continue;
-
-              {
-                const GdisAtom *from_atom;
-                const GdisAtom *to_atom;
-                gdouble delta[3];
-
-                from_atom = g_ptr_array_index(model->atoms, atom_index);
-                to_atom = g_ptr_array_index(model->atoms, neighbor);
-                gdis_model_minimum_image_delta(model,
-                                               matrix,
-                                               inverse,
-                                               from_atom->position,
-                                               to_atom->position,
-                                               delta);
-                unwrapped_positions[3u * neighbor] = unwrapped_positions[3u * atom_index] + delta[0];
-                unwrapped_positions[3u * neighbor + 1u] = unwrapped_positions[3u * atom_index + 1u] + delta[1];
-                unwrapped_positions[3u * neighbor + 2u] = unwrapped_positions[3u * atom_index + 2u] + delta[2];
-              }
-
-              visited[neighbor] = TRUE;
-              g_queue_push_tail(&queue, GUINT_TO_POINTER(neighbor));
-            }
-        }
-
-      for (i = 0; i < atom_count; i++)
-        {
-          if (component_ids[i] != component)
-            continue;
-
-          centroid[0] += unwrapped_positions[3u * i];
-          centroid[1] += unwrapped_positions[3u * i + 1u];
-          centroid[2] += unwrapped_positions[3u * i + 2u];
-          count++;
-        }
-
-      if (count == 0)
-        {
-          g_free(visited);
-          continue;
-        }
-
-      centroid[0] /= (gdouble) count;
-      centroid[1] /= (gdouble) count;
-      centroid[2] /= (gdouble) count;
-      gdis_cart_to_frac(inverse, centroid, centroid_frac);
-
-      wrapped_frac[0] = centroid_frac[0];
-      wrapped_frac[1] = centroid_frac[1];
-      wrapped_frac[2] = centroid_frac[2];
-      for (i = 0; i < dims; i++)
-        wrapped_frac[i] -= floor(wrapped_frac[i]);
-
-      shift_frac[0] = wrapped_frac[0] - centroid_frac[0];
-      shift_frac[1] = wrapped_frac[1] - centroid_frac[1];
-      shift_frac[2] = wrapped_frac[2] - centroid_frac[2];
-      gdis_frac_to_cart(matrix, shift_frac, shift_cart);
-
-      for (i = 0; i < atom_count; i++)
-        {
-          GdisAtom *atom;
-
-          if (component_ids[i] != component)
-            continue;
-
-          atom = g_ptr_array_index(model->atoms, i);
-          atom->position[0] += shift_cart[0];
-          atom->position[1] += shift_cart[1];
-          atom->position[2] += shift_cart[2];
-        }
-
-      g_free(visited);
-    }
-
-  g_free(unwrapped_positions);
-  g_free(component_ids);
+  if (!gdis_model_repack_periodic_components(model, matrix, inverse))
+    gdis_model_wrap_atoms_to_cell(model->atoms,
+                                  model->periodicity,
+                                  matrix,
+                                  inverse);
 
   gdis_model_discard_frames(model);
   if (model->explicit_bond_count == 0)
@@ -1839,7 +1717,27 @@ gdis_model_format_from_path(const char *path)
   else if (g_str_equal(lower, "cif"))
     format = GDIS_MODEL_FORMAT_CIF;
   else if (g_str_equal(lower, "xml"))
-    format = GDIS_MODEL_FORMAT_QBOX_XML;
+    {
+      g_autofree gchar *basename = g_path_get_basename(path);
+      g_autofree gchar *basename_lower = g_ascii_strdown(basename ? basename : "", -1);
+
+      if (g_str_has_prefix(basename_lower, "vasprun"))
+        format = GDIS_MODEL_FORMAT_UNKNOWN;
+      else
+        format = GDIS_MODEL_FORMAT_QBOX_XML;
+    }
+  else if (g_str_equal(lower, "gin") || g_str_equal(lower, "res"))
+    format = GDIS_MODEL_FORMAT_GULP_INPUT;
+  else if (g_str_equal(lower, "got") || g_str_equal(lower, "gout"))
+    format = GDIS_MODEL_FORMAT_GULP_OUTPUT;
+  else if (g_str_equal(lower, "xtl"))
+    format = GDIS_MODEL_FORMAT_XTL;
+  else if (g_str_equal(lower, "qein"))
+    format = GDIS_MODEL_FORMAT_QE_INPUT;
+  else if (g_str_equal(lower, "qeout"))
+    format = GDIS_MODEL_FORMAT_QE_OUTPUT;
+  else if (g_str_equal(lower, "inp"))
+    format = GDIS_MODEL_FORMAT_GAMESS_INPUT;
 
   g_free(lower);
   return format;
@@ -1862,6 +1760,18 @@ gdis_model_format_label(GdisModelFormat format)
       return "CIF";
     case GDIS_MODEL_FORMAT_QBOX_XML:
       return "Qbox XML";
+    case GDIS_MODEL_FORMAT_GULP_INPUT:
+      return "GULP Input";
+    case GDIS_MODEL_FORMAT_GULP_OUTPUT:
+      return "GULP Output";
+    case GDIS_MODEL_FORMAT_XTL:
+      return "XTL";
+    case GDIS_MODEL_FORMAT_QE_INPUT:
+      return "Quantum ESPRESSO Input";
+    case GDIS_MODEL_FORMAT_QE_OUTPUT:
+      return "Quantum ESPRESSO Output";
+    case GDIS_MODEL_FORMAT_GAMESS_INPUT:
+      return "GAMESS Input";
     case GDIS_MODEL_FORMAT_UNKNOWN:
     default:
       return "Unknown";
@@ -2158,6 +2068,312 @@ gdis_model_init_image_limits(GdisModel *model)
   model->image_limits[3] = 1;
   model->image_limits[4] = 0;
   model->image_limits[5] = 1;
+}
+
+static void
+gdis_model_wrap_atoms_to_cell(GPtrArray *atoms,
+                              guint periodicity,
+                              const gdouble matrix[9],
+                              const gdouble inverse[9])
+{
+  guint dims;
+
+  g_return_if_fail(atoms != NULL);
+  g_return_if_fail(matrix != NULL);
+  g_return_if_fail(inverse != NULL);
+
+  dims = periodicity;
+  if (dims == 0u)
+    dims = 3u;
+  dims = MIN(dims, 3u);
+
+  for (guint i = 0; i < atoms->len; i++)
+    {
+      GdisAtom *atom;
+      gdouble frac[3];
+
+      atom = g_ptr_array_index(atoms, i);
+      gdis_cart_to_frac(inverse, atom->position, frac);
+
+      for (guint axis = 0; axis < dims; axis++)
+        frac[axis] -= floor(frac[axis]);
+
+      gdis_frac_to_cart(matrix, frac, atom->position);
+    }
+}
+
+static gboolean
+gdis_model_repack_periodic_components(GdisModel *model,
+                                      const gdouble matrix[9],
+                                      const gdouble inverse[9])
+{
+  static const gdouble compact_span_tolerance = 1.05;
+  gdouble *unwrapped_positions;
+  guint *component_ids;
+  guint component_count;
+  guint dims;
+  guint atom_count;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(matrix != NULL, FALSE);
+  g_return_val_if_fail(inverse != NULL, FALSE);
+
+  if (!model->atoms || model->atoms->len == 0u)
+    return TRUE;
+
+  atom_count = model->atoms->len;
+  dims = model->periodicity;
+  if (dims == 0u)
+    dims = 3u;
+  dims = MIN(dims, 3u);
+
+  component_ids = gdis_model_build_component_ids(model, &component_count);
+  if (!component_ids)
+    return FALSE;
+
+  unwrapped_positions = g_new0(gdouble, atom_count * 3u);
+  for (guint i = 0; i < atom_count; i++)
+    {
+      const GdisAtom *atom;
+
+      atom = g_ptr_array_index(model->atoms, i);
+      unwrapped_positions[3u * i] = atom->position[0];
+      unwrapped_positions[3u * i + 1u] = atom->position[1];
+      unwrapped_positions[3u * i + 2u] = atom->position[2];
+    }
+
+  for (guint component = 0; component < component_count; component++)
+    {
+      GQueue queue = G_QUEUE_INIT;
+      gboolean *visited;
+      gboolean found_start;
+      gboolean component_is_compact;
+      guint start_index;
+      guint count;
+      gdouble centroid[3];
+      gdouble centroid_frac[3];
+      gdouble wrapped_frac[3];
+      gdouble shift_frac[3];
+      gdouble shift_cart[3];
+      gdouble min_frac[3];
+      gdouble max_frac[3];
+
+      visited = g_new0(gboolean, atom_count);
+      found_start = FALSE;
+      start_index = 0u;
+      count = 0u;
+      centroid[0] = 0.0;
+      centroid[1] = 0.0;
+      centroid[2] = 0.0;
+      min_frac[0] = G_MAXDOUBLE;
+      min_frac[1] = G_MAXDOUBLE;
+      min_frac[2] = G_MAXDOUBLE;
+      max_frac[0] = -G_MAXDOUBLE;
+      max_frac[1] = -G_MAXDOUBLE;
+      max_frac[2] = -G_MAXDOUBLE;
+
+      for (guint i = 0; i < atom_count; i++)
+        {
+          if (component_ids[i] == component)
+            {
+              start_index = i;
+              found_start = TRUE;
+              break;
+            }
+        }
+
+      if (!found_start)
+        {
+          g_free(visited);
+          continue;
+        }
+
+      visited[start_index] = TRUE;
+      g_queue_push_tail(&queue, GUINT_TO_POINTER(start_index));
+
+      while (!g_queue_is_empty(&queue))
+        {
+          guint atom_index;
+
+          atom_index = GPOINTER_TO_UINT(g_queue_pop_head(&queue));
+          for (guint bond_index = 0; bond_index < model->bonds->len; bond_index++)
+            {
+              const GdisBond *bond;
+              guint neighbor;
+
+              bond = &g_array_index(model->bonds, GdisBond, bond_index);
+              if (bond->atom_index_a == atom_index)
+                neighbor = bond->atom_index_b;
+              else if (bond->atom_index_b == atom_index)
+                neighbor = bond->atom_index_a;
+              else
+                continue;
+
+              if (neighbor >= atom_count ||
+                  component_ids[neighbor] != component ||
+                  visited[neighbor])
+                continue;
+
+              {
+                const GdisAtom *from_atom;
+                const GdisAtom *to_atom;
+                gdouble delta[3];
+
+                from_atom = g_ptr_array_index(model->atoms, atom_index);
+                to_atom = g_ptr_array_index(model->atoms, neighbor);
+                gdis_model_minimum_image_delta(model,
+                                               matrix,
+                                               inverse,
+                                               from_atom->position,
+                                               to_atom->position,
+                                               delta);
+                unwrapped_positions[3u * neighbor] = unwrapped_positions[3u * atom_index] + delta[0];
+                unwrapped_positions[3u * neighbor + 1u] = unwrapped_positions[3u * atom_index + 1u] + delta[1];
+                unwrapped_positions[3u * neighbor + 2u] = unwrapped_positions[3u * atom_index + 2u] + delta[2];
+              }
+
+              visited[neighbor] = TRUE;
+              g_queue_push_tail(&queue, GUINT_TO_POINTER(neighbor));
+            }
+        }
+
+      for (guint i = 0; i < atom_count; i++)
+        {
+          gdouble frac[3];
+
+          if (component_ids[i] != component)
+            continue;
+
+          centroid[0] += unwrapped_positions[3u * i];
+          centroid[1] += unwrapped_positions[3u * i + 1u];
+          centroid[2] += unwrapped_positions[3u * i + 2u];
+          gdis_cart_to_frac(inverse, &unwrapped_positions[3u * i], frac);
+          for (guint axis = 0; axis < dims; axis++)
+            {
+              min_frac[axis] = MIN(min_frac[axis], frac[axis]);
+              max_frac[axis] = MAX(max_frac[axis], frac[axis]);
+            }
+          count++;
+        }
+
+      if (count == 0u)
+        {
+          g_free(visited);
+          continue;
+        }
+
+      centroid[0] /= (gdouble) count;
+      centroid[1] /= (gdouble) count;
+      centroid[2] /= (gdouble) count;
+
+      component_is_compact = TRUE;
+      for (guint axis = 0; axis < dims; axis++)
+        {
+          if ((max_frac[axis] - min_frac[axis]) > compact_span_tolerance)
+            {
+              component_is_compact = FALSE;
+              break;
+            }
+        }
+
+      if (component_is_compact)
+        {
+          gdis_cart_to_frac(inverse, centroid, centroid_frac);
+          wrapped_frac[0] = centroid_frac[0];
+          wrapped_frac[1] = centroid_frac[1];
+          wrapped_frac[2] = centroid_frac[2];
+          for (guint axis = 0; axis < dims; axis++)
+            wrapped_frac[axis] -= floor(wrapped_frac[axis]);
+
+          shift_frac[0] = wrapped_frac[0] - centroid_frac[0];
+          shift_frac[1] = wrapped_frac[1] - centroid_frac[1];
+          shift_frac[2] = wrapped_frac[2] - centroid_frac[2];
+          gdis_frac_to_cart(matrix, shift_frac, shift_cart);
+
+          for (guint i = 0; i < atom_count; i++)
+            {
+              GdisAtom *atom;
+
+              if (component_ids[i] != component)
+                continue;
+
+              atom = g_ptr_array_index(model->atoms, i);
+              atom->position[0] = unwrapped_positions[3u * i] + shift_cart[0];
+              atom->position[1] = unwrapped_positions[3u * i + 1u] + shift_cart[1];
+              atom->position[2] = unwrapped_positions[3u * i + 2u] + shift_cart[2];
+            }
+        }
+      else
+        {
+          for (guint i = 0; i < atom_count; i++)
+            {
+              GdisAtom *atom;
+              gdouble frac[3];
+
+              if (component_ids[i] != component)
+                continue;
+
+              gdis_cart_to_frac(inverse, &unwrapped_positions[3u * i], frac);
+              for (guint axis = 0; axis < dims; axis++)
+                frac[axis] -= floor(frac[axis]);
+
+              atom = g_ptr_array_index(model->atoms, i);
+              gdis_frac_to_cart(matrix, frac, atom->position);
+            }
+        }
+
+      g_free(visited);
+    }
+
+  g_free(unwrapped_positions);
+  g_free(component_ids);
+
+  return TRUE;
+}
+
+static void
+gdis_model_normalize_loaded_periodic_geometry(GdisModel *model)
+{
+  gdouble matrix[9];
+  gdouble inverse[9];
+
+  g_return_if_fail(model != NULL);
+
+  if (!model->periodic ||
+      !model->atoms ||
+      model->atoms->len == 0u ||
+      !gdis_model_build_cell_matrix(model, matrix, inverse))
+    return;
+
+  if (!gdis_model_repack_periodic_components(model, matrix, inverse))
+    gdis_model_wrap_atoms_to_cell(model->atoms,
+                                  model->periodicity,
+                                  matrix,
+                                  inverse);
+
+  if (model->frames)
+    {
+      for (guint i = 0; i < model->frames->len; i++)
+        {
+          GdisModelFrame *frame;
+
+          frame = g_ptr_array_index(model->frames, i);
+          if (!frame ||
+              !frame->periodic ||
+              !frame->atoms ||
+              frame->atoms->len == 0u ||
+              !gdis_build_cell_matrix_from_parameters(frame->cell_lengths,
+                                                      frame->cell_angles,
+                                                      matrix,
+                                                      inverse))
+            continue;
+
+          gdis_model_wrap_atoms_to_cell(frame->atoms,
+                                        frame->periodicity,
+                                        matrix,
+                                        inverse);
+        }
+    }
 }
 
 static guint *
@@ -2948,6 +3164,1740 @@ arc_done:
     g_ptr_array_free(frames, TRUE);
 
   return ok;
+}
+
+static gboolean
+gdis_model_load_gulp_input_like(GdisModel *model,
+                                const gchar *contents,
+                                GdisModelFormat format,
+                                GError **error)
+{
+  typedef enum
+  {
+    GDIS_GULP_COORD_NONE = 0,
+    GDIS_GULP_COORD_CARTESIAN,
+    GDIS_GULP_COORD_FRACTIONAL,
+    GDIS_GULP_COORD_SURFACE_FRACTIONAL
+  } GdisGulpCoordMode;
+
+  gchar **lines;
+  GdisGulpCoordMode coord_mode;
+  gint current_region;
+  gboolean seen_name;
+  gboolean have_cell_matrix;
+  gboolean have_surface_vectors;
+  gdouble cell_matrix[9];
+  gdouble cell_inverse[9];
+  gdouble surface_a[3];
+  gdouble surface_b[3];
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  coord_mode = GDIS_GULP_COORD_NONE;
+  current_region = -1;
+  seen_name = FALSE;
+  have_cell_matrix = FALSE;
+  have_surface_vectors = FALSE;
+  gdis_vec3_set(surface_a, 0.0, 0.0, 0.0);
+  gdis_vec3_set(surface_b, 0.0, 0.0, 0.0);
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *line;
+      gchar *trimmed;
+      g_auto(GStrv) tokens = NULL;
+      gint token_count = 0;
+      g_autofree gchar *first_lower = NULL;
+
+      line = lines[i];
+      g_strchomp(line);
+      trimmed = g_strstrip(line);
+      if (trimmed[0] == '\0' || trimmed[0] == '#')
+        continue;
+
+      tokens = gdis_split_simple(trimmed, &token_count);
+      if (token_count <= 0)
+        continue;
+
+      first_lower = g_ascii_strdown(tokens[0], -1);
+
+      if (g_str_equal(first_lower, "name"))
+        {
+          const gchar *name_text;
+
+          if (seen_name && model->atoms->len > 0u)
+            break;
+
+          seen_name = TRUE;
+          name_text = trimmed + strlen(tokens[0]);
+          while (*name_text && g_ascii_isspace(*name_text))
+            name_text++;
+          if (*name_text)
+            {
+              g_clear_pointer(&model->title, g_free);
+              model->title = g_strdup(name_text);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "title"))
+        {
+          const gchar *title_text;
+
+          title_text = trimmed + strlen(tokens[0]);
+          while (*title_text && g_ascii_isspace(*title_text))
+            title_text++;
+
+          if (*title_text)
+            {
+              g_clear_pointer(&model->title, g_free);
+              model->title = g_strdup(title_text);
+            }
+          else
+            {
+              guint j;
+
+              for (j = i + 1; lines[j] != NULL; j++)
+                {
+                  gchar *title_line;
+                  gchar *title_trimmed;
+
+                  title_line = lines[j];
+                  g_strchomp(title_line);
+                  title_trimmed = g_strstrip(title_line);
+                  if (title_trimmed[0] == '\0')
+                    continue;
+                  if (g_ascii_strcasecmp(title_trimmed, "end") == 0)
+                    break;
+
+                  g_clear_pointer(&model->title, g_free);
+                  model->title = g_strdup(title_trimmed);
+                  break;
+                }
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "space"))
+        {
+          if (token_count > 1)
+            {
+              const gchar *space_text;
+
+              space_text = trimmed + strlen(tokens[0]);
+              while (*space_text && g_ascii_isspace(*space_text))
+                space_text++;
+              if (*space_text)
+                {
+                  g_clear_pointer(&model->space_group, g_free);
+                  model->space_group = g_strdup(space_text);
+                }
+            }
+          else if (lines[i + 1] != NULL)
+            {
+              gchar *space_line;
+              gchar *space_trimmed;
+
+              space_line = lines[i + 1];
+              g_strchomp(space_line);
+              space_trimmed = g_strstrip(space_line);
+              if (space_trimmed[0] != '\0')
+                {
+                  g_clear_pointer(&model->space_group, g_free);
+                  model->space_group = g_strdup(space_trimmed);
+                }
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "cell") || g_str_equal(first_lower, "scell"))
+        {
+          gdouble values[6] = {0.0, 0.0, 0.0, 90.0, 90.0, 90.0};
+          const gboolean is_surface_cell = g_str_equal(first_lower, "scell");
+          const guint required = is_surface_cell ? 3u : 6u;
+          guint found;
+          guint line_index;
+
+          found = gdis_collect_doubles_from_line(trimmed, values, required);
+          line_index = i;
+          while (found < required && lines[line_index + 1] != NULL)
+            {
+              guint added;
+              gchar *next_line;
+              gchar *next_trimmed;
+
+              line_index++;
+              next_line = lines[line_index];
+              g_strchomp(next_line);
+              next_trimmed = g_strstrip(next_line);
+              if (next_trimmed[0] == '\0' || next_trimmed[0] == '#')
+                continue;
+
+              added = gdis_collect_doubles_from_line(next_trimmed,
+                                                     values + found,
+                                                     required - found);
+              if (added == 0u)
+                {
+                  line_index--;
+                  break;
+                }
+              found += added;
+            }
+          i = line_index;
+
+          if (found >= required)
+            {
+              if (is_surface_cell)
+                {
+                  model->cell_lengths[0] = values[0];
+                  model->cell_lengths[1] = values[1];
+                  model->cell_lengths[2] = 1.0;
+                  model->cell_angles[0] = 90.0;
+                  model->cell_angles[1] = 90.0;
+                  model->cell_angles[2] = values[2];
+                  model->periodic = TRUE;
+                  model->periodicity = 2u;
+                }
+              else
+                {
+                  if (values[2] <= 1.0e-8)
+                    {
+                      model->cell_lengths[0] = values[0];
+                      model->cell_lengths[1] = values[1];
+                      model->cell_lengths[2] = 1.0;
+                      model->cell_angles[0] = 90.0;
+                      model->cell_angles[1] = 90.0;
+                      model->cell_angles[2] = values[5];
+                      model->periodic = TRUE;
+                      model->periodicity = 2u;
+                    }
+                  else
+                    {
+                      memcpy(model->cell_lengths, values, 3u * sizeof(gdouble));
+                      memcpy(model->cell_angles, values + 3, 3u * sizeof(gdouble));
+                      model->periodic = TRUE;
+                      model->periodicity = 3u;
+                    }
+                }
+
+              if (g_str_equal(first_lower, "scell"))
+                {
+                  model->periodic = TRUE;
+                  model->periodicity = 2u;
+                }
+              else if (values[2] > 1.0e-8)
+                {
+                  model->periodic = TRUE;
+                  model->periodicity = 3u;
+                }
+
+              have_cell_matrix = gdis_model_build_cell_matrix(model,
+                                                              cell_matrix,
+                                                              cell_inverse);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "vectors"))
+        {
+          gdouble a_vec[3];
+          gdouble b_vec[3];
+          gdouble c_vec[3];
+          gboolean have_vectors;
+          guint parsed = 0u;
+
+          have_vectors = TRUE;
+          for (guint j = 0; j < 3u; j++)
+            {
+              gdouble *target;
+              gdouble values[3];
+
+              if (lines[i + 1] == NULL)
+                {
+                  have_vectors = FALSE;
+                  break;
+                }
+
+              i++;
+              target = (j == 0u) ? a_vec : (j == 1u) ? b_vec : c_vec;
+              parsed = gdis_collect_doubles_from_line(lines[i], values, 3u);
+              if (parsed < 3u)
+                {
+                  have_vectors = FALSE;
+                  break;
+                }
+              target[0] = values[0];
+              target[1] = values[1];
+              target[2] = values[2];
+            }
+
+          if (have_vectors &&
+              gdis_surface_build_cell_from_vectors(a_vec,
+                                                   b_vec,
+                                                   c_vec,
+                                                   model->cell_lengths,
+                                                   model->cell_angles))
+            {
+              model->periodic = TRUE;
+              model->periodicity = 3u;
+              have_cell_matrix = gdis_model_build_cell_matrix(model,
+                                                              cell_matrix,
+                                                              cell_inverse);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "svectors"))
+        {
+          gdouble values[3];
+          gdouble c_vec[3];
+
+          if (lines[i + 1] != NULL && lines[i + 2] != NULL)
+            {
+              guint first_count;
+              guint second_count;
+
+              i++;
+              first_count = gdis_collect_doubles_from_line(lines[i], values, 3u);
+              if (first_count >= 2u)
+                {
+                  surface_a[0] = values[0];
+                  surface_a[1] = values[1];
+                  surface_a[2] = (first_count >= 3u) ? values[2] : 0.0;
+                }
+
+              i++;
+              second_count = gdis_collect_doubles_from_line(lines[i], values, 3u);
+              if (second_count >= 2u)
+                {
+                  surface_b[0] = values[0];
+                  surface_b[1] = values[1];
+                  surface_b[2] = (second_count >= 3u) ? values[2] : 0.0;
+                }
+
+              if (first_count >= 2u && second_count >= 2u)
+                {
+                  have_surface_vectors = TRUE;
+                  c_vec[0] = 0.0;
+                  c_vec[1] = 0.0;
+                  c_vec[2] = 1.0;
+                  if (gdis_surface_build_cell_from_vectors(surface_a,
+                                                           surface_b,
+                                                           c_vec,
+                                                           model->cell_lengths,
+                                                           model->cell_angles))
+                    {
+                      model->periodic = TRUE;
+                      model->periodicity = 2u;
+                      have_cell_matrix = gdis_model_build_cell_matrix(model,
+                                                                      cell_matrix,
+                                                                      cell_inverse);
+                    }
+                }
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "region"))
+        {
+          guint parsed_region;
+
+          if (token_count > 1 && gdis_try_parse_uint(tokens[1], &parsed_region))
+            current_region = (gint) parsed_region;
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "cartesian") || g_str_equal(first_lower, "cart"))
+        {
+          coord_mode = GDIS_GULP_COORD_CARTESIAN;
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "fractional") || g_str_equal(first_lower, "frac"))
+        {
+          coord_mode = GDIS_GULP_COORD_FRACTIONAL;
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "sfractional") || g_str_equal(first_lower, "sfrac"))
+        {
+          coord_mode = GDIS_GULP_COORD_SURFACE_FRACTIONAL;
+          for (gint j = 1; j + 1 < token_count; j++)
+            {
+              g_autofree gchar *keyword = g_ascii_strdown(tokens[j], -1);
+              guint parsed_region;
+
+              if (!g_str_equal(keyword, "region"))
+                continue;
+              if (gdis_try_parse_uint(tokens[j + 1], &parsed_region))
+                current_region = (gint) parsed_region;
+            }
+          continue;
+        }
+
+      if (coord_mode != GDIS_GULP_COORD_NONE && token_count >= 4)
+        {
+          g_autofree gchar *type = NULL;
+          gdouble values[3];
+          gdouble cart[3];
+          gboolean is_core = FALSE;
+          gboolean is_shell = FALSE;
+          gboolean has_explicit_type = FALSE;
+          gboolean exact_coords = FALSE;
+          gint coord_start = 1;
+          g_autofree gchar *element = NULL;
+          gint region;
+
+          if (g_str_equal(first_lower, "library") ||
+              g_str_equal(first_lower, "species") ||
+              g_str_equal(first_lower, "print") ||
+              g_str_equal(first_lower, "output") ||
+              g_str_equal(first_lower, "switch") ||
+              g_str_equal(first_lower, "maxcyc") ||
+              g_str_equal(first_lower, "title") ||
+              g_str_equal(first_lower, "name") ||
+              g_str_equal(first_lower, "harm") ||
+              g_str_equal(first_lower, "harmonic") ||
+              g_str_equal(first_lower, "three") ||
+              g_str_equal(first_lower, "torsion") ||
+              g_str_equal(first_lower, "morse") ||
+              g_str_equal(first_lower, "buck") ||
+              g_str_equal(first_lower, "spring"))
+            {
+              coord_mode = GDIS_GULP_COORD_NONE;
+              continue;
+            }
+
+          if (token_count >= 5)
+            {
+              type = g_ascii_strdown(tokens[1], -1);
+              is_core = g_str_equal(type, "core") ||
+                        g_str_equal(tokens[1], "c") ||
+                        g_str_has_prefix(type, "bcor");
+              is_shell = g_str_has_prefix(type, "shel") ||
+                         g_str_equal(tokens[1], "s") ||
+                         g_str_has_prefix(type, "bshe");
+              has_explicit_type = is_core || is_shell;
+              if (has_explicit_type)
+                coord_start = 2;
+            }
+
+          if (is_shell)
+            continue;
+
+          if (coord_start + 2 < token_count &&
+              gdis_try_parse_double_relaxed(tokens[coord_start], &values[0]) &&
+              gdis_try_parse_double_relaxed(tokens[coord_start + 1], &values[1]) &&
+              gdis_try_parse_double_relaxed(tokens[coord_start + 2], &values[2]))
+            {
+              exact_coords = TRUE;
+            }
+          else if (!has_explicit_type &&
+                   token_count >= 4 &&
+                   gdis_try_parse_double_relaxed(tokens[1], &values[0]) &&
+                   gdis_try_parse_double_relaxed(tokens[2], &values[1]) &&
+                   gdis_try_parse_double_relaxed(tokens[3], &values[2]))
+            {
+              coord_start = 1;
+              exact_coords = TRUE;
+            }
+
+          if (!exact_coords)
+            continue;
+
+          if (coord_mode == GDIS_GULP_COORD_CARTESIAN)
+            {
+              cart[0] = values[0];
+              cart[1] = values[1];
+              cart[2] = values[2];
+            }
+          else if (coord_mode == GDIS_GULP_COORD_FRACTIONAL)
+            {
+              if (!have_cell_matrix)
+                continue;
+              gdis_frac_to_cart(cell_matrix, values, cart);
+            }
+          else
+            {
+              if (have_surface_vectors)
+                {
+                  cart[0] = surface_a[0] * values[0] + surface_b[0] * values[1];
+                  cart[1] = surface_a[1] * values[0] + surface_b[1] * values[1];
+                  cart[2] = surface_a[2] * values[0] + surface_b[2] * values[1] + values[2];
+                }
+              else if (have_cell_matrix)
+                {
+                  cart[0] = cell_matrix[0] * values[0] + cell_matrix[1] * values[1];
+                  cart[1] = cell_matrix[3] * values[0] + cell_matrix[4] * values[1];
+                  cart[2] = values[2];
+                }
+              else
+                {
+                  continue;
+                }
+            }
+
+          element = gdis_normalize_element_symbol(tokens[0]);
+          region = (coord_mode == GDIS_GULP_COORD_SURFACE_FRACTIONAL) ? current_region : -1;
+          g_ptr_array_add(model->atoms,
+                          gdis_atom_new(tokens[0],
+                                        element,
+                                        element,
+                                        cart[0],
+                                        cart[1],
+                                        cart[2],
+                                        1.0,
+                                        region,
+                                        model->atoms->len + 1u));
+        }
+    }
+
+  g_strfreev(lines);
+
+  if (model->atoms->len == 0u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No atoms were parsed from %s '%s'.",
+                  gdis_model_format_label(format),
+                  model->path);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **error)
+{
+  typedef enum
+  {
+    GDIS_GULP_BLOCK_NONE = 0,
+    GDIS_GULP_BLOCK_CART,
+    GDIS_GULP_BLOCK_FRACTIONAL,
+    GDIS_GULP_BLOCK_SURFACE_MIXED
+  } GdisGulpBlockMode;
+
+  gchar **lines;
+  GPtrArray *best_atoms;
+  gboolean best_periodic;
+  guint best_periodicity;
+  gdouble best_lengths[3];
+  gdouble best_angles[3];
+
+  gboolean context_periodic;
+  guint context_periodicity;
+  gdouble context_lengths[3];
+  gdouble context_angles[3];
+  gboolean context_have_surface_vectors;
+  gdouble context_surface_a[3];
+  gdouble context_surface_b[3];
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  best_atoms = NULL;
+  best_periodic = FALSE;
+  best_periodicity = 0u;
+  best_lengths[0] = best_lengths[1] = best_lengths[2] = 0.0;
+  best_angles[0] = best_angles[1] = best_angles[2] = 90.0;
+
+  context_periodic = FALSE;
+  context_periodicity = 0u;
+  context_lengths[0] = context_lengths[1] = context_lengths[2] = 0.0;
+  context_angles[0] = context_angles[1] = context_angles[2] = 90.0;
+  context_have_surface_vectors = FALSE;
+  gdis_vec3_set(context_surface_a, 0.0, 0.0, 0.0);
+  gdis_vec3_set(context_surface_b, 0.0, 0.0, 0.0);
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *line;
+      gchar *trimmed;
+      g_autofree gchar *lower = NULL;
+      GdisGulpBlockMode mode;
+
+      line = lines[i];
+      g_strchomp(line);
+      trimmed = g_strstrip(line);
+      if (trimmed[0] == '\0')
+        continue;
+
+      lower = g_ascii_strdown(trimmed, -1);
+
+      if (g_strstr_len(lower, -1, "cartesian lattice vectors (angstroms)") != NULL)
+        {
+          gdouble a_vec[3];
+          gdouble b_vec[3];
+          gdouble c_vec[3];
+          gdouble values[3];
+          guint scan_index;
+          guint parsed_vectors;
+          guint count_a;
+          guint count_b;
+          guint count_c;
+
+          count_a = 0u;
+          count_b = 0u;
+          count_c = 0u;
+          scan_index = i + 1u;
+          parsed_vectors = 0u;
+          while (lines[scan_index] != NULL && parsed_vectors < 3u)
+            {
+              gchar *vector_line;
+              guint count;
+
+              vector_line = g_strstrip(lines[scan_index]);
+              if (vector_line[0] == '\0')
+                {
+                  scan_index++;
+                  continue;
+                }
+
+              count = gdis_collect_doubles_from_line(vector_line, values, 3u);
+              if (count < 3u)
+                break;
+
+              if (parsed_vectors == 0u)
+                {
+                  a_vec[0] = values[0];
+                  a_vec[1] = values[1];
+                  a_vec[2] = values[2];
+                  count_a = count;
+                }
+              else if (parsed_vectors == 1u)
+                {
+                  b_vec[0] = values[0];
+                  b_vec[1] = values[1];
+                  b_vec[2] = values[2];
+                  count_b = count;
+                }
+              else
+                {
+                  c_vec[0] = values[0];
+                  c_vec[1] = values[1];
+                  c_vec[2] = values[2];
+                  count_c = count;
+                }
+
+              parsed_vectors++;
+              scan_index++;
+            }
+
+          if (count_a >= 3u &&
+              count_b >= 3u &&
+              count_c >= 3u &&
+              gdis_surface_build_cell_from_vectors(a_vec,
+                                                   b_vec,
+                                                   c_vec,
+                                                   context_lengths,
+                                                   context_angles))
+            {
+              context_periodic = TRUE;
+              context_periodicity = 3u;
+            }
+
+          if (scan_index > i + 1u)
+            i = scan_index - 1u;
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "surface cartesian vectors (angstroms)") != NULL)
+        {
+          gdouble values[3];
+          guint scan_index;
+          guint parsed_vectors;
+          guint count_a;
+          guint count_b;
+          gdouble c_vec[3];
+
+          count_a = 0u;
+          count_b = 0u;
+          scan_index = i + 1u;
+          parsed_vectors = 0u;
+          while (lines[scan_index] != NULL && parsed_vectors < 2u)
+            {
+              gchar *vector_line;
+              guint count;
+
+              vector_line = g_strstrip(lines[scan_index]);
+              if (vector_line[0] == '\0')
+                {
+                  scan_index++;
+                  continue;
+                }
+
+              count = gdis_collect_doubles_from_line(vector_line, values, 3u);
+              if (count < 2u)
+                break;
+
+              if (parsed_vectors == 0u)
+                {
+                  context_surface_a[0] = values[0];
+                  context_surface_a[1] = values[1];
+                  context_surface_a[2] = (count >= 3u) ? values[2] : 0.0;
+                  count_a = count;
+                }
+              else
+                {
+                  context_surface_b[0] = values[0];
+                  context_surface_b[1] = values[1];
+                  context_surface_b[2] = (count >= 3u) ? values[2] : 0.0;
+                  count_b = count;
+                }
+
+              parsed_vectors++;
+              scan_index++;
+            }
+
+          if (count_a >= 2u && count_b >= 2u)
+            {
+              context_have_surface_vectors = TRUE;
+              c_vec[0] = 0.0;
+              c_vec[1] = 0.0;
+              c_vec[2] = 1.0;
+              if (gdis_surface_build_cell_from_vectors(context_surface_a,
+                                                       context_surface_b,
+                                                       c_vec,
+                                                       context_lengths,
+                                                       context_angles))
+                {
+                  context_periodic = TRUE;
+                  context_periodicity = 2u;
+                }
+            }
+
+          if (scan_index > i + 1u)
+            i = scan_index - 1u;
+          continue;
+        }
+
+      mode = GDIS_GULP_BLOCK_NONE;
+      if (g_strstr_len(lower, -1, "fractional coordinates of asymmetric unit") != NULL ||
+          g_strstr_len(lower, -1, "final asymmetric unit coordinates") != NULL)
+        mode = GDIS_GULP_BLOCK_FRACTIONAL;
+      else if (g_strstr_len(lower, -1, "mixed fractional/cartesian coordinates of surface") != NULL)
+        mode = GDIS_GULP_BLOCK_SURFACE_MIXED;
+      else if (g_strstr_len(lower, -1, "cartesian coordinates of cluster") != NULL ||
+               g_strstr_len(lower, -1, "final cartesian coordinates of atoms") != NULL)
+        mode = GDIS_GULP_BLOCK_CART;
+
+      if (mode != GDIS_GULP_BLOCK_NONE)
+        {
+          GPtrArray *block_atoms;
+          gboolean block_periodic;
+          guint block_periodicity;
+          gdouble block_lengths[3];
+          gdouble block_angles[3];
+          gboolean block_have_surface_vectors;
+          gdouble block_surface_a[3];
+          gdouble block_surface_b[3];
+          gboolean block_have_cell_matrix;
+          gdouble block_matrix[9];
+          gdouble block_inverse[9];
+          gint block_region;
+          gboolean block_had_rows;
+          GdisModel block_reference = {0};
+
+          block_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+          block_periodic = context_periodic;
+          block_periodicity = context_periodicity;
+          memcpy(block_lengths, context_lengths, sizeof(block_lengths));
+          memcpy(block_angles, context_angles, sizeof(block_angles));
+          block_have_surface_vectors = context_have_surface_vectors;
+          gdis_vec3_copy(block_surface_a, context_surface_a);
+          gdis_vec3_copy(block_surface_b, context_surface_b);
+          if (mode == GDIS_GULP_BLOCK_SURFACE_MIXED && block_periodicity == 0u)
+            {
+              block_periodic = TRUE;
+              block_periodicity = 2u;
+            }
+
+          block_reference.periodic = block_periodic;
+          block_reference.periodicity = block_periodicity;
+          memcpy(block_reference.cell_lengths, block_lengths, sizeof(block_lengths));
+          memcpy(block_reference.cell_angles, block_angles, sizeof(block_angles));
+          block_have_cell_matrix = gdis_model_build_cell_matrix(&block_reference,
+                                                                block_matrix,
+                                                                block_inverse);
+          block_region = -1;
+          block_had_rows = FALSE;
+
+          for (i = i + 1; lines[i] != NULL; i++)
+            {
+              gchar *block_line;
+              gchar *block_trimmed;
+              g_autofree gchar *block_lower = NULL;
+              g_auto(GStrv) tokens = NULL;
+              gint token_count = 0;
+              guint serial = 0u;
+              gdouble values[3];
+              gdouble cart[3];
+              g_autofree gchar *element = NULL;
+              g_autofree gchar *type = NULL;
+
+              block_line = lines[i];
+              g_strchomp(block_line);
+              block_trimmed = g_strstrip(block_line);
+              if (block_trimmed[0] == '\0')
+                {
+                  if (block_had_rows)
+                    break;
+                  continue;
+                }
+
+              block_lower = g_ascii_strdown(block_trimmed, -1);
+              if (g_strstr_len(block_lower, -1, "coordinates of") != NULL && block_had_rows)
+                {
+                  i--;
+                  break;
+                }
+
+              if (g_str_has_prefix(block_lower, "region"))
+                {
+                  gdouble region_value[1];
+                  if (gdis_collect_doubles_from_line(block_trimmed, region_value, 1u) >= 1u)
+                    block_region = (gint) llround(region_value[0]);
+                  continue;
+                }
+
+              if (g_str_has_prefix(block_trimmed, "-") || g_str_has_prefix(block_trimmed, "*"))
+                continue;
+
+              tokens = gdis_split_simple(block_trimmed, &token_count);
+              if (token_count < 4)
+                {
+                  if (block_had_rows)
+                    {
+                      i--;
+                      break;
+                    }
+                  continue;
+                }
+
+              if (!gdis_try_parse_uint(tokens[0], &serial))
+                {
+                  if (block_had_rows)
+                    {
+                      i--;
+                      break;
+                    }
+                  continue;
+                }
+
+              if (!gdis_collect_three_doubles_from_tokens(tokens, token_count, 3, values) &&
+                  !gdis_collect_three_doubles_from_tokens(tokens, token_count, 2, values))
+                continue;
+
+              type = (token_count > 2) ? g_ascii_strdown(tokens[2], -1) : g_strdup("c");
+              if (g_str_has_prefix(type, "shel") || g_str_equal(type, "s"))
+                {
+                  block_had_rows = TRUE;
+                  continue;
+                }
+
+              if (mode == GDIS_GULP_BLOCK_CART)
+                {
+                  cart[0] = values[0];
+                  cart[1] = values[1];
+                  cart[2] = values[2];
+                }
+              else if (mode == GDIS_GULP_BLOCK_FRACTIONAL)
+                {
+                  if (!block_have_cell_matrix)
+                    continue;
+                  gdis_frac_to_cart(block_matrix, values, cart);
+                }
+              else
+                {
+                  if (block_have_surface_vectors)
+                    {
+                      cart[0] = block_surface_a[0] * values[0] + block_surface_b[0] * values[1];
+                      cart[1] = block_surface_a[1] * values[0] + block_surface_b[1] * values[1];
+                      cart[2] = block_surface_a[2] * values[0] +
+                                block_surface_b[2] * values[1] +
+                                values[2];
+                    }
+                  else if (block_have_cell_matrix)
+                    {
+                      cart[0] = block_matrix[0] * values[0] + block_matrix[1] * values[1];
+                      cart[1] = block_matrix[3] * values[0] + block_matrix[4] * values[1];
+                      cart[2] = values[2];
+                    }
+                  else
+                    {
+                      cart[0] = values[0];
+                      cart[1] = values[1];
+                      cart[2] = values[2];
+                    }
+                }
+
+              element = gdis_normalize_element_symbol(tokens[1]);
+              g_ptr_array_add(block_atoms,
+                              gdis_atom_new(tokens[1],
+                                            element,
+                                            element,
+                                            cart[0],
+                                            cart[1],
+                                            cart[2],
+                                            1.0,
+                                            (mode == GDIS_GULP_BLOCK_SURFACE_MIXED)
+                                              ? block_region
+                                              : -1,
+                                            serial));
+              block_had_rows = TRUE;
+            }
+
+          if (block_atoms->len > 0u)
+            {
+              if (best_atoms)
+                g_ptr_array_free(best_atoms, TRUE);
+              best_atoms = block_atoms;
+              best_periodic = block_periodic;
+              best_periodicity = block_periodicity;
+              memcpy(best_lengths, block_lengths, sizeof(best_lengths));
+              memcpy(best_angles, block_angles, sizeof(best_angles));
+            }
+          else
+            {
+              g_ptr_array_free(block_atoms, TRUE);
+            }
+
+          continue;
+        }
+    }
+
+  g_strfreev(lines);
+
+  if (!best_atoms)
+    {
+      GPtrArray *fallback_atoms;
+      GdisModel fallback_reference = {0};
+      gboolean fallback_have_matrix;
+      gdouble fallback_matrix[9];
+      gdouble fallback_inverse[9];
+      gchar **fallback_lines;
+
+      fallback_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+      fallback_reference.periodic = context_periodic;
+      fallback_reference.periodicity = context_periodicity;
+      memcpy(fallback_reference.cell_lengths, context_lengths, sizeof(context_lengths));
+      memcpy(fallback_reference.cell_angles, context_angles, sizeof(context_angles));
+      fallback_have_matrix = gdis_model_build_cell_matrix(&fallback_reference,
+                                                          fallback_matrix,
+                                                          fallback_inverse);
+
+      fallback_lines = g_strsplit(contents, "\n", -1);
+      for (guint i = 0; fallback_lines[i] != NULL; i++)
+        {
+          g_auto(GStrv) tokens = NULL;
+          gint token_count = 0;
+          guint serial;
+          gdouble values[3];
+          gdouble cart[3];
+          g_autofree gchar *type = NULL;
+          g_autofree gchar *element = NULL;
+          gboolean looks_fractional;
+
+          tokens = gdis_split_simple(fallback_lines[i], &token_count);
+          if (token_count < 5)
+            continue;
+          if (!gdis_try_parse_uint(tokens[0], &serial))
+            continue;
+
+          type = (token_count > 2) ? g_ascii_strdown(tokens[2], -1) : g_strdup("c");
+          if (g_str_has_prefix(type, "shel") || g_str_equal(type, "s"))
+            continue;
+
+          if (!gdis_collect_three_doubles_from_tokens(tokens, token_count, 3, values) &&
+              !gdis_collect_three_doubles_from_tokens(tokens, token_count, 2, values))
+            continue;
+
+          looks_fractional = fabs(values[0]) <= 1.5 && fabs(values[1]) <= 1.5 && fabs(values[2]) <= 1.5;
+          if (fallback_have_matrix && looks_fractional)
+            gdis_frac_to_cart(fallback_matrix, values, cart);
+          else
+            {
+              cart[0] = values[0];
+              cart[1] = values[1];
+              cart[2] = values[2];
+            }
+
+          element = gdis_normalize_element_symbol(tokens[1]);
+          g_ptr_array_add(fallback_atoms,
+                          gdis_atom_new(tokens[1],
+                                        element,
+                                        element,
+                                        cart[0],
+                                        cart[1],
+                                        cart[2],
+                                        1.0,
+                                        -1,
+                                        serial));
+        }
+      g_strfreev(fallback_lines);
+
+      if (fallback_atoms->len > 0u)
+        {
+          best_atoms = fallback_atoms;
+          best_periodic = context_periodic;
+          best_periodicity = context_periodicity;
+          memcpy(best_lengths, context_lengths, sizeof(best_lengths));
+          memcpy(best_angles, context_angles, sizeof(best_angles));
+        }
+      else
+        {
+          g_ptr_array_free(fallback_atoms, TRUE);
+        }
+    }
+
+  if (!best_atoms || best_atoms->len == 0u)
+    {
+      if (best_atoms)
+        g_ptr_array_free(best_atoms, TRUE);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No atom coordinate table could be parsed from GULP output '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  if (model->atoms)
+    g_ptr_array_free(model->atoms, TRUE);
+  model->atoms = best_atoms;
+  model->periodic = best_periodic;
+  model->periodicity = best_periodicity;
+  memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
+  memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+
+  return TRUE;
+}
+
+static gboolean
+gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
+{
+  gchar **lines;
+  gboolean in_atoms;
+  gboolean have_cell_matrix;
+  gdouble cell_matrix[9];
+  gdouble cell_inverse[9];
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  in_atoms = FALSE;
+  have_cell_matrix = FALSE;
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *line;
+      gchar *trimmed;
+      g_auto(GStrv) tokens = NULL;
+      gint token_count = 0;
+      g_autofree gchar *first_lower = NULL;
+
+      line = lines[i];
+      g_strchomp(line);
+      trimmed = g_strstrip(line);
+      if (trimmed[0] == '\0')
+        continue;
+
+      tokens = gdis_split_simple(trimmed, &token_count);
+      if (token_count == 0)
+        continue;
+
+      first_lower = g_ascii_strdown(tokens[0], -1);
+
+      if (g_str_equal(first_lower, "title"))
+        {
+          const gchar *title_text;
+
+          title_text = trimmed + strlen(tokens[0]);
+          while (*title_text && g_ascii_isspace(*title_text))
+            title_text++;
+          if (*title_text)
+            {
+              g_clear_pointer(&model->title, g_free);
+              model->title = g_strdup(title_text);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "cell"))
+        {
+          gdouble values[6] = {0.0, 0.0, 0.0, 90.0, 90.0, 90.0};
+          guint found;
+          guint line_index;
+
+          found = gdis_collect_doubles_from_line(trimmed, values, 6u);
+          line_index = i;
+          while (found < 6u && lines[line_index + 1] != NULL)
+            {
+              guint added;
+
+              line_index++;
+              added = gdis_collect_doubles_from_line(lines[line_index],
+                                                     values + found,
+                                                     6u - found);
+              if (added == 0u)
+                {
+                  line_index--;
+                  break;
+                }
+              found += added;
+            }
+          i = line_index;
+
+          if (found >= 6u)
+            {
+              memcpy(model->cell_lengths, values, 3u * sizeof(gdouble));
+              memcpy(model->cell_angles, values + 3, 3u * sizeof(gdouble));
+              model->periodic = TRUE;
+              model->periodicity = 3u;
+              have_cell_matrix = gdis_model_build_cell_matrix(model,
+                                                              cell_matrix,
+                                                              cell_inverse);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "symmetry"))
+        {
+          for (gint j = 1; j + 1 < token_count; j++)
+            {
+              g_autofree gchar *keyword = g_ascii_strdown(tokens[j], -1);
+              if (g_str_equal(keyword, "label"))
+                {
+                  GString *space_group;
+
+                  space_group = g_string_new(tokens[j + 1]);
+                  for (gint k = j + 2; k < token_count; k++)
+                    {
+                      g_string_append_c(space_group, ' ');
+                      g_string_append(space_group, tokens[k]);
+                    }
+                  g_clear_pointer(&model->space_group, g_free);
+                  model->space_group = g_string_free(space_group, FALSE);
+                  break;
+                }
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "atoms"))
+        {
+          in_atoms = TRUE;
+          continue;
+        }
+
+      if (in_atoms)
+        {
+          gdouble frac_or_cart[3];
+          gdouble cart[3];
+          gdouble occupancy;
+          g_autofree gchar *element = NULL;
+
+          if (g_str_equal(first_lower, "eof"))
+            break;
+
+          if (token_count < 4)
+            continue;
+
+          if (!gdis_collect_three_doubles_from_tokens(tokens, token_count, 1, frac_or_cart))
+            continue;
+
+          if (have_cell_matrix)
+            gdis_frac_to_cart(cell_matrix, frac_or_cart, cart);
+          else
+            {
+              cart[0] = frac_or_cart[0];
+              cart[1] = frac_or_cart[1];
+              cart[2] = frac_or_cart[2];
+            }
+
+          occupancy = 1.0;
+          if (token_count > 6)
+            {
+              gdouble parsed_occ;
+              if (gdis_try_parse_double_relaxed(tokens[6], &parsed_occ))
+                occupancy = parsed_occ;
+            }
+
+          element = gdis_normalize_element_symbol(tokens[0]);
+          g_ptr_array_add(model->atoms,
+                          gdis_atom_new(tokens[0],
+                                        element,
+                                        element,
+                                        cart[0],
+                                        cart[1],
+                                        cart[2],
+                                        occupancy,
+                                        -1,
+                                        model->atoms->len + 1u));
+        }
+    }
+
+  g_strfreev(lines);
+
+  if (model->atoms->len == 0u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No atoms were parsed from XTL '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+gdis_qe_unit_scale_from_header(const gchar *header,
+                               gdouble alat_bohr,
+                               gdouble *scale_out,
+                               gboolean *fractional_out)
+{
+  g_autofree gchar *lower = NULL;
+  gdouble scale = 1.0;
+  gboolean fractional = FALSE;
+  gdouble parsed[1];
+
+  g_return_val_if_fail(scale_out != NULL, FALSE);
+  g_return_val_if_fail(fractional_out != NULL, FALSE);
+
+  if (!header)
+    {
+      *scale_out = 1.0;
+      *fractional_out = FALSE;
+      return TRUE;
+    }
+
+  lower = g_ascii_strdown(header, -1);
+  fractional = (g_strstr_len(lower, -1, "crystal") != NULL);
+
+  if (fractional)
+    scale = 1.0;
+  else if (g_strstr_len(lower, -1, "angstrom") != NULL)
+    scale = 1.0;
+  else if (g_strstr_len(lower, -1, "bohr") != NULL)
+    scale = 0.529177210903;
+  else if (g_strstr_len(lower, -1, "alat") != NULL)
+    {
+      guint count;
+
+      count = gdis_collect_doubles_from_line(header, parsed, 1u);
+      if (count == 0u)
+        parsed[0] = alat_bohr;
+      if (parsed[0] <= 0.0)
+        return FALSE;
+      scale = parsed[0] * 0.529177210903;
+    }
+
+  *scale_out = scale;
+  *fractional_out = fractional;
+  return TRUE;
+}
+
+static gboolean
+gdis_model_load_qe_like(GdisModel *model, const gchar *contents, GError **error)
+{
+  gchar **lines;
+  gdouble alat_bohr;
+  gint qe_ibrav;
+  gdouble qe_celldm1;
+  gdouble qe_celldm3;
+  gboolean qe_have_celldm1;
+  gboolean qe_have_celldm3;
+  gboolean context_periodic;
+  guint context_periodicity;
+  gdouble context_lengths[3];
+  gdouble context_angles[3];
+  GPtrArray *best_atoms;
+  gboolean best_periodic;
+  guint best_periodicity;
+  gdouble best_lengths[3];
+  gdouble best_angles[3];
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  alat_bohr = 0.0;
+  qe_ibrav = 0;
+  qe_celldm1 = 0.0;
+  qe_celldm3 = 0.0;
+  qe_have_celldm1 = FALSE;
+  qe_have_celldm3 = FALSE;
+  context_periodic = FALSE;
+  context_periodicity = 0u;
+  context_lengths[0] = context_lengths[1] = context_lengths[2] = 0.0;
+  context_angles[0] = context_angles[1] = context_angles[2] = 90.0;
+  best_atoms = NULL;
+  best_periodic = FALSE;
+  best_periodicity = 0u;
+  best_lengths[0] = best_lengths[1] = best_lengths[2] = 0.0;
+  best_angles[0] = best_angles[1] = best_angles[2] = 90.0;
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *line;
+      gchar *trimmed;
+      g_autofree gchar *lower = NULL;
+
+      line = lines[i];
+      g_strchomp(line);
+      trimmed = g_strstrip(line);
+      if (trimmed[0] == '\0')
+        continue;
+
+      lower = g_ascii_strdown(trimmed, -1);
+
+      if (g_strstr_len(lower, -1, "lattice parameter (alat)") != NULL)
+        {
+          gdouble values[1];
+          if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u)
+            alat_bohr = values[0];
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "ibrav") != NULL && strchr(trimmed, '=') != NULL)
+        {
+          const gchar *eq;
+          gdouble parsed;
+
+          eq = strchr(trimmed, '=');
+          if (eq && gdis_try_parse_double_relaxed(eq + 1, &parsed))
+            qe_ibrav = (gint) llround(parsed);
+        }
+      if (g_strstr_len(lower, -1, "celldm(1)") != NULL && strchr(trimmed, '=') != NULL)
+        {
+          const gchar *eq;
+          gdouble parsed;
+
+          eq = strchr(trimmed, '=');
+          if (eq && gdis_try_parse_double_relaxed(eq + 1, &parsed))
+            {
+              qe_celldm1 = parsed;
+              qe_have_celldm1 = TRUE;
+            }
+        }
+      if (g_strstr_len(lower, -1, "celldm(3)") != NULL && strchr(trimmed, '=') != NULL)
+        {
+          const gchar *eq;
+          gdouble parsed;
+
+          eq = strchr(trimmed, '=');
+          if (eq && gdis_try_parse_double_relaxed(eq + 1, &parsed))
+            {
+              qe_celldm3 = parsed;
+              qe_have_celldm3 = TRUE;
+            }
+        }
+
+      if (!context_periodic && qe_ibrav == 4 && qe_have_celldm1 && qe_have_celldm3)
+        {
+          const gdouble a_ang = qe_celldm1 * 0.529177210903;
+          const gdouble c_ang = qe_celldm3 * a_ang;
+          if (a_ang > 0.0 && c_ang > 0.0)
+            {
+              context_periodic = TRUE;
+              context_periodicity = 3u;
+              context_lengths[0] = a_ang;
+              context_lengths[1] = a_ang;
+              context_lengths[2] = c_ang;
+              context_angles[0] = 90.0;
+              context_angles[1] = 90.0;
+              context_angles[2] = 120.0;
+            }
+        }
+
+      if (!model->title || model->title[0] == '\0')
+        {
+          if (g_str_has_prefix(lower, "prefix"))
+            {
+              const gchar *eq;
+
+              eq = strchr(trimmed, '=');
+              if (eq)
+                {
+                  g_autofree gchar *prefix = g_strdup(eq + 1);
+                  g_strstrip(prefix);
+                  if (prefix[0] == '\'' || prefix[0] == '"')
+                    memmove(prefix, prefix + 1, strlen(prefix));
+                  g_strchomp(prefix);
+                  g_strstrip(prefix);
+                  while (prefix[0] != '\0')
+                    {
+                      gsize len;
+
+                      len = strlen(prefix);
+                      if (prefix[len - 1] == ',' ||
+                          prefix[len - 1] == '\'' ||
+                          prefix[len - 1] == '"')
+                        {
+                          prefix[len - 1] = '\0';
+                          g_strstrip(prefix);
+                          continue;
+                        }
+                      break;
+                    }
+                  if (prefix[0] != '\0')
+                    {
+                      g_clear_pointer(&model->title, g_free);
+                      model->title = g_strdup(prefix);
+                    }
+                }
+            }
+        }
+
+      if (g_str_has_prefix(lower, "cell_parameters"))
+        {
+          gdouble unit_scale;
+          gboolean fractional_units;
+          gdouble a_vec[3];
+          gdouble b_vec[3];
+          gdouble c_vec[3];
+          gdouble values[3];
+          guint count_a;
+          guint count_b;
+          guint count_c;
+
+          if (!gdis_qe_unit_scale_from_header(trimmed,
+                                              alat_bohr,
+                                              &unit_scale,
+                                              &fractional_units))
+            continue;
+          (void) fractional_units;
+
+          if (lines[i + 1] == NULL || lines[i + 2] == NULL || lines[i + 3] == NULL)
+            continue;
+
+          count_a = gdis_collect_doubles_from_line(lines[i + 1], values, 3u);
+          if (count_a >= 3u)
+            {
+              a_vec[0] = values[0] * unit_scale;
+              a_vec[1] = values[1] * unit_scale;
+              a_vec[2] = values[2] * unit_scale;
+            }
+
+          count_b = gdis_collect_doubles_from_line(lines[i + 2], values, 3u);
+          if (count_b >= 3u)
+            {
+              b_vec[0] = values[0] * unit_scale;
+              b_vec[1] = values[1] * unit_scale;
+              b_vec[2] = values[2] * unit_scale;
+            }
+
+          count_c = gdis_collect_doubles_from_line(lines[i + 3], values, 3u);
+          if (count_c >= 3u)
+            {
+              c_vec[0] = values[0] * unit_scale;
+              c_vec[1] = values[1] * unit_scale;
+              c_vec[2] = values[2] * unit_scale;
+            }
+
+          if (count_a >= 3u &&
+              count_b >= 3u &&
+              count_c >= 3u &&
+              gdis_surface_build_cell_from_vectors(a_vec,
+                                                   b_vec,
+                                                   c_vec,
+                                                   context_lengths,
+                                                   context_angles))
+            {
+              context_periodic = TRUE;
+              context_periodicity = 3u;
+            }
+
+          i += 3u;
+          continue;
+        }
+
+      if (g_str_has_prefix(lower, "atomic_positions"))
+        {
+          GPtrArray *block_atoms;
+          gboolean block_periodic;
+          guint block_periodicity;
+          gdouble block_lengths[3];
+          gdouble block_angles[3];
+          gdouble unit_scale;
+          gboolean fractional_units;
+          GdisModel block_reference = {0};
+          gboolean block_have_matrix;
+          gdouble block_matrix[9];
+          gdouble block_inverse[9];
+
+          if (!gdis_qe_unit_scale_from_header(trimmed,
+                                              alat_bohr,
+                                              &unit_scale,
+                                              &fractional_units))
+            continue;
+
+          block_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+          block_periodic = context_periodic;
+          block_periodicity = context_periodicity;
+          memcpy(block_lengths, context_lengths, sizeof(block_lengths));
+          memcpy(block_angles, context_angles, sizeof(block_angles));
+
+          block_reference.periodic = block_periodic;
+          block_reference.periodicity = block_periodicity;
+          memcpy(block_reference.cell_lengths, block_lengths, sizeof(block_lengths));
+          memcpy(block_reference.cell_angles, block_angles, sizeof(block_angles));
+          block_have_matrix = gdis_model_build_cell_matrix(&block_reference,
+                                                           block_matrix,
+                                                           block_inverse);
+
+          for (i = i + 1; lines[i] != NULL; i++)
+            {
+              gchar *atom_line;
+              gchar *atom_trimmed;
+              g_autofree gchar *atom_lower = NULL;
+              g_auto(GStrv) tokens = NULL;
+              gint token_count = 0;
+              gdouble values[3];
+              gdouble cart[3];
+              gint species_index;
+              gint coord_start;
+              guint serial_probe;
+              const gchar *species;
+              g_autofree gchar *element = NULL;
+
+              atom_line = lines[i];
+              g_strchomp(atom_line);
+              atom_trimmed = g_strstrip(atom_line);
+              if (atom_trimmed[0] == '\0')
+                {
+                  if (block_atoms->len > 0u)
+                    break;
+                  continue;
+                }
+
+              atom_lower = g_ascii_strdown(atom_trimmed, -1);
+              if (g_str_has_prefix(atom_lower, "k_points") ||
+                  g_str_has_prefix(atom_lower, "cell_parameters") ||
+                  g_str_has_prefix(atom_lower, "end") ||
+                  g_str_has_prefix(atom_lower, "begin") ||
+                  g_str_has_prefix(atom_lower, "&"))
+                {
+                  if (block_atoms->len > 0u)
+                    {
+                      i--;
+                      break;
+                    }
+                  continue;
+                }
+
+              tokens = gdis_split_simple(atom_trimmed, &token_count);
+              if (token_count < 4)
+                {
+                  if (block_atoms->len > 0u)
+                    {
+                      i--;
+                      break;
+                    }
+                  continue;
+                }
+
+              species_index = 0;
+              coord_start = 1;
+              if (gdis_try_parse_uint(tokens[0], &serial_probe) && token_count >= 5)
+                {
+                  species_index = 1;
+                  coord_start = 2;
+                }
+
+              if (!gdis_collect_three_doubles_from_tokens(tokens,
+                                                          token_count,
+                                                          coord_start,
+                                                          values))
+                {
+                  if (block_atoms->len > 0u)
+                    {
+                      i--;
+                      break;
+                    }
+                  continue;
+                }
+
+              if (fractional_units)
+                {
+                  if (!block_have_matrix)
+                    continue;
+                  gdis_frac_to_cart(block_matrix, values, cart);
+                }
+              else
+                {
+                  cart[0] = values[0] * unit_scale;
+                  cart[1] = values[1] * unit_scale;
+                  cart[2] = values[2] * unit_scale;
+                }
+
+              species = (species_index < token_count) ? tokens[species_index] : "X";
+              element = gdis_normalize_element_symbol(species);
+              g_ptr_array_add(block_atoms,
+                              gdis_atom_new(species,
+                                            element,
+                                            element,
+                                            cart[0],
+                                            cart[1],
+                                            cart[2],
+                                            1.0,
+                                            -1,
+                                            block_atoms->len + 1u));
+            }
+
+          if (block_atoms->len > 0u)
+            {
+              if (best_atoms)
+                g_ptr_array_free(best_atoms, TRUE);
+              best_atoms = block_atoms;
+              best_periodic = block_periodic;
+              best_periodicity = block_periodicity;
+              memcpy(best_lengths, block_lengths, sizeof(best_lengths));
+              memcpy(best_angles, block_angles, sizeof(best_angles));
+            }
+          else
+            {
+              g_ptr_array_free(block_atoms, TRUE);
+            }
+
+          continue;
+        }
+    }
+
+  g_strfreev(lines);
+
+  if (!best_atoms || best_atoms->len == 0u)
+    {
+      if (best_atoms)
+        g_ptr_array_free(best_atoms, TRUE);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No QE atomic positions were parsed from '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  if (model->atoms)
+    g_ptr_array_free(model->atoms, TRUE);
+  model->atoms = best_atoms;
+  model->periodic = best_periodic;
+  model->periodicity = best_periodicity;
+  memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
+  memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+
+  return TRUE;
+}
+
+static gboolean
+gdis_model_load_qe_input(GdisModel *model, const gchar *contents, GError **error)
+{
+  return gdis_model_load_qe_like(model, contents, error);
+}
+
+static gboolean
+gdis_model_load_qe_output(GdisModel *model, const gchar *contents, GError **error)
+{
+  return gdis_model_load_qe_like(model, contents, error);
+}
+
+static gboolean
+gdis_model_load_gamess_input(GdisModel *model, const gchar *contents, GError **error)
+{
+  gchar **lines;
+  gboolean in_data_block;
+  guint data_header_lines;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  in_data_block = FALSE;
+  data_header_lines = 0u;
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *line;
+      gchar *trimmed;
+      g_autofree gchar *lower = NULL;
+      g_auto(GStrv) tokens = NULL;
+      gint token_count = 0;
+      gdouble coords[3];
+      g_autofree gchar *element = NULL;
+
+      line = lines[i];
+      g_strchomp(line);
+      trimmed = g_strstrip(line);
+      if (trimmed[0] == '\0')
+        continue;
+
+      lower = g_ascii_strdown(trimmed, -1);
+      if (!in_data_block)
+        {
+          if (g_str_has_prefix(lower, "$data"))
+            {
+              in_data_block = TRUE;
+              data_header_lines = 0u;
+            }
+          continue;
+        }
+
+      if (g_str_has_prefix(lower, "$end"))
+        break;
+
+      if (data_header_lines == 0u)
+        {
+          g_clear_pointer(&model->title, g_free);
+          model->title = g_strdup(trimmed);
+          data_header_lines++;
+          continue;
+        }
+      if (data_header_lines == 1u)
+        {
+          data_header_lines++;
+          continue;
+        }
+
+      tokens = gdis_split_simple(trimmed, &token_count);
+      if (token_count < 5)
+        continue;
+      if (!gdis_collect_three_doubles_from_tokens(tokens, token_count, 2, coords))
+        continue;
+
+      element = gdis_normalize_element_symbol(tokens[0]);
+      g_ptr_array_add(model->atoms,
+                      gdis_atom_new(tokens[0],
+                                    element,
+                                    element,
+                                    coords[0],
+                                    coords[1],
+                                    coords[2],
+                                    1.0,
+                                    -1,
+                                    model->atoms->len + 1u));
+    }
+
+  g_strfreev(lines);
+
+  if (model->atoms->len == 0u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No atoms were parsed from GAMESS input '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  return TRUE;
 }
 
 static gboolean
@@ -4333,7 +6283,10 @@ gdis_model_surface_default_path(const GdisModel *source,
 }
 
 static gboolean
-gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble inverse[9])
+gdis_build_cell_matrix_from_parameters(const gdouble lengths[3],
+                                       const gdouble angles[3],
+                                       gdouble matrix[9],
+                                       gdouble inverse[9])
 {
   gdouble alpha;
   gdouble beta;
@@ -4345,23 +6298,23 @@ gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble 
   gdouble cy;
   gdouble cz_sq;
 
-  if (!gdis_model_has_valid_cell(model))
+  if (!lengths || !angles || lengths[0] <= 0.0 || lengths[1] <= 0.0 || lengths[2] <= 0.0)
     return FALSE;
 
-  alpha = model->cell_angles[0] * (G_PI / 180.0);
-  beta = model->cell_angles[1] * (G_PI / 180.0);
-  gamma = model->cell_angles[2] * (G_PI / 180.0);
+  alpha = angles[0] * (G_PI / 180.0);
+  beta = angles[1] * (G_PI / 180.0);
+  gamma = angles[2] * (G_PI / 180.0);
 
-  ax = model->cell_lengths[0];
-  bx = model->cell_lengths[1] * cos(gamma);
-  by = model->cell_lengths[1] * sin(gamma);
-  cx = model->cell_lengths[2] * cos(beta);
+  ax = lengths[0];
+  bx = lengths[1] * cos(gamma);
+  by = lengths[1] * sin(gamma);
+  cx = lengths[2] * cos(beta);
 
   if (fabs(by) < 1.0e-10)
     return FALSE;
 
-  cy = model->cell_lengths[2] * (cos(alpha) - cos(beta) * cos(gamma)) / sin(gamma);
-  cz_sq = model->cell_lengths[2] * model->cell_lengths[2] - cx * cx - cy * cy;
+  cy = lengths[2] * (cos(alpha) - cos(beta) * cos(gamma)) / sin(gamma);
+  cz_sq = lengths[2] * lengths[2] - cx * cx - cy * cy;
   if (cz_sq < 0.0 && fabs(cz_sq) < 1.0e-10)
     cz_sq = 0.0;
   if (cz_sq < 0.0)
@@ -4381,6 +6334,18 @@ gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble 
     return TRUE;
 
   return gdis_model_invert_matrix3(matrix, inverse);
+}
+
+static gboolean
+gdis_model_build_cell_matrix(const GdisModel *model, gdouble matrix[9], gdouble inverse[9])
+{
+  if (!gdis_model_has_valid_cell(model))
+    return FALSE;
+
+  return gdis_build_cell_matrix_from_parameters(model->cell_lengths,
+                                                model->cell_angles,
+                                                matrix,
+                                                inverse);
 }
 
 static void
@@ -4573,6 +6538,77 @@ gdis_try_parse_double(const gchar *text, gdouble *value)
 }
 
 static gboolean
+gdis_try_parse_double_relaxed(const gchar *text, gdouble *value)
+{
+  g_autofree gchar *clean = NULL;
+  gchar *endptr;
+  gdouble parsed;
+  gsize len;
+
+  g_return_val_if_fail(value != NULL, FALSE);
+
+  if (gdis_try_parse_double(text, value))
+    return TRUE;
+
+  if (!text)
+    return FALSE;
+
+  clean = g_strdup(text);
+  g_strstrip(clean);
+  if (clean[0] == '\0' || g_str_equal(clean, "*"))
+    return FALSE;
+
+  while (clean[0] == '(' || clean[0] == '[' || clean[0] == '{' || clean[0] == '<')
+    memmove(clean, clean + 1, strlen(clean));
+
+  for (gchar *p = clean; *p != '\0'; p++)
+    {
+      if (*p == 'd' || *p == 'D')
+        *p = 'E';
+    }
+
+  len = strlen(clean);
+  while (len > 0)
+    {
+      gchar tail;
+
+      tail = clean[len - 1];
+      if (g_ascii_isspace(tail) ||
+          tail == '*' ||
+          tail == ',' ||
+          tail == ';' ||
+          tail == ':' ||
+          tail == ')' ||
+          tail == ']' ||
+          tail == '}' ||
+          tail == '>')
+        {
+          clean[len - 1] = '\0';
+          len--;
+          continue;
+        }
+      break;
+    }
+
+  if (clean[0] == '\0')
+    return FALSE;
+
+  parsed = g_ascii_strtod(clean, &endptr);
+  if (endptr == clean)
+    return FALSE;
+
+  while (*endptr != '\0')
+    {
+      if (!g_ascii_isspace(*endptr))
+        return FALSE;
+      endptr++;
+    }
+
+  *value = parsed;
+  return TRUE;
+}
+
+static gboolean
 gdis_try_parse_uint(const gchar *text, guint *value)
 {
   gchar *endptr;
@@ -4599,6 +6635,53 @@ gdis_try_parse_uint(const gchar *text, guint *value)
 
   *value = (guint) parsed;
   return TRUE;
+}
+
+static guint
+gdis_collect_doubles_from_line(const gchar *line, gdouble *values, guint max_values)
+{
+  g_auto(GStrv) tokens = NULL;
+  guint found = 0u;
+  gint token_count = 0;
+
+  if (!line || !values || max_values == 0u)
+    return 0u;
+
+  tokens = gdis_split_simple(line, &token_count);
+  for (gint i = 0; i < token_count && found < max_values; i++)
+    {
+      gdouble parsed;
+
+      if (gdis_try_parse_double_relaxed(tokens[i], &parsed))
+        values[found++] = parsed;
+    }
+
+  return found;
+}
+
+static gboolean
+gdis_collect_three_doubles_from_tokens(gchar **tokens,
+                                       gint token_count,
+                                       gint start_index,
+                                       gdouble out[3])
+{
+  gint i;
+  guint found = 0u;
+
+  g_return_val_if_fail(out != NULL, FALSE);
+
+  if (!tokens || token_count <= 0 || start_index >= token_count)
+    return FALSE;
+
+  for (i = MAX(start_index, 0); i < token_count && found < 3u; i++)
+    {
+      gdouble parsed;
+
+      if (gdis_try_parse_double_relaxed(tokens[i], &parsed))
+        out[found++] = parsed;
+    }
+
+  return found == 3u;
 }
 
 static gchar **

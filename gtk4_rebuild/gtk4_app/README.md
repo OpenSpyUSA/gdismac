@@ -149,6 +149,7 @@ Run without a startup file:
 
 ```sh
 make run
+./run-gdis-gtk4
 ```
 
 Run with one or more startup files:
@@ -156,9 +157,38 @@ Run with one or more startup files:
 ```sh
 make run ARGS="../../examples/water.xyz"
 make run ARGS="../../models/deoxy.pdb ../../models/gibb.car"
+./run-gdis-gtk4 ../../examples/water.xyz
+./run-gdis-gtk4 ../../models/deoxy.pdb
+./run-gdis-gtk4 ../../models/*
 ./build/gdis-gtk4 ../../examples/water.xyz
 ./build/gdis-gtk4 ../../models/deoxy.pdb
 ./build/gdis-gtk4 ../../models/*
+```
+
+Create and open a macOS app bundle (no manual binary path needed):
+
+```sh
+make app
+make open-app
+```
+
+This creates:
+
+```text
+gtk4_rebuild/gtk4_app/build/GDIS.app
+```
+
+Create the app directly in the project `dist/` folder:
+
+```sh
+make dist-app
+make open-dist-app
+```
+
+This creates:
+
+```text
+dist/GDIS.app
 ```
 
 ## Typical Usage
@@ -182,4 +212,3 @@ make run ARGS="../../models/deoxy.pdb ../../models/gibb.car"
 - Legacy snapshot: [../legacy_snapshot](../legacy_snapshot)
 - Restoration audit: [../RESTORATION_AUDIT.md](../RESTORATION_AUDIT.md)
 - Porting notes: [../gtk4_app/PORTING.md](./PORTING.md)
-
