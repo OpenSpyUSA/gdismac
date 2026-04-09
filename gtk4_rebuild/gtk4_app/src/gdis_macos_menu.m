@@ -311,4 +311,50 @@ gdis_macos_menu_install(GtkApplication *app)
                      gdis_macos_menu_install_state_free);
 }
 
+gchar *
+gdis_macos_choose_directory(const char *title, const char *initial_dir)
+{
+  @autoreleasepool
+    {
+      NSOpenPanel *panel;
+      NSURL *directory_url;
+      NSString *panel_title;
+      NSURL *selected_url;
+      NSString *selected_path;
+
+      panel = [NSOpenPanel openPanel];
+      panel_title = (title && title[0]) ? [NSString stringWithUTF8String:title]
+                                        : @"Open all models in folder";
+      [panel setTitle:panel_title];
+      [panel setPrompt:@"Select"];
+      [panel setCanChooseDirectories:YES];
+      [panel setCanChooseFiles:NO];
+      [panel setAllowsMultipleSelection:NO];
+      [panel setResolvesAliases:YES];
+
+      if (initial_dir && initial_dir[0])
+        {
+          NSString *path;
+
+          path = [NSString stringWithUTF8String:initial_dir];
+          directory_url = [NSURL fileURLWithPath:path isDirectory:YES];
+          if (directory_url)
+            [panel setDirectoryURL:directory_url];
+        }
+
+      if ([panel runModal] != NSModalResponseOK)
+        return NULL;
+
+      selected_url = [[panel URLs] firstObject];
+      if (!selected_url)
+        return NULL;
+
+      selected_path = [selected_url path];
+      if (!selected_path)
+        return NULL;
+
+      return g_strdup([selected_path UTF8String]);
+    }
+}
+
 #endif

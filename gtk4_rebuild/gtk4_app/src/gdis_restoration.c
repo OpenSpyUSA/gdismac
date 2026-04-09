@@ -59,6 +59,13 @@ static gboolean gdis_write_xyz_pose(FILE *stream,
                                     const GArray *scope,
                                     const gdouble *positions,
                                     const gchar *title);
+static void gdis_sort_scope_by_connectivity(const GdisModel *model, GArray *scope);
+static void gdis_compute_scope_centroid(const GdisModel *model,
+                                        const GArray *scope,
+                                        gdouble centroid[3]);
+static gdouble gdis_measure_scope_radius(const GdisModel *model,
+                                         const GArray *scope,
+                                         const gdouble centroid[3]);
 static void gdis_pick_orthogonal_axis(const gdouble axis[3], gdouble orthogonal[3]);
 static gboolean gdis_zmatrix_place_with_two_refs(const gdouble ref_b[3],
                                                  const gdouble ref_c[3],
@@ -550,6 +557,386 @@ docking_done:
   return success;
 }
 
+void
+gdis_mdi_settings_init(GdisMdiSettings *settings)
+{
+  g_return_if_fail(settings != NULL);
+
+  memset(settings, 0, sizeof(*settings));
+  settings->box_dim = 4u;
+  settings->random_rotate = TRUE;
+}
+
+gboolean
+gdis_generate_mdi_model(const GPtrArray *source_models,
+                        const GdisMdiSettings *settings,
+                        GdisModel **model_out,
+                        gchar **summary_out,
+                        GError **error)
+{
+  GdisModel *model;
+  guint component_count;
+  guint solvent_index;
+  guint box_dim;
+  guint64 total_sites;
+  guint64 solute_total;
+  guint64 solvent_total;
+  gdouble lattice_sep;
+  gdouble box_len;
+  guint *assignment;
+  GArray *occupied_sites;
+  guint copied_atoms;
+  guint copied_molecules;
+
+  g_return_val_if_fail(source_models != NULL, FALSE);
+  g_return_val_if_fail(settings != NULL, FALSE);
+  g_return_val_if_fail(model_out != NULL, FALSE);
+
+  *model_out = NULL;
+  component_count = source_models->len;
+  if (component_count < 2u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Load solvent and solute molecules first.");
+      return FALSE;
+    }
+
+  if (!settings->component_counts || settings->component_count != component_count)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "MD initializer component counts are out of sync with the loaded model list.");
+      return FALSE;
+    }
+
+  box_dim = MAX(settings->box_dim, 3u);
+  solvent_index = MIN(settings->solvent_index, component_count - 1u);
+  total_sites = (guint64) box_dim * (guint64) box_dim * (guint64) box_dim;
+  solute_total = 0u;
+  lattice_sep = 0.0;
+
+  for (guint i = 0; i < component_count; i++)
+    {
+      const GdisModel *source_model;
+      guint requested;
+      GArray *scope;
+      gdouble centroid[3];
+      gdouble radius;
+
+      source_model = g_ptr_array_index((GPtrArray *) source_models, i);
+      if (!source_model || !source_model->atoms || source_model->atoms->len == 0u)
+        continue;
+
+      requested = (i == solvent_index)
+        ? 1u
+        : settings->component_counts[i];
+      if (i != solvent_index)
+        solute_total += requested;
+      if (requested == 0u)
+        continue;
+
+      scope = g_array_sized_new(FALSE, FALSE, sizeof(guint), source_model->atoms->len);
+      for (guint atom_index = 0; atom_index < source_model->atoms->len; atom_index++)
+        g_array_append_val(scope, atom_index);
+      gdis_compute_scope_centroid(source_model, scope, centroid);
+      radius = gdis_measure_scope_radius(source_model, scope, centroid);
+      lattice_sep = MAX(lattice_sep, 2.0 * radius + 1.0);
+      g_array_free(scope, TRUE);
+    }
+
+  if (solute_total >= total_sites)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Too many solute molecules were requested for a %u x %u x %u box.",
+                  box_dim,
+                  box_dim,
+                  box_dim);
+      return FALSE;
+    }
+
+  solvent_total = total_sites - solute_total;
+  if (solvent_total < 9u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Too many solute molecules were requested. The solvent needs at least 9 remaining lattice sites.");
+      return FALSE;
+    }
+
+  if (!(lattice_sep > 0.0))
+    lattice_sep = 4.0;
+  box_len = lattice_sep * (gdouble) box_dim;
+  assignment = g_new0(guint, (gsize) total_sites);
+  occupied_sites = g_array_new(FALSE, FALSE, sizeof(guint));
+  for (guint64 pos = 0; pos < total_sites; pos++)
+    assignment[pos] = solvent_index;
+
+  for (guint component_index = 0; component_index < component_count; component_index++)
+    {
+      guint requested;
+
+      if (component_index == solvent_index)
+        continue;
+
+      requested = settings->component_counts[component_index];
+      for (guint placed = 0; placed < requested; placed++)
+        {
+          guint chosen_pos = 0u;
+          gint best_min_distance = G_MININT;
+          GArray *candidates;
+
+          candidates = g_array_new(FALSE, FALSE, sizeof(guint));
+          for (guint iz = 0; iz < box_dim; iz++)
+            {
+              for (guint iy = 0; iy < box_dim; iy++)
+                {
+                  for (guint ix = 0; ix < box_dim; ix++)
+                    {
+                      guint pos;
+                      gint min_distance_sq;
+
+                      pos = ix + box_dim * (iy + box_dim * iz);
+                      min_distance_sq = G_MAXINT;
+                      if (occupied_sites->len == 0u)
+                        min_distance_sq = (gint) total_sites;
+                      else
+                        {
+                          for (guint s = 0; s < occupied_sites->len; s++)
+                            {
+                              guint occupied_pos;
+                              guint occupied_ix;
+                              guint occupied_iy;
+                              guint occupied_iz;
+                              gint dx;
+                              gint dy;
+                              gint dz;
+                              gint distance_sq;
+
+                              occupied_pos = g_array_index(occupied_sites, guint, s);
+                              occupied_ix = occupied_pos % box_dim;
+                              occupied_iy = (occupied_pos / box_dim) % box_dim;
+                              occupied_iz = occupied_pos / (box_dim * box_dim);
+                              dx = abs((gint) occupied_ix - (gint) ix);
+                              dy = abs((gint) occupied_iy - (gint) iy);
+                              dz = abs((gint) occupied_iz - (gint) iz);
+                              if (dx > (gint) box_dim / 2)
+                                dx = (gint) box_dim - dx;
+                              if (dy > (gint) box_dim / 2)
+                                dy = (gint) box_dim - dy;
+                              if (dz > (gint) box_dim / 2)
+                                dz = (gint) box_dim - dz;
+                              distance_sq = dx * dx + dy * dy + dz * dz;
+                              min_distance_sq = MIN(min_distance_sq, distance_sq);
+                            }
+                        }
+
+                      if (min_distance_sq > best_min_distance)
+                        {
+                          best_min_distance = min_distance_sq;
+                          g_array_set_size(candidates, 0u);
+                          g_array_append_val(candidates, pos);
+                        }
+                      else if (min_distance_sq == best_min_distance)
+                        {
+                          g_array_append_val(candidates, pos);
+                        }
+                    }
+                }
+            }
+
+          if (candidates->len == 0u)
+            {
+              g_array_free(candidates, TRUE);
+              g_array_free(occupied_sites, TRUE);
+              g_free(assignment);
+              g_set_error(error,
+                          GDIS_MODEL_ERROR,
+                          GDIS_MODEL_ERROR_FAILED,
+                          "No candidate lattice sites were available for component placement.");
+              return FALSE;
+            }
+
+          chosen_pos = g_array_index(candidates,
+                                     guint,
+                                     g_random_int_range(0, (gint) candidates->len));
+          assignment[chosen_pos] = component_index;
+          g_array_append_val(occupied_sites, chosen_pos);
+          g_array_free(candidates, TRUE);
+        }
+    }
+
+  model = gdis_model_create_empty("MDI model.cif", GDIS_MODEL_FORMAT_CIF);
+  if (!model)
+    {
+      g_array_free(occupied_sites, TRUE);
+      g_free(assignment);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "Could not allocate the MDI model.");
+      return FALSE;
+    }
+
+  model->periodic = TRUE;
+  model->periodicity = 3u;
+  model->cell_lengths[0] = box_len;
+  model->cell_lengths[1] = box_len;
+  model->cell_lengths[2] = box_len;
+  model->cell_angles[0] = 90.0;
+  model->cell_angles[1] = 90.0;
+  model->cell_angles[2] = 90.0;
+  gdis_model_reset_image_limits(model);
+
+  copied_atoms = 0u;
+  copied_molecules = 0u;
+  for (guint iz = 0; iz < box_dim; iz++)
+    {
+      for (guint iy = 0; iy < box_dim; iy++)
+        {
+          for (guint ix = 0; ix < box_dim; ix++)
+            {
+              guint pos;
+              guint component_index;
+              GdisModel *source_model;
+              GArray *scope;
+              gdouble centroid[3];
+              gdouble translate[3];
+              gdouble angle_x;
+              gdouble angle_y;
+              gdouble angle_z;
+
+              pos = ix + box_dim * (iy + box_dim * iz);
+              component_index = assignment[pos];
+              source_model = g_ptr_array_index((GPtrArray *) source_models, component_index);
+              if (!source_model || !source_model->atoms || source_model->atoms->len == 0u)
+                continue;
+
+              scope = g_array_sized_new(FALSE, FALSE, sizeof(guint), source_model->atoms->len);
+              for (guint atom_index = 0; atom_index < source_model->atoms->len; atom_index++)
+                g_array_append_val(scope, atom_index);
+              gdis_compute_scope_centroid(source_model, scope, centroid);
+              g_array_free(scope, TRUE);
+
+              translate[0] = (lattice_sep * 0.5) + lattice_sep * (gdouble) ix;
+              translate[1] = (lattice_sep * 0.5) + lattice_sep * (gdouble) iy;
+              translate[2] = (lattice_sep * 0.5) + lattice_sep * (gdouble) iz;
+              if (settings->random_rotate)
+                {
+                  angle_x = g_random_double_range(0.0, 2.0 * G_PI);
+                  angle_y = g_random_double_range(0.0, 2.0 * G_PI);
+                  angle_z = g_random_double_range(0.0, 2.0 * G_PI);
+                }
+              else
+                {
+                  angle_x = 0.0;
+                  angle_y = 0.0;
+                  angle_z = 0.0;
+                }
+
+              for (guint atom_index = 0; atom_index < source_model->atoms->len; atom_index++)
+                {
+                  const GdisAtom *source_atom;
+                  GdisAtom *dest_atom;
+                  gdouble relative[3];
+                  gdouble rotated[3];
+
+                  source_atom = g_ptr_array_index(source_model->atoms, atom_index);
+                  relative[0] = source_atom->position[0] - centroid[0];
+                  relative[1] = source_atom->position[1] - centroid[1];
+                  relative[2] = source_atom->position[2] - centroid[2];
+                  gdis_rotate_euler_xyz(relative, angle_x, angle_y, angle_z, rotated);
+
+                  if (!gdis_model_add_atom(model,
+                                           source_atom->label,
+                                           source_atom->element,
+                                           source_atom->ff_type,
+                                           source_atom->region,
+                                           translate[0] + rotated[0],
+                                           translate[1] + rotated[1],
+                                           translate[2] + rotated[2],
+                                           error))
+                    {
+                      gdis_model_free(model);
+                      g_array_free(occupied_sites, TRUE);
+                      g_free(assignment);
+                      return FALSE;
+                    }
+
+                  dest_atom = g_ptr_array_index(model->atoms, model->atoms->len - 1u);
+                  dest_atom->occupancy = source_atom->occupancy;
+                  dest_atom->charge = source_atom->charge;
+                  dest_atom->has_charge = source_atom->has_charge;
+                  copied_atoms++;
+                }
+
+              copied_molecules++;
+            }
+        }
+    }
+
+  g_array_free(occupied_sites, TRUE);
+  g_free(assignment);
+
+  g_free(model->path);
+  g_free(model->basename);
+  model->path = g_strdup_printf("MDI-model-%ux%ux%u.cif", box_dim, box_dim, box_dim);
+  model->basename = g_strdup_printf("MDI model %ux%ux%u", box_dim, box_dim, box_dim);
+  g_clear_pointer(&model->title, g_free);
+  model->title = g_strdup_printf("MDI model from %s",
+                                 ((GdisModel *) g_ptr_array_index((GPtrArray *) source_models, solvent_index))->basename);
+
+  if (summary_out)
+    {
+      GString *summary;
+
+      summary = g_string_new(NULL);
+      g_string_append_printf(summary,
+                             "MD initializer complete.\n"
+                             "Solvent: %s\n"
+                             "Box: %u x %u x %u lattice sites\n"
+                             "Lattice spacing: %.3f A\n"
+                             "Cell length: %.3f A\n"
+                             "Placed molecules: %u\n"
+                             "Placed atoms: %u\n\n"
+                             "Component counts:\n"
+                             "  %s (solvent): %llu\n",
+                             ((GdisModel *) g_ptr_array_index((GPtrArray *) source_models, solvent_index))->basename,
+                             box_dim,
+                             box_dim,
+                             box_dim,
+                             lattice_sep,
+                             box_len,
+                             copied_molecules,
+                             copied_atoms,
+                             ((GdisModel *) g_ptr_array_index((GPtrArray *) source_models, solvent_index))->basename,
+                             (unsigned long long) solvent_total);
+      for (guint i = 0; i < component_count; i++)
+        {
+          GdisModel *source_model;
+
+          if (i == solvent_index || settings->component_counts[i] == 0u)
+            continue;
+          source_model = g_ptr_array_index((GPtrArray *) source_models, i);
+          g_string_append_printf(summary,
+                                 "  %s: %u\n",
+                                 source_model ? source_model->basename : "model",
+                                 settings->component_counts[i]);
+        }
+      g_string_append(summary,
+                      "\nGTK4 now restores the legacy lattice-fill MD initializer workflow for structure packing.");
+      *summary_out = g_string_free(summary, FALSE);
+    }
+
+  *model_out = model;
+  return TRUE;
+}
+
 gboolean
 gdis_build_zmatrix_rows(const GdisModel *model,
                         const GArray *selected_atoms,
@@ -637,66 +1024,59 @@ gdis_format_zmatrix_rows(const GdisModel *model,
 
   report = g_string_new("");
   g_string_append_printf(report,
-                         "Z-matrix Report\n"
+                         "ZMATRIX editor\n"
                          "Model: %s\n"
                          "Scope: %s\n"
-                         "Atoms: %u\n\n",
+                         "Atoms: %u\n"
+                         "Distance units: Angstrom\n"
+                         "Angle units: degrees\n\n",
                          model->basename ? model->basename : "model",
                          use_selection ? "current selection" : "full model",
                          scope->len);
-  g_string_append(report,
-                  "Idx  Atom       BondRef   Dist(A)    AngleRef  Angle(deg)  TorsionRef  Torsion(deg)\n");
 
   for (guint i = 0; i < rows->len; i++)
     {
       const GdisZmatrixRow *row;
       const GdisAtom *atom;
-      g_autofree gchar *distance_ref_text = NULL;
-      g_autofree gchar *distance_text = NULL;
-      g_autofree gchar *angle_ref_text = NULL;
-      g_autofree gchar *angle_text = NULL;
-      g_autofree gchar *torsion_ref_text = NULL;
-      g_autofree gchar *torsion_text = NULL;
+      guint distance_ref;
+      guint angle_ref;
+      guint torsion_ref;
+      gdouble distance_value;
+      gdouble angle_value;
+      gdouble torsion_value;
 
       row = &g_array_index(rows, GdisZmatrixRow, i);
       atom = g_ptr_array_index(model->atoms, row->atom_index);
 
-      distance_ref_text = (row->distance_ref != G_MAXUINT)
-                          ? g_strdup_printf("%u", gdis_scope_find_index(scope, row->distance_ref) + 1u)
-                          : g_strdup("-");
-      distance_text = (row->distance_ref != G_MAXUINT)
-                      ? g_strdup_printf("%.4f", row->distance)
-                      : g_strdup("-");
-      angle_ref_text = (row->angle_ref != G_MAXUINT)
-                       ? g_strdup_printf("%u", gdis_scope_find_index(scope, row->angle_ref) + 1u)
-                       : g_strdup("-");
-      angle_text = (row->angle_ref != G_MAXUINT)
-                   ? g_strdup_printf("%.3f", row->angle)
-                   : g_strdup("-");
-      torsion_ref_text = (row->torsion_ref != G_MAXUINT)
-                         ? g_strdup_printf("%u", gdis_scope_find_index(scope, row->torsion_ref) + 1u)
-                         : g_strdup("-");
-      torsion_text = (row->torsion_ref != G_MAXUINT)
-                     ? g_strdup_printf("%.3f", row->torsion)
-                     : g_strdup("-");
+      distance_ref = (row->distance_ref != G_MAXUINT)
+                     ? (guint) (gdis_scope_find_index(scope, row->distance_ref) + 1)
+                     : 0u;
+      angle_ref = (row->angle_ref != G_MAXUINT)
+                  ? (guint) (gdis_scope_find_index(scope, row->angle_ref) + 1)
+                  : 0u;
+      torsion_ref = (row->torsion_ref != G_MAXUINT)
+                    ? (guint) (gdis_scope_find_index(scope, row->torsion_ref) + 1)
+                    : 0u;
+      distance_value = (row->distance_ref != G_MAXUINT) ? row->distance : 0.0;
+      angle_value = (row->angle_ref != G_MAXUINT) ? row->angle : 0.0;
+      torsion_value = (row->torsion_ref != G_MAXUINT) ? row->torsion : 0.0;
 
       g_string_append_printf(
         report,
-        "%3u  %-8s  %7s  %8s  %8s  %10s  %10s  %12s\n",
+        "[%u]  %-4s  %d %d %d  %-9.4f  %-9.4f  %-9.4f\n",
         i + 1u,
         atom->label && atom->label[0] != '\0' ? atom->label : atom->element,
-        distance_ref_text,
-        distance_text,
-        angle_ref_text,
-        angle_text,
-        torsion_ref_text,
-        torsion_text);
+        (gint) distance_ref,
+        (gint) angle_ref,
+        (gint) torsion_ref,
+        distance_value,
+        angle_value,
+        torsion_value);
     }
 
   g_string_append(report,
-                  "\nReference atoms are chosen from the earlier connected scope where possible,\n"
-                  "with nearest-neighbour fallback when the current selection order is not fully bonded.\n"
-                  "Use the row editor to change numeric values, then choose Recompute geometry to apply them.\n");
+                  "\nUse the row editor below to change numeric values, then choose Recompute geometry to apply them.\n"
+                  "Build zmatrix from selection follows the current selected atom set after GTK4 reorders it into a connectivity-friendly path.\n");
   return g_string_free(report, FALSE);
 }
 
@@ -980,7 +1360,156 @@ gdis_build_scope_array(const GdisModel *model,
       return NULL;
     }
 
+  gdis_sort_scope_by_connectivity(model, scope);
   return scope;
+}
+
+static void
+gdis_sort_scope_by_connectivity(const GdisModel *model, GArray *scope)
+{
+  GArray *sorted;
+  GArray *remaining;
+  guint current_atom;
+
+  g_return_if_fail(model != NULL);
+  g_return_if_fail(scope != NULL);
+
+  if (scope->len < 3u)
+    return;
+
+  sorted = g_array_sized_new(FALSE, FALSE, sizeof(guint), scope->len);
+  remaining = g_array_sized_new(FALSE, FALSE, sizeof(guint), scope->len);
+  g_array_append_vals(remaining, scope->data, scope->len);
+
+  current_atom = g_array_index(remaining, guint, 0u);
+  g_array_append_val(sorted, current_atom);
+  g_array_remove_index(remaining, 0u);
+
+  while (remaining->len > 0u)
+    {
+      gint bonded_to_current = -1;
+      gint bonded_to_scope = -1;
+      gint nearest_any = 0;
+      gdouble bonded_to_current_dist = G_MAXDOUBLE;
+      gdouble bonded_to_scope_dist = G_MAXDOUBLE;
+      gdouble nearest_any_dist = G_MAXDOUBLE;
+      const GdisAtom *current_atom_record;
+
+      current_atom_record = g_ptr_array_index(model->atoms, current_atom);
+      for (guint i = 0; i < remaining->len; i++)
+        {
+          guint candidate_atom;
+          const GdisAtom *candidate_record;
+          gdouble distance_sq;
+          gboolean bonded_to_previous_scope;
+
+          candidate_atom = g_array_index(remaining, guint, i);
+          candidate_record = g_ptr_array_index(model->atoms, candidate_atom);
+          distance_sq = gdis_distance_sq(current_atom_record->position, candidate_record->position);
+          if (distance_sq < nearest_any_dist)
+            {
+              nearest_any_dist = distance_sq;
+              nearest_any = (gint) i;
+            }
+
+          bonded_to_previous_scope = FALSE;
+          if (gdis_atoms_are_bonded(model, current_atom, candidate_atom) &&
+              distance_sq < bonded_to_current_dist)
+            {
+              bonded_to_current_dist = distance_sq;
+              bonded_to_current = (gint) i;
+            }
+
+          for (guint j = 0; j < sorted->len; j++)
+            {
+              guint previous_atom;
+
+              previous_atom = g_array_index(sorted, guint, j);
+              if (gdis_atoms_are_bonded(model, previous_atom, candidate_atom))
+                {
+                  bonded_to_previous_scope = TRUE;
+                  break;
+                }
+            }
+
+          if (bonded_to_previous_scope && distance_sq < bonded_to_scope_dist)
+            {
+              bonded_to_scope_dist = distance_sq;
+              bonded_to_scope = (gint) i;
+            }
+        }
+
+      if (bonded_to_current >= 0)
+        current_atom = g_array_index(remaining, guint, (guint) bonded_to_current);
+      else if (bonded_to_scope >= 0)
+        current_atom = g_array_index(remaining, guint, (guint) bonded_to_scope);
+      else
+        current_atom = g_array_index(remaining, guint, (guint) nearest_any);
+
+      g_array_append_val(sorted, current_atom);
+      g_array_remove_index(remaining,
+                           bonded_to_current >= 0 ? (guint) bonded_to_current :
+                           bonded_to_scope >= 0 ? (guint) bonded_to_scope :
+                           (guint) nearest_any);
+    }
+
+  g_array_set_size(scope, 0u);
+  g_array_append_vals(scope, sorted->data, sorted->len);
+  g_array_free(sorted, TRUE);
+  g_array_free(remaining, TRUE);
+}
+
+static void
+gdis_compute_scope_centroid(const GdisModel *model,
+                            const GArray *scope,
+                            gdouble centroid[3])
+{
+  g_return_if_fail(model != NULL);
+  g_return_if_fail(scope != NULL);
+  g_return_if_fail(centroid != NULL);
+
+  gdis_vec3_set(centroid, 0.0, 0.0, 0.0);
+  if (scope->len == 0u)
+    return;
+
+  for (guint i = 0; i < scope->len; i++)
+    {
+      const GdisAtom *atom;
+
+      atom = g_ptr_array_index(model->atoms, g_array_index(scope, guint, i));
+      centroid[0] += atom->position[0];
+      centroid[1] += atom->position[1];
+      centroid[2] += atom->position[2];
+    }
+
+  centroid[0] /= (gdouble) scope->len;
+  centroid[1] /= (gdouble) scope->len;
+  centroid[2] /= (gdouble) scope->len;
+}
+
+static gdouble
+gdis_measure_scope_radius(const GdisModel *model,
+                          const GArray *scope,
+                          const gdouble centroid[3])
+{
+  gdouble radius;
+
+  g_return_val_if_fail(model != NULL, 0.0);
+  g_return_val_if_fail(scope != NULL, 0.0);
+  g_return_val_if_fail(centroid != NULL, 0.0);
+
+  radius = 0.0;
+  for (guint i = 0; i < scope->len; i++)
+    {
+      const GdisAtom *atom;
+      gdouble rel[3];
+
+      atom = g_ptr_array_index(model->atoms, g_array_index(scope, guint, i));
+      gdis_vec3_subtract(atom->position, centroid, rel);
+      radius = MAX(radius, gdis_vec3_length(rel));
+    }
+
+  return radius;
 }
 
 static gboolean

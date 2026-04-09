@@ -1,6 +1,6 @@
 # GTK4 Restoration Audit
 
-Last checked: 2026-04-05
+Last checked: 2026-04-09
 
 This audit compares the legacy Linux-oriented GDIS menu surface in:
 
@@ -64,9 +64,9 @@ Status legend:
 | Editing | `gui_edit_dialog` | `Partial` | GTK4 editor supports label/element/coordinate edits, atom add/delete, bond add/remove, and pick-driven bond editing. The full legacy editing surface is still larger. |
 | Dislocations | `gui_defect_dialog` | `Partial` | GTK4 restores a native dislocation transform workflow, but not the entire legacy defect toolbox. |
 | Docking | `gui_dock_dialog` | `Partial` | GTK4 restores docking project generation, but not the broader legacy docking environment. |
-| Dynamics | `gui_mdi_dialog` | `Missing` | No GTK4 structure-building dynamics dialog yet. |
+| Dynamics | `gui_mdi_dialog` | `Partial` | GTK4 now restores a native MD initializer with solvent/solute setup, legacy-style box/count limits, and a real lattice-fill packing backend. The old external `genbox` takeover path is still not ported. |
 | Surfaces | `surface_dialog` | `Partial` | GTK4 computes low-index planes and d-spacings, but not the full slab-construction workflow from the legacy dialog. |
-| Zmatrix | `gui_zmat_dialog` | `Partial` | GTK4 restores a native Z-matrix editor with geometry rebuild, but not the full legacy notebook workflow. |
+| Zmatrix | `gui_zmat_dialog` | `Partial` | GTK4 restores a native Z-matrix editor with legacy-style line formatting, row editing, selection rebuild, and geometry recomputation. Variable editing and deeper authored-legacy Z-matrix parity are still missing. |
 
 ## Tools / Computation
 
@@ -85,9 +85,9 @@ Status legend:
 
 | Legacy feature | Legacy callback | GTK4 status | Notes |
 | --- | --- | --- | --- |
-| Dynamics analysis | `gui_analysis_dialog` | `Missing` | No GTK4 analysis dialog yet. |
+| Dynamics analysis | `gui_analysis_dialog` | `Partial` | GTK4 now restores a real MD-analysis dialog under `Tools > Analysis > Dynamics` with `Pair count`, `RDF`, and `Measurements`, plus a result plot window. Deeper legacy calculations like `VACF`, `Temperature`, `Kinetic E`, and `Potential E` still depend on a fuller trajectory-metadata port. |
 | Measurements | `gui_measure_dialog` | `Partial` | GTK4 has explicit `Auto`, `Distance`, `Angle`, and `Torsion` modes, plus periodic minimum-image geometry support. It still lacks the legacy persistent measurement objects, search workflow, list controls, and editable measurement values. |
-| Plots | `gui_plots_dialog` | `Missing` | No GTK4 plotting tool yet. |
+| Plots | `gui_plots_dialog` | `Partial` | GTK4 now restores the legacy Dynamics/Electronic/Frequency page layout plus Execute/tick controls, and keeps the functional geometry/viewer-linked plots. Force/pressure, DOS/bands, and vibrational/Raman plots still depend on a deeper model-data bridge. |
 
 ## View
 

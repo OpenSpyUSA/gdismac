@@ -36,6 +36,15 @@ typedef struct
 
 typedef struct
 {
+  guint box_dim;
+  guint solvent_index;
+  const guint *component_counts;
+  guint component_count;
+  gboolean random_rotate;
+} GdisMdiSettings;
+
+typedef struct
+{
   guint atom_index;
   guint distance_ref;
   guint angle_ref;
@@ -57,6 +66,13 @@ gboolean gdis_generate_docking_project(const GdisModel *model,
                                        const GdisDockingSettings *settings,
                                        gchar **summary_out,
                                        GError **error);
+
+void gdis_mdi_settings_init(GdisMdiSettings *settings);
+gboolean gdis_generate_mdi_model(const GPtrArray *source_models,
+                                 const GdisMdiSettings *settings,
+                                 GdisModel **model_out,
+                                 gchar **summary_out,
+                                 GError **error);
 
 gboolean gdis_build_zmatrix_rows(const GdisModel *model,
                                  const GArray *selected_atoms,

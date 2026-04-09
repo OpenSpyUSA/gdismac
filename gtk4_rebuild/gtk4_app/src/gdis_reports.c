@@ -860,8 +860,8 @@ gdis_report_surface(const GdisModel *model)
     }
 
   g_string_append(report,
-                  "\nThis GTK4 bridge now provides plane ranking and d-spacing lookup.\n"
-                  "The full legacy slab-construction workflow is still a deeper port.");
+                  "\nLow-index plane ranking and d-spacing lookup are ready here.\n"
+                  "Use the Surface tool controls to build the slab from the selected Miller plane.");
   g_array_free(planes, TRUE);
   return g_string_free(report, FALSE);
 }
@@ -939,7 +939,7 @@ gdis_diffraction_calculate(const GdisModel *model,
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_FAILED,
-                  "Diffraction currently targets fully 3D periodic crystals.");
+                  "Diffraction requires a fully 3D periodic crystal.");
       return FALSE;
     }
 
@@ -1130,20 +1130,11 @@ gdis_report_isosurface(const GdisModel *model)
     g_string_append_printf(report, "Active model: %s\n\n", model->basename);
 
   g_string_append(report,
-                  "Iso-surfaces are not impossible here, but they are a much larger rebuild than a menu hookup.\n"
-                  "The original GDIS had real promolecule / electron-density iso-surface code.\n"
-                  "What the GTK4 rebuild still lacks is the scalar-field and mesh-display pipeline that code depends on.\n\n"
-                  "The current bridge loads structure models only:\n"
-                  "  XYZ\n"
-                  "  PDB\n"
-                  "  ARC/CAR\n"
-                  "  CIF\n\n"
-                  "To make iso-surfaces real here, the next port would need:\n"
-                  "  1. grid-data loaders and/or promolecule field generation\n"
-                  "  2. scalar-field storage in the GTK4 model bridge\n"
-                  "  3. marching-cubes style surface extraction\n"
-                  "  4. shaded mesh rendering in the GTK4 viewer\n\n"
-                  "So this feature is feasible, but it is still a separate engine port, not a small bridge fix.");
+                  "The GTK4 Iso-surfaces tool generates molecular, promolecule, Hirshfeld-style, and analytic electron-density surfaces from the active model.\n\n"
+                  "Use the Iso-surfaces window to choose the surface type, colour mode, grid size, blur, and isovalue.\n"
+                  "Electrostatic colouring uses the GTK4 bonded electronegativity field.\n"
+                  "Electron density mode uses the GTK4 analytic whole-model density field.\n"
+                  "If a surface exceeds the triangle budget, increase the grid size, raise smoothing, or focus on a smaller selection.");
   return g_string_free(report, FALSE);
 }
 

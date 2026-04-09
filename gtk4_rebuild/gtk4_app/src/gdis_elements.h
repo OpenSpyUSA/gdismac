@@ -39,5 +39,6 @@ const GdisElementInfo *gdis_element_lookup_atomic_number(guint atomic_number);
 const GdisElementInfo *gdis_element_fallback(void);
 const char *gdis_element_family_label(GdisElementFamily family);
 guint gdis_element_count(void);
+gboolean gdis_element_lookup_legacy_charge(const char *symbol, gdouble *charge_out);
 
 G_END_DECLS

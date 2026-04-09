@@ -84,9 +84,11 @@ The rebuild already provides practical native workflows for:
 
 - species mapping
 - starter-deck generation
+- practical setup controls for `ecutprec`, `dt`, spin, empty states, and charge mixing
 - working-directory export
 - pseudo and restart asset staging
 - optional launcher prefix
+- command helpers for `plot`, `spectrum`, `partial_charge`, `constraint`, `extforce`, and `set occ` / `print occ`
 - direct `qbox` / `qb` launch support
 - result/report session tracking
 
@@ -165,6 +167,16 @@ make run ARGS="../../models/deoxy.pdb ../../models/gibb.car"
 ./build/gdis-gtk4 ../../models/*
 ```
 
+Export a deterministic PNG directly from the GTK4 renderer:
+
+```sh
+./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-view.png
+./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-iso.png --iso
+./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-shape.png --iso --color shape-index
+make export-png MODEL=../../models/water.car OUT=/tmp/water-view.png
+make export-png MODEL=../../models/water.car OUT=/tmp/water-iso.png ISO=1 COLOR=shape-index
+```
+
 Create and open a macOS app bundle (no manual binary path needed):
 
 ```sh
@@ -198,7 +210,7 @@ dist/GDIS.app
 3. Click in the viewer to select atoms and build pick history.
 4. Use `Tools > Building > Editing...` for atom and bond edits.
 5. Use `Tools > Analysis > Measurements...` for distance, angle, and torsion tools.
-6. Use `Tools > Computation > Qbox...` if you want to prepare or run a Qbox job.
+6. Use `Tools > Computation > Qbox...` if you want to prepare or execute a Qbox job.
 7. Use `View > Executable paths...` to configure backend executables for the current session.
 
 ## macOS Notes
@@ -206,6 +218,7 @@ dist/GDIS.app
 - The app builds as a normal GTK4 desktop binary on macOS.
 - Qbox actions are also surfaced through a native macOS menu entry so they remain reachable from the system menu bar.
 - The current layout is tuned for practical Mac usage, but the GTK4 rebuild still differs from the exact old Linux interface in a number of places.
+- If desktop screenshots are unreliable, use `./capture-gdis-gtk4` or `make export-png ...` to export the viewer to PNG from inside the app itself. This avoids focus, scaling, and interrupted-window capture problems.
 
 ## Reference Files
 

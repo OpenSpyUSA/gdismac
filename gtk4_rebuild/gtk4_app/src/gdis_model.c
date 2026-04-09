@@ -1,8 +1,12 @@
 #include "gdis_model.h"
+#include "gdis_elements.h"
 
 #include <ctype.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
+
+#include "../../legacy_snapshot/src/sginfo.h"
 
 typedef struct
 {
@@ -11,6 +15,8 @@ typedef struct
   gdouble coords[3];
   gdouble occupancy;
   gboolean fractional;
+  guint multiplicity;
+  gboolean have_multiplicity;
 } GdisCifAtomRecord;
 
 typedef struct
@@ -21,6 +27,10 @@ typedef struct
   guint periodicity;
   gdouble cell_lengths[3];
   gdouble cell_angles[3];
+  gboolean has_energy;
+  gdouble energy_ev;
+  gboolean has_force_rms;
+  gdouble force_rms_ev_ang;
   GPtrArray *atoms;
 } GdisModelFrame;
 
@@ -28,18 +38,32 @@ typedef struct
 {
   GdisModel *model;
   GHashTable *species_symbols;
+  GPtrArray *frames;
+  GdisModelFrame *current_frame;
   gchar *current_species_name;
   gchar *current_atom_name;
   gchar *current_atom_species;
   GString *text;
   gdouble current_atom_position[3];
-  gdouble a_vec[3];
-  gdouble b_vec[3];
-  gdouble c_vec[3];
+  gdouble default_a_vec[3];
+  gdouble default_b_vec[3];
+  gdouble default_c_vec[3];
+  guint atomset_count;
+  guint current_iteration_count;
+  gboolean inside_iteration;
   gboolean inside_species_symbol;
   gboolean inside_atom_position;
+  gboolean inside_etotal;
+  gboolean inside_atom_force;
   gboolean have_current_atom_position;
-  gboolean have_cell;
+  gboolean have_current_atom_force;
+  gboolean current_frame_has_cell;
+  gboolean have_default_cell;
+  gboolean have_current_iteration_energy;
+  gdouble current_iteration_energy_ev;
+  gdouble current_atom_force[3];
+  gdouble current_frame_force_sum_sq;
+  guint current_frame_force_count;
   gboolean looks_like_qbox;
 } GdisQboxXmlParseState;
 
@@ -48,6 +72,17 @@ typedef struct
   const char *symbol;
   gdouble radius;
 } GdisRadiusEntry;
+
+typedef struct
+{
+  gdouble matrix[9];
+  gdouble offset[3];
+} GdisSymmetryOp;
+
+typedef struct
+{
+  gdouble values[3];
+} GdisFractionalPosition;
 
 static GdisModel *gdis_model_new(const char *path, GdisModelFormat format);
 static void gdis_model_clear_contents(GdisModel *model);
@@ -103,6 +138,7 @@ static GdisAtom *gdis_atom_new(const gchar *label,
                                guint serial);
 static void gdis_atom_free(gpointer data);
 static void gdis_cif_atom_record_free(gpointer data);
+static guint gdis_cif_sum_reported_multiplicities(const GPtrArray *records);
 static gboolean gdis_model_has_valid_cell(const GdisModel *model);
 static gboolean gdis_build_cell_matrix_from_parameters(const gdouble lengths[3],
                                                        const gdouble angles[3],
@@ -117,6 +153,9 @@ static void gdis_model_wrap_atoms_to_cell(GPtrArray *atoms,
                                           guint periodicity,
                                           const gdouble matrix[9],
                                           const gdouble inverse[9]);
+static gboolean gdis_model_atoms_inside_primary_cell(GPtrArray *atoms,
+                                                     guint periodicity,
+                                                     const gdouble inverse[9]);
 static gboolean gdis_model_repack_periodic_components(GdisModel *model,
                                                       const gdouble matrix[9],
                                                       const gdouble inverse[9]);
@@ -143,9 +182,19 @@ static gint gdis_arc_like_region_from_type(const gchar *text);
 static gboolean gdis_try_parse_double(const gchar *text, gdouble *value);
 static gboolean gdis_try_parse_double_relaxed(const gchar *text, gdouble *value);
 static gboolean gdis_try_parse_uint(const gchar *text, guint *value);
+static gboolean gdis_gulp_type_is_core(const gchar *text);
+static gboolean gdis_gulp_type_is_shell(const gchar *text);
+static gchar *gdis_gulp_make_species_key(const gchar *name, const gchar *type_text);
+static const gdouble *gdis_gulp_lookup_species_charge(GHashTable *species_charges,
+                                                      const gchar *label,
+                                                      const gchar *element,
+                                                      const gchar *type_text);
 static guint gdis_collect_doubles_from_line(const gchar *line,
                                             gdouble *values,
                                             guint max_values);
+static gchar *gdis_xtl_compose_space_group(const gchar *label,
+                                           guint number,
+                                           const gchar *qualifier);
 static gboolean gdis_collect_three_doubles_from_tokens(gchar **tokens,
                                                        gint token_count,
                                                        gint start_index,
@@ -155,7 +204,19 @@ static GPtrArray *gdis_tokenize_cif(const gchar *line);
 static gboolean gdis_cif_parse_value_line(const gchar *line, gchar **tag_out, gchar **value_out);
 static gdouble gdis_parse_cif_number(const gchar *text);
 static gboolean gdis_cif_is_control_line(const gchar *line);
+static gboolean gdis_parse_cif_symmetry_operation(const gchar *text, GdisSymmetryOp *op_out);
+gboolean gdis_model_set_element_covalent_override(GdisModel *model,
+                                                  const gchar *symbol,
+                                                  gdouble radius);
+void gdis_model_copy_element_overrides(GdisModel *dest, const GdisModel *src);
+gdouble gdis_model_lookup_covalent_radius(const GdisModel *model, const GdisAtom *atom);
 static gdouble gdis_lookup_covalent_radius(const gchar *element);
+gboolean gdis_model_should_infer_bond(const GdisModel *model,
+                                      const GdisAtom *atom_i,
+                                      const GdisAtom *atom_j,
+                                      gdouble radius_i,
+                                      gdouble radius_j,
+                                      gdouble *max_distance_out);
 static const gchar *gdis_xml_local_name(const gchar *name);
 static gboolean gdis_parse_vector3_text(const gchar *text, gdouble vector[3]);
 static void gdis_vec3_set(gdouble vector[3], gdouble x, gdouble y, gdouble z);
@@ -177,6 +238,32 @@ static gboolean gdis_surface_build_cell_from_vectors(const gdouble a_vec[3],
                                                      const gdouble c_vec[3],
                                                      gdouble lengths[3],
                                                      gdouble angles[3]);
+static gint gdis_str_ibegin(const char *s1, const char *s2);
+static gint gdis_build_sginfo_compat(T_SgInfo *sg_info, const gchar *space_group_text);
+static void gdis_free_sginfo_compat(T_SgInfo *sg_info);
+static gchar *gdis_format_space_group_label(const T_SgInfo *sg_info);
+static gboolean gdis_model_uses_rhombohedral_setting(const GdisModel *model,
+                                                     const gchar *space_group_text);
+static gboolean gdis_build_space_group_operations(const GdisModel *model,
+                                                  const gchar *space_group_text,
+                                                  gint origin_choice,
+                                                  GArray **ops_out,
+                                                  gchar **canonical_label_out);
+static gdouble gdis_wrap_fractional_coordinate(gdouble value);
+static void gdis_wrap_fractional_vector(gdouble frac[3], guint periodicity);
+static gboolean gdis_fractional_positions_equal(const gdouble left[3],
+                                                const gdouble right[3],
+                                                guint periodicity,
+                                                gdouble tolerance);
+static GdisAtom *gdis_atom_clone_with_position(const GdisAtom *source,
+                                               const gdouble position[3],
+                                               guint serial);
+static gboolean gdis_model_expand_atoms_with_symmetry_ops(GdisModel *model,
+                                                          const GArray *ops);
+gboolean gdis_model_expand_space_group_atoms(GdisModel *model,
+                                             gint origin_choice);
+static gboolean gdis_model_expand_space_group_atoms_best_match(GdisModel *model,
+                                                               guint expected_atom_count);
 static void gdis_qbox_xml_start_element(GMarkupParseContext *context,
                                         const gchar         *element_name,
                                         const gchar        **attribute_names,
@@ -192,10 +279,40 @@ static void gdis_qbox_xml_text(GMarkupParseContext *context,
                                gsize                text_len,
                                gpointer             user_data,
                                GError             **parse_error);
+gboolean gdis_qbox_apply_cell_vectors_to_frame(GdisQboxXmlParseState *state,
+                                               GdisModelFrame *frame,
+                                               const gdouble a_vec[3],
+                                               const gdouble b_vec[3],
+                                               const gdouble c_vec[3],
+                                               GError **error);
+gboolean gdis_qbox_begin_frame(GdisQboxXmlParseState *state,
+                               GError **error);
+gboolean gdis_qbox_finish_current_frame(GdisQboxXmlParseState *state,
+                                        GError **error);
 static gchar *gdis_model_surface_default_path(const GdisModel *source,
                                               gint h,
                                               gint k,
                                               gint l);
+static gboolean gdis_model_sum_charge_atoms(const GPtrArray *atoms,
+                                            gboolean periodic,
+                                            guint periodicity,
+                                            const gdouble lengths[3],
+                                            const gdouble angles[3],
+                                            const gchar *space_group,
+                                            gint origin_choice,
+                                            gboolean expand_space_group,
+                                            gdouble *total_charge_out);
+static gboolean gdis_model_sum_known_charge_atoms(const GPtrArray *atoms,
+                                                  gboolean periodic,
+                                                  guint periodicity,
+                                                  const gdouble lengths[3],
+                                                  const gdouble angles[3],
+                                                  const gchar *space_group,
+                                                  gint origin_choice,
+                                                  gboolean expand_space_group,
+                                                  gdouble *total_charge_out);
+static gboolean gdis_model_sum_legacy_visible_charge(const GPtrArray *atoms,
+                                                     gdouble *total_charge_out);
 
 GQuark
 gdis_model_error_quark(void)
@@ -355,11 +472,18 @@ gdis_model_clone(const GdisModel *model)
   copy->atom_count = model->atom_count;
   copy->bond_count = model->bond_count;
   copy->explicit_bond_count = model->explicit_bond_count;
+  copy->has_total_charge = model->has_total_charge;
+  copy->total_charge_e = model->total_charge_e;
+  copy->has_density = model->has_density;
+  copy->density_g_cm3 = model->density_g_cm3;
+  copy->has_energy = model->has_energy;
+  copy->energy_ev = model->energy_ev;
   copy->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
   copy->bonds = g_array_sized_new(FALSE,
                                   FALSE,
                                   sizeof(GdisBond),
                                   model->bonds ? model->bonds->len : 0u);
+  copy->element_covalent_overrides = NULL;
 
   if (model->atoms)
     {
@@ -378,11 +502,15 @@ gdis_model_clone(const GdisModel *model)
                                         atom->occupancy,
                                         atom->region,
                                         atom->serial));
+          ((GdisAtom *) g_ptr_array_index(copy->atoms, copy->atoms->len - 1u))->charge = atom->charge;
+          ((GdisAtom *) g_ptr_array_index(copy->atoms, copy->atoms->len - 1u))->has_charge = atom->has_charge;
         }
     }
 
   if (model->bonds && model->bonds->len > 0)
     g_array_append_vals(copy->bonds, model->bonds->data, model->bonds->len);
+
+  gdis_model_copy_element_overrides(copy, model);
 
   if (model->frames && model->frames->len > 0)
     {
@@ -400,6 +528,10 @@ gboolean
 gdis_model_copy_from(GdisModel *dest, const GdisModel *src, GError **error)
 {
   GdisModel *copy;
+  gchar *preserved_path;
+  gchar *preserved_basename;
+  gchar *preserved_format_label;
+  GdisModelFormat preserved_format;
 
   g_return_val_if_fail(dest != NULL, FALSE);
   g_return_val_if_fail(src != NULL, FALSE);
@@ -417,9 +549,21 @@ gdis_model_copy_from(GdisModel *dest, const GdisModel *src, GError **error)
       return FALSE;
     }
 
+  preserved_path = g_strdup(dest->path);
+  preserved_basename = g_strdup(dest->basename);
+  preserved_format_label = g_strdup(dest->format_label);
+  preserved_format = dest->format;
+
   gdis_model_clear_contents(dest);
   *dest = *copy;
   g_free(copy);
+  g_free(dest->path);
+  g_free(dest->basename);
+  g_free(dest->format_label);
+  dest->path = preserved_path;
+  dest->basename = preserved_basename;
+  dest->format_label = preserved_format_label;
+  dest->format = preserved_format;
   return TRUE;
 }
 
@@ -444,6 +588,7 @@ gdis_model_clear_contents(GdisModel *model)
   g_clear_pointer(&model->title, g_free);
   g_clear_pointer(&model->format_label, g_free);
   g_clear_pointer(&model->space_group, g_free);
+  g_clear_pointer(&model->element_covalent_overrides, g_hash_table_unref);
 
   if (model->atoms)
     g_ptr_array_free(model->atoms, TRUE);
@@ -496,7 +641,7 @@ gdis_model_save(GdisModel *model, const char *path, GError **error)
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
-                  "Saving Qbox XML is not supported from the GTK4 rebuild yet.");
+                  "Saving Qbox XML is not available from this app.");
       break;
     case GDIS_MODEL_FORMAT_GULP_INPUT:
     case GDIS_MODEL_FORMAT_GULP_OUTPUT:
@@ -507,7 +652,7 @@ gdis_model_save(GdisModel *model, const char *path, GError **error)
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
-                  "Saving %s is not supported from the GTK4 rebuild yet.",
+                  "Saving %s is not available from this app.",
                   gdis_model_format_label(format));
       break;
     case GDIS_MODEL_FORMAT_UNKNOWN:
@@ -1374,7 +1519,7 @@ gdis_model_build_surface_slab(const GdisModel *source,
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_FAILED,
-                  "Surface construction currently targets fully 3D periodic crystal models.");
+                  "Surface construction requires a fully 3D periodic crystal model.");
       return FALSE;
     }
 
@@ -1526,6 +1671,7 @@ gdis_model_build_surface_slab(const GdisModel *source,
   surface->periodicity = 2;
   memcpy(surface->cell_lengths, lengths, sizeof(lengths));
   memcpy(surface->cell_angles, angles, sizeof(angles));
+  gdis_model_copy_element_overrides(surface, source);
 
   if (!gdis_model_build_cell_matrix(surface, slab_canonical_matrix, NULL))
     {
@@ -1726,6 +1872,8 @@ gdis_model_format_from_path(const char *path)
       else
         format = GDIS_MODEL_FORMAT_QBOX_XML;
     }
+  else if (g_str_equal(lower, "r"))
+    format = GDIS_MODEL_FORMAT_QBOX_XML;
   else if (g_str_equal(lower, "gin") || g_str_equal(lower, "res"))
     format = GDIS_MODEL_FORMAT_GULP_INPUT;
   else if (g_str_equal(lower, "got") || g_str_equal(lower, "gout"))
@@ -1896,6 +2044,78 @@ gdis_model_discard_frames(GdisModel *model)
   model->current_frame_index = 0u;
 }
 
+guint
+gdis_model_get_component_count(const GdisModel *model)
+{
+  guint *component_ids;
+  guint component_count;
+
+  g_return_val_if_fail(model != NULL, 0u);
+
+  component_ids = gdis_model_build_component_ids(model, &component_count);
+  g_free(component_ids);
+  return component_count;
+}
+
+gboolean
+gdis_model_get_cell_volume(const GdisModel *model, gdouble *volume_out)
+{
+  gdouble matrix[9];
+  gdouble inverse[9];
+  gdouble a_vec[3];
+  gdouble b_vec[3];
+  gdouble c_vec[3];
+  gdouble cross_ab[3];
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(volume_out != NULL, FALSE);
+
+  *volume_out = 0.0;
+  if (!gdis_model_build_cell_matrix(model, matrix, inverse))
+    return FALSE;
+
+  gdis_vec3_set(a_vec, matrix[0], matrix[3], matrix[6]);
+  gdis_vec3_set(b_vec, matrix[1], matrix[4], matrix[7]);
+  gdis_vec3_set(c_vec, matrix[2], matrix[5], matrix[8]);
+  gdis_vec3_cross(a_vec, b_vec, cross_ab);
+  *volume_out = fabs(gdis_vec3_dot(cross_ab, c_vec));
+  return TRUE;
+}
+
+gboolean
+gdis_model_get_cell_matrix(const GdisModel *model,
+                           gdouble matrix[9],
+                           gdouble inverse[9])
+{
+  return gdis_model_build_cell_matrix(model, matrix, inverse);
+}
+
+void
+gdis_model_compute_minimum_image_delta(const GdisModel *model,
+                                       const gdouble matrix[9],
+                                       const gdouble inverse[9],
+                                       const gdouble from[3],
+                                       const gdouble to[3],
+                                       gdouble delta[3])
+{
+  g_return_if_fail(model != NULL);
+  g_return_if_fail(matrix != NULL);
+  g_return_if_fail(inverse != NULL);
+  g_return_if_fail(from != NULL);
+  g_return_if_fail(to != NULL);
+  g_return_if_fail(delta != NULL);
+
+  if (!model->periodic)
+    {
+      delta[0] = to[0] - from[0];
+      delta[1] = to[1] - from[1];
+      delta[2] = to[2] - from[2];
+      return;
+    }
+
+  gdis_model_minimum_image_delta(model, matrix, inverse, from, to, delta);
+}
+
 static GdisModel *
 gdis_model_new(const char *path, GdisModelFormat format)
 {
@@ -1908,6 +2128,7 @@ gdis_model_new(const char *path, GdisModelFormat format)
   model->format_label = g_strdup(gdis_model_format_label(format));
   model->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
   model->bonds = g_array_new(FALSE, FALSE, sizeof(GdisBond));
+  model->element_covalent_overrides = NULL;
   model->frames = NULL;
   model->current_frame_index = 0u;
   model->cell_angles[0] = 90.0;
@@ -1978,6 +2199,8 @@ gdis_model_frame_clone(const GdisModelFrame *frame)
                                         atom->occupancy,
                                         atom->region,
                                         atom->serial));
+          ((GdisAtom *) g_ptr_array_index(copy->atoms, copy->atoms->len - 1u))->charge = atom->charge;
+          ((GdisAtom *) g_ptr_array_index(copy->atoms, copy->atoms->len - 1u))->has_charge = atom->has_charge;
         }
     }
 
@@ -2031,6 +2254,8 @@ gdis_model_frame_apply(GdisModel *model, const GdisModelFrame *frame)
                                         atom->occupancy,
                                         atom->region,
                                         atom->serial));
+          ((GdisAtom *) g_ptr_array_index(atoms, atoms->len - 1u))->charge = atom->charge;
+          ((GdisAtom *) g_ptr_array_index(atoms, atoms->len - 1u))->has_charge = atom->has_charge;
         }
     }
 
@@ -2100,6 +2325,40 @@ gdis_model_wrap_atoms_to_cell(GPtrArray *atoms,
 
       gdis_frac_to_cart(matrix, frac, atom->position);
     }
+}
+
+static gboolean
+gdis_model_atoms_inside_primary_cell(GPtrArray *atoms,
+                                     guint periodicity,
+                                     const gdouble inverse[9])
+{
+  static const gdouble tolerance = 1.0e-5;
+  guint dims;
+
+  g_return_val_if_fail(atoms != NULL, FALSE);
+  g_return_val_if_fail(inverse != NULL, FALSE);
+
+  dims = periodicity;
+  if (dims == 0u)
+    dims = 3u;
+  dims = MIN(dims, 3u);
+
+  for (guint i = 0; i < atoms->len; i++)
+    {
+      GdisAtom *atom;
+      gdouble frac[3];
+
+      atom = g_ptr_array_index(atoms, i);
+      gdis_cart_to_frac(inverse, atom->position, frac);
+
+      for (guint axis = 0; axis < dims; axis++)
+        {
+          if (frac[axis] < -tolerance || frac[axis] > 1.0 + tolerance)
+            return FALSE;
+        }
+    }
+
+  return TRUE;
 }
 
 static gboolean
@@ -2336,6 +2595,7 @@ gdis_model_normalize_loaded_periodic_geometry(GdisModel *model)
 {
   gdouble matrix[9];
   gdouble inverse[9];
+  gboolean prefer_atom_wrap;
 
   g_return_if_fail(model != NULL);
 
@@ -2345,11 +2605,32 @@ gdis_model_normalize_loaded_periodic_geometry(GdisModel *model)
       !gdis_model_build_cell_matrix(model, matrix, inverse))
     return;
 
-  if (!gdis_model_repack_periodic_components(model, matrix, inverse))
+  /* Legacy BIOSYM ARC/CAR import wrapped each atom into the primary cell
+   * while reading the Cartesian coordinates. Keep that default presentation
+   * in the GTK4 rebuild so crystal networks do not open with part of the
+   * bonded framework sitting outside the drawn unit cell. */
+  prefer_atom_wrap = (model->format == GDIS_MODEL_FORMAT_ARC ||
+                      model->format == GDIS_MODEL_FORMAT_CAR ||
+                      model->format == GDIS_MODEL_FORMAT_GULP_INPUT);
+
+  if (prefer_atom_wrap)
     gdis_model_wrap_atoms_to_cell(model->atoms,
                                   model->periodicity,
                                   matrix,
                                   inverse);
+  else
+    {
+      if (!gdis_model_repack_periodic_components(model, matrix, inverse) ||
+          !gdis_model_atoms_inside_primary_cell(model->atoms,
+                                                model->periodicity,
+                                                inverse))
+        {
+          gdis_model_wrap_atoms_to_cell(model->atoms,
+                                        model->periodicity,
+                                        matrix,
+                                        inverse);
+        }
+    }
 
   if (model->frames)
     {
@@ -2368,10 +2649,31 @@ gdis_model_normalize_loaded_periodic_geometry(GdisModel *model)
                                                       inverse))
             continue;
 
-          gdis_model_wrap_atoms_to_cell(frame->atoms,
-                                        frame->periodicity,
-                                        matrix,
-                                        inverse);
+          if (prefer_atom_wrap)
+            gdis_model_wrap_atoms_to_cell(frame->atoms,
+                                          frame->periodicity,
+                                          matrix,
+                                          inverse);
+          else
+            {
+              GdisModel snapshot;
+
+              memset(&snapshot, 0, sizeof(snapshot));
+              snapshot.atoms = frame->atoms;
+              snapshot.bonds = model->bonds;
+              snapshot.periodic = frame->periodic;
+              snapshot.periodicity = frame->periodicity;
+              memcpy(snapshot.cell_lengths, frame->cell_lengths, sizeof(snapshot.cell_lengths));
+              memcpy(snapshot.cell_angles, frame->cell_angles, sizeof(snapshot.cell_angles));
+              if (!gdis_model_repack_periodic_components(&snapshot, matrix, inverse) ||
+                  !gdis_model_atoms_inside_primary_cell(frame->atoms,
+                                                        frame->periodicity,
+                                                        inverse))
+                gdis_model_wrap_atoms_to_cell(frame->atoms,
+                                              frame->periodicity,
+                                              matrix,
+                                              inverse);
+            }
         }
     }
 }
@@ -3064,12 +3366,15 @@ gdis_model_load_arc_like(GdisModel *model,
       tokens = gdis_split_simple(line, &token_count);
       if (token_count >= 8)
         {
+          GdisAtom *atom;
           gchar *element;
           gchar *ff_type;
           gdouble x;
           gdouble y;
           gdouble z;
           gdouble occupancy;
+          gdouble charge;
+          gboolean have_charge;
           gint region;
           gboolean skip_atom;
 
@@ -3103,6 +3408,10 @@ gdis_model_load_arc_like(GdisModel *model,
           else
             occupancy = 1.0;
 
+          charge = 0.0;
+          have_charge = token_count >= 9 &&
+                        gdis_try_parse_double_relaxed(tokens[8], &charge);
+
           ff_type = NULL;
           if (token_count >= 7)
             ff_type = gdis_strdup_strip(tokens[6]);
@@ -3112,16 +3421,21 @@ gdis_model_load_arc_like(GdisModel *model,
           else
             element = gdis_normalize_element_symbol(tokens[0]);
 
-          g_ptr_array_add(current_frame->atoms,
-                          gdis_atom_new(tokens[0],
-                                        element,
-                                        (ff_type && ff_type[0] != '\0') ? ff_type : element,
-                                        x,
-                                        y,
-                                        z,
-                                        occupancy,
-                                        region,
-                                        current_frame->atoms->len + 1u));
+          atom = gdis_atom_new(tokens[0],
+                               element,
+                               (ff_type && ff_type[0] != '\0') ? ff_type : element,
+                               x,
+                               y,
+                               z,
+                               occupancy,
+                               region,
+                               current_frame->atoms->len + 1u);
+          if (have_charge)
+            {
+              atom->charge = charge;
+              atom->has_charge = TRUE;
+            }
+          g_ptr_array_add(current_frame->atoms, atom);
           g_free(ff_type);
           g_free(element);
         }
@@ -3149,6 +3463,16 @@ gdis_model_load_arc_like(GdisModel *model,
     }
 
   gdis_model_frame_apply(model, g_ptr_array_index(frames, 0u));
+  if (gdis_model_sum_known_charge_atoms(model->atoms,
+                                        model->periodic,
+                                        model->periodicity,
+                                        model->cell_lengths,
+                                        model->cell_angles,
+                                        model->space_group,
+                                        0,
+                                        FALSE,
+                                        &model->total_charge_e))
+    model->has_total_charge = TRUE;
   model->current_frame_index = 0u;
   if (frames->len > 1u)
     {
@@ -3186,6 +3510,13 @@ gdis_model_load_gulp_input_like(GdisModel *model,
   gboolean seen_name;
   gboolean have_cell_matrix;
   gboolean have_surface_vectors;
+  gboolean saw_fractional_atoms;
+  gboolean saw_non_fractional_atoms;
+  gboolean ignore_additional_geometry;
+  gboolean inside_element_block;
+  GHashTable *species_charges;
+  GPtrArray *charge_atoms;
+  gint origin_choice;
   gdouble cell_matrix[9];
   gdouble cell_inverse[9];
   gdouble surface_a[3];
@@ -3200,6 +3531,13 @@ gdis_model_load_gulp_input_like(GdisModel *model,
   seen_name = FALSE;
   have_cell_matrix = FALSE;
   have_surface_vectors = FALSE;
+  saw_fractional_atoms = FALSE;
+  saw_non_fractional_atoms = FALSE;
+  ignore_additional_geometry = FALSE;
+  inside_element_block = FALSE;
+  species_charges = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+  charge_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  origin_choice = 0;
   gdis_vec3_set(surface_a, 0.0, 0.0, 0.0);
   gdis_vec3_set(surface_b, 0.0, 0.0, 0.0);
 
@@ -3223,12 +3561,178 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       first_lower = g_ascii_strdown(tokens[0], -1);
 
+      if (inside_element_block ||
+          g_str_equal(first_lower, "element") ||
+          g_str_equal(first_lower, "elements"))
+        {
+          const gint property_index = inside_element_block ? 0 : 1;
+
+          if (!inside_element_block)
+            {
+              inside_element_block = TRUE;
+              coord_mode = GDIS_GULP_COORD_NONE;
+            }
+
+          if (token_count > property_index &&
+              g_ascii_strcasecmp(tokens[property_index], "end") == 0)
+            {
+              inside_element_block = FALSE;
+              continue;
+            }
+
+          if (token_count >= property_index + 3)
+            {
+              g_autofree gchar *property_lower = NULL;
+              const gchar *symbol_text;
+              const GdisElementInfo *element_info = NULL;
+              gdouble radius;
+              gchar *symbol = NULL;
+              guint atomic_number;
+
+              property_lower = g_ascii_strdown(tokens[property_index], -1);
+              if (!g_str_equal(property_lower, "cova") &&
+                  !g_str_equal(property_lower, "covalent"))
+                continue;
+
+              symbol_text = tokens[property_index + 1];
+              if (gdis_try_parse_uint(symbol_text, &atomic_number))
+                element_info = gdis_element_lookup_atomic_number(atomic_number);
+
+              if (element_info && element_info->symbol && element_info->symbol[0] != '\0')
+                symbol = g_strdup(element_info->symbol);
+              else
+                symbol = gdis_normalize_element_symbol(symbol_text);
+
+              if (symbol &&
+                  symbol[0] != '\0' &&
+                  gdis_try_parse_double_relaxed(tokens[property_index + 2], &radius))
+                gdis_model_set_element_covalent_override(model, symbol, radius);
+
+              g_free(symbol);
+            }
+          continue;
+        }
+
+      if (g_str_equal(first_lower, "species"))
+        {
+          gboolean species_count_limited = FALSE;
+          guint species_remaining = 0u;
+
+          if (token_count > 1 && gdis_try_parse_uint(tokens[1], &species_remaining))
+            species_count_limited = TRUE;
+
+          for (;;)
+            {
+              guint next_index;
+              gchar *species_line;
+              gchar *species_trimmed;
+              g_auto(GStrv) species_tokens = NULL;
+              gint species_token_count = 0;
+
+              if (species_count_limited && species_remaining == 0u)
+                break;
+
+              next_index = i + 1u;
+              if (lines[next_index] == NULL)
+                break;
+
+              species_line = lines[next_index];
+              g_strchomp(species_line);
+              species_trimmed = g_strstrip(species_line);
+              if (species_trimmed[0] == '\0' || species_trimmed[0] == '#')
+                {
+                  i = next_index;
+                  continue;
+                }
+
+              species_tokens = gdis_split_simple(species_trimmed, &species_token_count);
+              if (species_token_count <= 0)
+                {
+                  i = next_index;
+                  continue;
+                }
+
+              if (g_ascii_strcasecmp(species_tokens[0], "end") == 0)
+                {
+                  i = next_index;
+                  break;
+                }
+
+              {
+                const gchar *type_name;
+                gint charge_index;
+                gdouble parsed_charge;
+
+                if (species_token_count >= 3 &&
+                    (gdis_gulp_type_is_core(species_tokens[1]) ||
+                     gdis_gulp_type_is_shell(species_tokens[1])))
+                  {
+                    type_name = species_tokens[1];
+                    charge_index = 2;
+                  }
+                else if (species_token_count >= 2)
+                  {
+                    type_name = "core";
+                    charge_index = 1;
+                  }
+                else
+                  {
+                    break;
+                  }
+
+                if (gdis_try_parse_double_relaxed(species_tokens[charge_index], &parsed_charge))
+                  {
+                    gdouble *stored_charge;
+                    g_autofree gchar *exact_key = NULL;
+                    g_autofree gchar *element_symbol = NULL;
+                    g_autofree gchar *element_key = NULL;
+
+                    stored_charge = g_new(gdouble, 1);
+                    *stored_charge = parsed_charge;
+                    exact_key = gdis_gulp_make_species_key(species_tokens[0], type_name);
+                    g_hash_table_replace(species_charges,
+                                         g_strdup(exact_key),
+                                         stored_charge);
+
+                    element_symbol = gdis_normalize_element_symbol(species_tokens[0]);
+                    if (element_symbol &&
+                        element_symbol[0] != '\0' &&
+                        g_ascii_strcasecmp(element_symbol, species_tokens[0]) != 0)
+                      {
+                        gdouble *element_charge;
+
+                        element_charge = g_new(gdouble, 1);
+                        *element_charge = parsed_charge;
+                        element_key = gdis_gulp_make_species_key(element_symbol, type_name);
+                        g_hash_table_replace(species_charges,
+                                             g_strdup(element_key),
+                                             element_charge);
+                      }
+                  }
+                else
+                  {
+                    break;
+                  }
+              }
+
+              i = next_index;
+              if (species_count_limited && species_remaining > 0u)
+                species_remaining--;
+            }
+          continue;
+        }
+
       if (g_str_equal(first_lower, "name"))
         {
           const gchar *name_text;
 
           if (seen_name && model->atoms->len > 0u)
-            break;
+            {
+              ignore_additional_geometry = TRUE;
+              coord_mode = GDIS_GULP_COORD_NONE;
+              current_region = -1;
+              continue;
+            }
 
           seen_name = TRUE;
           name_text = trimmed + strlen(tokens[0]);
@@ -3282,6 +3786,9 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (g_str_equal(first_lower, "space"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           if (token_count > 1)
             {
               const gchar *space_text;
@@ -3307,6 +3814,7 @@ gdis_model_load_gulp_input_like(GdisModel *model,
                 {
                   g_clear_pointer(&model->space_group, g_free);
                   model->space_group = g_strdup(space_trimmed);
+                  i++;
                 }
             }
           continue;
@@ -3314,6 +3822,9 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (g_str_equal(first_lower, "cell") || g_str_equal(first_lower, "scell"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           gdouble values[6] = {0.0, 0.0, 0.0, 90.0, 90.0, 90.0};
           const gboolean is_surface_cell = g_str_equal(first_lower, "scell");
           const guint required = is_surface_cell ? 3u : 6u;
@@ -3402,6 +3913,9 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (g_str_equal(first_lower, "vectors"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           gdouble a_vec[3];
           gdouble b_vec[3];
           gdouble c_vec[3];
@@ -3451,6 +3965,9 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (g_str_equal(first_lower, "svectors"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           gdouble values[3];
           gdouble c_vec[3];
 
@@ -3502,6 +4019,9 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (g_str_equal(first_lower, "region"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           guint parsed_region;
 
           if (token_count > 1 && gdis_try_parse_uint(tokens[1], &parsed_region))
@@ -3509,20 +4029,41 @@ gdis_model_load_gulp_input_like(GdisModel *model,
           continue;
         }
 
+      if (g_str_equal(first_lower, "origin"))
+        {
+          if (ignore_additional_geometry)
+            continue;
+
+          guint parsed_origin;
+
+          if (token_count > 1 && gdis_try_parse_uint(tokens[1], &parsed_origin))
+            origin_choice = (gint) parsed_origin;
+          continue;
+        }
+
       if (g_str_equal(first_lower, "cartesian") || g_str_equal(first_lower, "cart"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           coord_mode = GDIS_GULP_COORD_CARTESIAN;
           continue;
         }
 
       if (g_str_equal(first_lower, "fractional") || g_str_equal(first_lower, "frac"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           coord_mode = GDIS_GULP_COORD_FRACTIONAL;
           continue;
         }
 
       if (g_str_equal(first_lower, "sfractional") || g_str_equal(first_lower, "sfrac"))
         {
+          if (ignore_additional_geometry)
+            continue;
+
           coord_mode = GDIS_GULP_COORD_SURFACE_FRACTIONAL;
           for (gint j = 1; j + 1 < token_count; j++)
             {
@@ -3539,9 +4080,17 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
       if (coord_mode != GDIS_GULP_COORD_NONE && token_count >= 4)
         {
+          if (ignore_additional_geometry)
+            continue;
+
+          GdisAtom *atom;
           g_autofree gchar *type = NULL;
           gdouble values[3];
           gdouble cart[3];
+          gdouble charge = 0.0;
+          const gdouble *mapped_charge = NULL;
+          gdouble occupancy;
+          gboolean have_charge = FALSE;
           gboolean is_core = FALSE;
           gboolean is_shell = FALSE;
           gboolean has_explicit_type = FALSE;
@@ -3570,22 +4119,18 @@ gdis_model_load_gulp_input_like(GdisModel *model,
               continue;
             }
 
+          if (!g_ascii_isalpha(tokens[0][0]))
+            continue;
+
           if (token_count >= 5)
             {
               type = g_ascii_strdown(tokens[1], -1);
-              is_core = g_str_equal(type, "core") ||
-                        g_str_equal(tokens[1], "c") ||
-                        g_str_has_prefix(type, "bcor");
-              is_shell = g_str_has_prefix(type, "shel") ||
-                         g_str_equal(tokens[1], "s") ||
-                         g_str_has_prefix(type, "bshe");
+              is_core = gdis_gulp_type_is_core(type);
+              is_shell = gdis_gulp_type_is_shell(type);
               has_explicit_type = is_core || is_shell;
               if (has_explicit_type)
                 coord_start = 2;
             }
-
-          if (is_shell)
-            continue;
 
           if (coord_start + 2 < token_count &&
               gdis_try_parse_double_relaxed(tokens[coord_start], &values[0]) &&
@@ -3606,6 +4151,50 @@ gdis_model_load_gulp_input_like(GdisModel *model,
 
           if (!exact_coords)
             continue;
+
+          if (coord_mode == GDIS_GULP_COORD_FRACTIONAL)
+            saw_fractional_atoms = TRUE;
+          else
+            saw_non_fractional_atoms = TRUE;
+
+          if (coord_start + 3 < token_count &&
+              token_count == coord_start + 4 &&
+              gdis_try_parse_double_relaxed(tokens[coord_start + 3], &charge))
+            {
+              have_charge = TRUE;
+            }
+          else if (coord_start + 4 < token_count &&
+              gdis_try_parse_double_relaxed(tokens[coord_start + 3], &charge))
+            {
+              have_charge = TRUE;
+            }
+          else if (coord_start + 3 < token_count &&
+                   gdis_try_parse_double_relaxed(tokens[coord_start + 3], &charge) &&
+                   fabs(charge) > 1.05)
+            {
+              have_charge = TRUE;
+            }
+
+          occupancy = 1.0;
+          if (coord_start + 4 < token_count)
+            {
+              gdouble parsed_occupancy;
+
+              if (gdis_try_parse_double_relaxed(tokens[coord_start + 4], &parsed_occupancy) &&
+                  parsed_occupancy >= 0.0 &&
+                  parsed_occupancy <= 1.05)
+                occupancy = parsed_occupancy;
+            }
+          else if (!have_charge &&
+                   coord_start + 3 < token_count)
+            {
+              gdouble parsed_occupancy;
+
+              if (gdis_try_parse_double_relaxed(tokens[coord_start + 3], &parsed_occupancy) &&
+                  parsed_occupancy >= 0.0 &&
+                  parsed_occupancy <= 1.05)
+                occupancy = parsed_occupancy;
+            }
 
           if (coord_mode == GDIS_GULP_COORD_CARTESIAN)
             {
@@ -3640,21 +4229,132 @@ gdis_model_load_gulp_input_like(GdisModel *model,
             }
 
           element = gdis_normalize_element_symbol(tokens[0]);
+          if (!have_charge)
+            {
+              mapped_charge = gdis_gulp_lookup_species_charge(species_charges,
+                                                              tokens[0],
+                                                              element,
+                                                              is_shell ? "shell" : "core");
+              if (mapped_charge)
+                {
+                  charge = *mapped_charge;
+                  have_charge = TRUE;
+                }
+            }
+
+            {
+              GdisAtom *charge_atom;
+
+              charge_atom = gdis_atom_new(tokens[0],
+                                          element,
+                                          has_explicit_type ? tokens[1] : "core",
+                                          cart[0],
+                                          cart[1],
+                                          cart[2],
+                                          occupancy,
+                                          (coord_mode == GDIS_GULP_COORD_SURFACE_FRACTIONAL)
+                                            ? current_region
+                                            : -1,
+                                          charge_atoms->len + 1u);
+              if (have_charge)
+                {
+                  charge_atom->charge = charge;
+                  charge_atom->has_charge = TRUE;
+                }
+              g_ptr_array_add(charge_atoms, charge_atom);
+            }
+
+          if (is_shell)
+            continue;
+
           region = (coord_mode == GDIS_GULP_COORD_SURFACE_FRACTIONAL) ? current_region : -1;
-          g_ptr_array_add(model->atoms,
-                          gdis_atom_new(tokens[0],
-                                        element,
-                                        element,
-                                        cart[0],
-                                        cart[1],
-                                        cart[2],
-                                        1.0,
-                                        region,
-                                        model->atoms->len + 1u));
+          atom = gdis_atom_new(tokens[0],
+                               element,
+                               tokens[0],
+                               cart[0],
+                               cart[1],
+                               cart[2],
+                               occupancy,
+                               region,
+                               model->atoms->len + 1u);
+          if (have_charge)
+            {
+              atom->charge = charge;
+              atom->has_charge = TRUE;
+            }
+          g_ptr_array_add(model->atoms, atom);
         }
     }
 
   g_strfreev(lines);
+
+  for (guint i = 0; i < charge_atoms->len; i++)
+    {
+      GdisAtom *charge_atom;
+      const gdouble *resolved_charge;
+
+      charge_atom = g_ptr_array_index(charge_atoms, i);
+      if (!charge_atom || charge_atom->has_charge)
+        continue;
+
+      resolved_charge = gdis_gulp_lookup_species_charge(species_charges,
+                                                        charge_atom->label,
+                                                        charge_atom->element,
+                                                        charge_atom->ff_type);
+      if (!resolved_charge)
+        continue;
+
+      charge_atom->charge = *resolved_charge;
+      charge_atom->has_charge = TRUE;
+    }
+
+  for (guint i = 0; i < model->atoms->len; i++)
+    {
+      GdisAtom *atom_iter;
+      const gdouble *resolved_charge;
+
+      atom_iter = g_ptr_array_index(model->atoms, i);
+      if (!atom_iter || atom_iter->has_charge)
+        continue;
+
+      resolved_charge = gdis_gulp_lookup_species_charge(species_charges,
+                                                        atom_iter->label,
+                                                        atom_iter->element,
+                                                        "core");
+      if (!resolved_charge)
+        continue;
+
+      atom_iter->charge = *resolved_charge;
+      atom_iter->has_charge = TRUE;
+    }
+
+  if (charge_atoms->len > 0u &&
+      gdis_model_sum_known_charge_atoms(charge_atoms,
+                                        model->periodic,
+                                        model->periodicity,
+                                        model->cell_lengths,
+                                        model->cell_angles,
+                                        model->space_group,
+                                        origin_choice,
+                                        saw_fractional_atoms &&
+                                          !saw_non_fractional_atoms &&
+                                          model->periodic &&
+                                          model->periodicity == 3u &&
+                                          model->space_group &&
+                                          model->space_group[0] != '\0',
+                                        &model->total_charge_e))
+    model->has_total_charge = TRUE;
+
+  g_ptr_array_free(charge_atoms, TRUE);
+  g_hash_table_unref(species_charges);
+
+  if (saw_fractional_atoms &&
+      !saw_non_fractional_atoms &&
+      model->periodic &&
+      model->periodicity == 3u &&
+      model->space_group &&
+      model->space_group[0] != '\0')
+    gdis_model_expand_space_group_atoms(model, origin_choice);
 
   if (model->atoms->len == 0u)
     {
@@ -3693,8 +4393,29 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   gdouble context_lengths[3];
   gdouble context_angles[3];
   gboolean context_have_surface_vectors;
+  g_autofree gchar *context_space_group = NULL;
   gdouble context_surface_a[3];
   gdouble context_surface_b[3];
+  g_autofree gchar *best_space_group = NULL;
+  gboolean best_from_fractional_block;
+  guint best_priority;
+  guint best_config_index;
+  guint selected_config_index;
+  guint current_config_index;
+  gboolean inside_output_config;
+  gboolean selected_context_valid;
+  gboolean selected_context_periodic;
+  guint selected_context_periodicity;
+  gdouble selected_context_lengths[3];
+  gdouble selected_context_angles[3];
+  gboolean selected_context_have_surface_vectors;
+  guint best_charge_priority;
+  guint best_charge_config_index;
+  gboolean best_has_total_charge;
+  gboolean selected_config_has_shell_species;
+  g_autofree gchar *selected_context_space_group = NULL;
+  gdouble selected_context_surface_a[3];
+  gdouble selected_context_surface_b[3];
 
   g_return_val_if_fail(model != NULL, FALSE);
   g_return_val_if_fail(contents != NULL, FALSE);
@@ -3711,8 +4432,26 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   context_lengths[0] = context_lengths[1] = context_lengths[2] = 0.0;
   context_angles[0] = context_angles[1] = context_angles[2] = 90.0;
   context_have_surface_vectors = FALSE;
+  best_from_fractional_block = FALSE;
+  best_priority = 0u;
+  best_config_index = 0u;
+  selected_config_index = 0u;
+  current_config_index = 0u;
+  inside_output_config = FALSE;
+  selected_context_valid = FALSE;
+  selected_context_periodic = FALSE;
+  selected_context_periodicity = 0u;
+  selected_context_lengths[0] = selected_context_lengths[1] = selected_context_lengths[2] = 0.0;
+  selected_context_angles[0] = selected_context_angles[1] = selected_context_angles[2] = 90.0;
+  selected_context_have_surface_vectors = FALSE;
+  best_charge_priority = 0u;
+  best_charge_config_index = 0u;
+  best_has_total_charge = FALSE;
+  selected_config_has_shell_species = FALSE;
   gdis_vec3_set(context_surface_a, 0.0, 0.0, 0.0);
   gdis_vec3_set(context_surface_b, 0.0, 0.0, 0.0);
+  gdis_vec3_set(selected_context_surface_a, 0.0, 0.0, 0.0);
+  gdis_vec3_set(selected_context_surface_b, 0.0, 0.0, 0.0);
 
   for (guint i = 0; lines[i] != NULL; i++)
     {
@@ -3728,6 +4467,297 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
         continue;
 
       lower = g_ascii_strdown(trimmed, -1);
+
+      if (current_config_index == selected_config_index &&
+          g_strstr_len(lower, -1, "final energy") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u)
+            {
+              model->energy_ev = values[0];
+              model->has_energy = TRUE;
+            }
+          continue;
+        }
+
+      if (current_config_index == selected_config_index &&
+          !model->has_energy &&
+          g_strstr_len(lower, -1, "total lattice energy") != NULL &&
+          g_strstr_len(lower, -1, "ev") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u)
+            {
+              model->energy_ev = values[0];
+              model->has_energy = TRUE;
+            }
+          continue;
+        }
+
+      if (current_config_index == selected_config_index &&
+          g_strstr_len(lower, -1, "density of cell") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u)
+            {
+              model->density_g_cm3 = values[0];
+              model->has_density = TRUE;
+            }
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "input for configuration") != NULL)
+        {
+          gdouble config_value[1];
+          const gchar *title_text;
+
+          if (gdis_collect_doubles_from_line(trimmed, config_value, 1u) >= 1u)
+            current_config_index = (guint) MAX(0.0, llround(config_value[0]));
+          else
+            current_config_index = 0u;
+
+          if (selected_config_index == 0u)
+            selected_config_index = current_config_index;
+
+          inside_output_config = FALSE;
+          context_periodic = FALSE;
+          context_periodicity = 0u;
+          context_lengths[0] = context_lengths[1] = context_lengths[2] = 0.0;
+          context_angles[0] = context_angles[1] = context_angles[2] = 90.0;
+          context_have_surface_vectors = FALSE;
+          g_clear_pointer(&context_space_group, g_free);
+          gdis_vec3_set(context_surface_a, 0.0, 0.0, 0.0);
+          gdis_vec3_set(context_surface_b, 0.0, 0.0, 0.0);
+
+          if (current_config_index == selected_config_index)
+            {
+              title_text = strchr(trimmed, ':');
+              if (title_text)
+                {
+                  g_autofree gchar *parsed_title = NULL;
+
+                  parsed_title = gdis_strdup_strip(title_text + 1);
+                  while (parsed_title && parsed_title[0] != '\0')
+                    {
+                      gsize len;
+
+                      len = strlen(parsed_title);
+                      if (len == 0u || parsed_title[len - 1] != '*')
+                        break;
+                      parsed_title[len - 1] = '\0';
+                      g_strstrip(parsed_title);
+                    }
+
+                  if (parsed_title && parsed_title[0] != '\0')
+                    {
+                      g_clear_pointer(&model->title, g_free);
+                      model->title = g_strdup(parsed_title);
+                    }
+                }
+            }
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "output for configuration") != NULL)
+        {
+          gdouble config_value[1];
+          const gchar *title_text;
+
+          if (gdis_collect_doubles_from_line(trimmed, config_value, 1u) >= 1u)
+            current_config_index = (guint) MAX(0.0, llround(config_value[0]));
+          else
+            current_config_index = 0u;
+
+          if (selected_config_index == 0u)
+            selected_config_index = current_config_index;
+
+          inside_output_config = TRUE;
+
+          if (current_config_index == selected_config_index && selected_context_valid)
+            {
+              context_periodic = selected_context_periodic;
+              context_periodicity = selected_context_periodicity;
+              memcpy(context_lengths, selected_context_lengths, sizeof(context_lengths));
+              memcpy(context_angles, selected_context_angles, sizeof(context_angles));
+              context_have_surface_vectors = selected_context_have_surface_vectors;
+              g_clear_pointer(&context_space_group, g_free);
+              context_space_group = selected_context_space_group
+                                      ? g_strdup(selected_context_space_group)
+                                      : NULL;
+              gdis_vec3_copy(context_surface_a, selected_context_surface_a);
+              gdis_vec3_copy(context_surface_b, selected_context_surface_b);
+            }
+
+          if (current_config_index == selected_config_index)
+            {
+              title_text = strchr(trimmed, ':');
+              if (title_text)
+                {
+                  g_autofree gchar *parsed_title = NULL;
+
+                  parsed_title = gdis_strdup_strip(title_text + 1);
+                  while (parsed_title && parsed_title[0] != '\0')
+                    {
+                      gsize len;
+
+                      len = strlen(parsed_title);
+                      if (len == 0u || parsed_title[len - 1] != '*')
+                        break;
+                      parsed_title[len - 1] = '\0';
+                      g_strstrip(parsed_title);
+                    }
+
+                  if (parsed_title && parsed_title[0] != '\0')
+                    {
+                      g_clear_pointer(&model->title, g_free);
+                      model->title = g_strdup(parsed_title);
+                    }
+                }
+            }
+          continue;
+        }
+
+      if (g_str_has_prefix(lower, "space group"))
+        {
+          const gchar *value_text;
+
+          value_text = strchr(trimmed, ':');
+          if (value_text)
+            {
+              g_autofree gchar *parsed_group = NULL;
+
+              value_text++;
+              while (*value_text && g_ascii_isspace(*value_text))
+                value_text++;
+
+              parsed_group = gdis_strdup_strip(value_text);
+              if (parsed_group && parsed_group[0] != '\0')
+                {
+                  g_clear_pointer(&context_space_group, g_free);
+                  context_space_group = g_steal_pointer(&parsed_group);
+                }
+            }
+
+          if (!inside_output_config &&
+              selected_config_index != 0u &&
+              current_config_index == selected_config_index)
+            {
+              selected_context_valid = TRUE;
+              selected_context_periodic = context_periodic;
+              selected_context_periodicity = context_periodicity;
+              memcpy(selected_context_lengths, context_lengths, sizeof(context_lengths));
+              memcpy(selected_context_angles, context_angles, sizeof(context_angles));
+              selected_context_have_surface_vectors = context_have_surface_vectors;
+              g_clear_pointer(&selected_context_space_group, g_free);
+              selected_context_space_group = context_space_group
+                                               ? g_strdup(context_space_group)
+                                               : NULL;
+              gdis_vec3_copy(selected_context_surface_a, context_surface_a);
+              gdis_vec3_copy(selected_context_surface_b, context_surface_b);
+            }
+          continue;
+        }
+
+      if (g_str_has_prefix(lower, "non-standard setting of group"))
+        {
+          const gchar *value_text;
+
+          value_text = strchr(trimmed, ':');
+          if (value_text)
+            {
+              g_autofree gchar *parsed_group = NULL;
+
+              value_text++;
+              while (*value_text && g_ascii_isspace(*value_text))
+                value_text++;
+
+              parsed_group = gdis_strdup_strip(value_text);
+              if (parsed_group && parsed_group[0] != '\0')
+                {
+                  g_clear_pointer(&context_space_group, g_free);
+                  context_space_group = g_steal_pointer(&parsed_group);
+                }
+            }
+
+          if (!inside_output_config &&
+              selected_config_index != 0u &&
+              current_config_index == selected_config_index)
+            {
+              selected_context_valid = TRUE;
+              selected_context_periodic = context_periodic;
+              selected_context_periodicity = context_periodicity;
+              memcpy(selected_context_lengths, context_lengths, sizeof(context_lengths));
+              memcpy(selected_context_angles, context_angles, sizeof(context_angles));
+              selected_context_have_surface_vectors = context_have_surface_vectors;
+              g_clear_pointer(&selected_context_space_group, g_free);
+              selected_context_space_group = context_space_group
+                                               ? g_strdup(context_space_group)
+                                               : NULL;
+              gdis_vec3_copy(selected_context_surface_a, context_surface_a);
+              gdis_vec3_copy(selected_context_surface_b, context_surface_b);
+            }
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "species output for") != NULL)
+        {
+          gboolean parsed_any;
+          guint scan_index;
+
+          parsed_any = FALSE;
+          scan_index = i + 1u;
+          while (lines[scan_index] != NULL)
+            {
+              gchar *species_line;
+              gchar *species_trimmed;
+              g_auto(GStrv) species_tokens = NULL;
+              gint species_token_count = 0;
+              gdouble radius;
+              g_autofree gchar *symbol = NULL;
+
+              species_line = lines[scan_index];
+              g_strchomp(species_line);
+              species_trimmed = g_strstrip(species_line);
+              if (species_trimmed[0] == '\0')
+                {
+                  scan_index++;
+                  continue;
+                }
+              if (species_trimmed[0] == '-' || species_trimmed[0] == '*')
+                {
+                  scan_index++;
+                  continue;
+                }
+
+              species_tokens = gdis_split_simple(species_trimmed, &species_token_count);
+              if (species_token_count >= 6 &&
+                  g_ascii_isalpha(species_tokens[0][0]) &&
+                  gdis_try_parse_double_relaxed(species_tokens[5], &radius))
+                {
+                  if (current_config_index == selected_config_index &&
+                      species_token_count > 1 &&
+                      g_ascii_strncasecmp(species_tokens[1], "shell", 5) == 0)
+                    selected_config_has_shell_species = TRUE;
+                  symbol = gdis_normalize_element_symbol(species_tokens[0]);
+                  if (symbol && symbol[0] != '\0')
+                    gdis_model_set_element_covalent_override(model, symbol, radius);
+                  parsed_any = TRUE;
+                  scan_index++;
+                  continue;
+                }
+
+              if (parsed_any)
+                break;
+              scan_index++;
+            }
+
+          if (scan_index > i + 1u)
+            i = scan_index - 1u;
+          continue;
+        }
 
       if (g_strstr_len(lower, -1, "cartesian lattice vectors (angstroms)") != NULL)
         {
@@ -3803,6 +4833,24 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
 
           if (scan_index > i + 1u)
             i = scan_index - 1u;
+
+          if (!inside_output_config &&
+              selected_config_index != 0u &&
+              current_config_index == selected_config_index)
+            {
+              selected_context_valid = TRUE;
+              selected_context_periodic = context_periodic;
+              selected_context_periodicity = context_periodicity;
+              memcpy(selected_context_lengths, context_lengths, sizeof(context_lengths));
+              memcpy(selected_context_angles, context_angles, sizeof(context_angles));
+              selected_context_have_surface_vectors = context_have_surface_vectors;
+              g_clear_pointer(&selected_context_space_group, g_free);
+              selected_context_space_group = context_space_group
+                                               ? g_strdup(context_space_group)
+                                               : NULL;
+              gdis_vec3_copy(selected_context_surface_a, context_surface_a);
+              gdis_vec3_copy(selected_context_surface_b, context_surface_b);
+            }
           continue;
         }
 
@@ -3873,6 +4921,24 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
 
           if (scan_index > i + 1u)
             i = scan_index - 1u;
+
+          if (!inside_output_config &&
+              selected_config_index != 0u &&
+              current_config_index == selected_config_index)
+            {
+              selected_context_valid = TRUE;
+              selected_context_periodic = context_periodic;
+              selected_context_periodicity = context_periodicity;
+              memcpy(selected_context_lengths, context_lengths, sizeof(context_lengths));
+              memcpy(selected_context_angles, context_angles, sizeof(context_angles));
+              selected_context_have_surface_vectors = context_have_surface_vectors;
+              g_clear_pointer(&selected_context_space_group, g_free);
+              selected_context_space_group = context_space_group
+                                               ? g_strdup(context_space_group)
+                                               : NULL;
+              gdis_vec3_copy(selected_context_surface_a, context_surface_a);
+              gdis_vec3_copy(selected_context_surface_b, context_surface_b);
+            }
           continue;
         }
 
@@ -3889,6 +4955,7 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
       if (mode != GDIS_GULP_BLOCK_NONE)
         {
           GPtrArray *block_atoms;
+          GPtrArray *block_charge_atoms;
           gboolean block_periodic;
           guint block_periodicity;
           gdouble block_lengths[3];
@@ -3904,6 +4971,7 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
           GdisModel block_reference = {0};
 
           block_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+          block_charge_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
           block_periodic = context_periodic;
           block_periodicity = context_periodicity;
           memcpy(block_lengths, context_lengths, sizeof(block_lengths));
@@ -3937,6 +5005,8 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
               guint serial = 0u;
               gdouble values[3];
               gdouble cart[3];
+              gdouble charge = 0.0;
+              gboolean have_charge = FALSE;
               g_autofree gchar *element = NULL;
               g_autofree gchar *type = NULL;
 
@@ -3994,11 +5064,6 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
                 continue;
 
               type = (token_count > 2) ? g_ascii_strdown(tokens[2], -1) : g_strdup("c");
-              if (g_str_has_prefix(type, "shel") || g_str_equal(type, "s"))
-                {
-                  block_had_rows = TRUE;
-                  continue;
-                }
 
               if (mode == GDIS_GULP_BLOCK_CART)
                 {
@@ -4036,36 +5101,140 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
                     }
                 }
 
+              if (mode == GDIS_GULP_BLOCK_FRACTIONAL)
+                {
+                  gdouble numeric_values[8];
+                  guint numeric_count;
+
+                  numeric_count = 0u;
+                  for (gint token_index = 2; token_index < token_count && numeric_count < G_N_ELEMENTS(numeric_values); token_index++)
+                    {
+                      gdouble parsed_value;
+
+                      if (!gdis_try_parse_double_relaxed(tokens[token_index], &parsed_value))
+                        continue;
+                      numeric_values[numeric_count++] = parsed_value;
+                    }
+                  if (numeric_count >= 5u)
+                    {
+                      charge = numeric_values[3];
+                      have_charge = TRUE;
+                    }
+                }
+
               element = gdis_normalize_element_symbol(tokens[1]);
-              g_ptr_array_add(block_atoms,
-                              gdis_atom_new(tokens[1],
-                                            element,
-                                            element,
-                                            cart[0],
-                                            cart[1],
-                                            cart[2],
-                                            1.0,
-                                            (mode == GDIS_GULP_BLOCK_SURFACE_MIXED)
-                                              ? block_region
-                                              : -1,
-                                            serial));
+              if (have_charge)
+                {
+                  GdisAtom *charge_atom;
+
+                  charge_atom = gdis_atom_new(tokens[1],
+                                              element,
+                                              type ? type : element,
+                                              cart[0],
+                                              cart[1],
+                                              cart[2],
+                                              1.0,
+                                              (mode == GDIS_GULP_BLOCK_SURFACE_MIXED)
+                                                ? block_region
+                                                : -1,
+                                              serial);
+                  charge_atom->charge = charge;
+                  charge_atom->has_charge = TRUE;
+                  g_ptr_array_add(block_charge_atoms, charge_atom);
+                }
+
+              if (g_str_has_prefix(type, "shel") || g_str_equal(type, "s"))
+                {
+                  block_had_rows = TRUE;
+                  continue;
+                }
+
+              {
+                GdisAtom *atom;
+
+                atom = gdis_atom_new(tokens[1],
+                                     element,
+                                     element,
+                                     cart[0],
+                                     cart[1],
+                                     cart[2],
+                                     1.0,
+                                     (mode == GDIS_GULP_BLOCK_SURFACE_MIXED)
+                                       ? block_region
+                                       : -1,
+                                     serial);
+                if (have_charge)
+                  {
+                    atom->charge = charge;
+                    atom->has_charge = TRUE;
+                  }
+                g_ptr_array_add(block_atoms, atom);
+              }
               block_had_rows = TRUE;
             }
 
           if (block_atoms->len > 0u)
             {
-              if (best_atoms)
-                g_ptr_array_free(best_atoms, TRUE);
-              best_atoms = block_atoms;
-              best_periodic = block_periodic;
-              best_periodicity = block_periodicity;
-              memcpy(best_lengths, block_lengths, sizeof(best_lengths));
-              memcpy(best_angles, block_angles, sizeof(best_angles));
+              const gboolean allow_block = (selected_config_index == 0u ||
+                                            current_config_index == 0u ||
+                                            current_config_index == selected_config_index);
+              const guint block_priority = inside_output_config ? 2u : 1u;
+              gdouble block_total_charge;
+
+              if (allow_block &&
+                  (!best_atoms ||
+                   block_priority > best_priority ||
+                   (block_priority == best_priority &&
+                    current_config_index == best_config_index)))
+                {
+                  if (best_atoms)
+                    g_ptr_array_free(best_atoms, TRUE);
+                  best_atoms = block_atoms;
+                  g_clear_pointer(&best_space_group, g_free);
+                  best_space_group = context_space_group ? g_strdup(context_space_group) : NULL;
+                  best_from_fractional_block = (mode == GDIS_GULP_BLOCK_FRACTIONAL);
+                  best_periodic = block_periodic;
+                  best_periodicity = block_periodicity;
+                  best_priority = block_priority;
+                  best_config_index = current_config_index;
+                  memcpy(best_lengths, block_lengths, sizeof(best_lengths));
+                  memcpy(best_angles, block_angles, sizeof(best_angles));
+                }
+              else
+                {
+                  g_ptr_array_free(block_atoms, TRUE);
+                }
+
+              if (allow_block &&
+                  block_charge_atoms->len > 0u &&
+                  gdis_model_sum_charge_atoms(block_charge_atoms,
+                                              block_periodic,
+                                              block_periodicity,
+                                              block_lengths,
+                                              block_angles,
+                                              context_space_group,
+                                              0,
+                                              mode == GDIS_GULP_BLOCK_FRACTIONAL,
+                                              &block_total_charge) &&
+                  (!selected_config_has_shell_species ||
+                   fabs(block_total_charge) <= 1.0e-3) &&
+                  (!best_has_total_charge ||
+                   block_priority > best_charge_priority ||
+                   (block_priority == best_charge_priority &&
+                    current_config_index == best_charge_config_index)))
+                {
+                  model->has_total_charge = TRUE;
+                  model->total_charge_e = block_total_charge;
+                  best_has_total_charge = TRUE;
+                  best_charge_priority = block_priority;
+                  best_charge_config_index = current_config_index;
+                }
             }
           else
             {
               g_ptr_array_free(block_atoms, TRUE);
             }
+          g_ptr_array_free(block_charge_atoms, TRUE);
 
           continue;
         }
@@ -4174,8 +5343,65 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   model->periodicity = best_periodicity;
   memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
   memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+  if (best_space_group && best_space_group[0] != '\0')
+    {
+      g_clear_pointer(&model->space_group, g_free);
+      model->space_group = g_strdup(best_space_group);
+    }
+
+  if (best_from_fractional_block &&
+      model->periodic &&
+      model->periodicity == 3u &&
+      model->space_group &&
+      model->space_group[0] != '\0')
+    gdis_model_expand_space_group_atoms(model, 0);
 
   return TRUE;
+}
+
+static gchar *
+gdis_xtl_compose_space_group(const gchar *label,
+                             guint number,
+                             const gchar *qualifier)
+{
+  g_autofree gchar *base = NULL;
+  g_autofree gchar *qualifier_lower = NULL;
+
+  if (label && label[0] != '\0')
+    base = gdis_strdup_strip(label);
+  else if (number > 0u)
+    base = g_strdup_printf("%u", number);
+
+  if (!base || base[0] == '\0')
+    return NULL;
+
+  if (!qualifier || qualifier[0] == '\0' || strchr(base, ':') != NULL)
+    return g_steal_pointer(&base);
+
+  qualifier_lower = g_ascii_strdown(qualifier, -1);
+  g_strstrip(qualifier_lower);
+
+  if (g_str_has_prefix(qualifier_lower, "origin_"))
+    {
+      const gchar *origin_text;
+
+      origin_text = qualifier_lower + strlen("origin_");
+      if (origin_text[0] != '\0')
+        return g_strdup_printf("%s:%s", base, origin_text);
+    }
+
+  if (g_str_equal(qualifier_lower, "hexagonal"))
+    return g_strdup_printf("%s:H", base);
+  if (g_str_equal(qualifier_lower, "rhombohedral"))
+    return g_strdup_printf("%s:R", base);
+  if (g_str_equal(qualifier_lower, "a_unique"))
+    return g_strdup_printf("%s:a", base);
+  if (g_str_equal(qualifier_lower, "b_unique"))
+    return g_strdup_printf("%s:b", base);
+  if (g_str_equal(qualifier_lower, "c_unique"))
+    return g_strdup_printf("%s:c", base);
+
+  return g_steal_pointer(&base);
 }
 
 static gboolean
@@ -4184,8 +5410,12 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
   gchar **lines;
   gboolean in_atoms;
   gboolean have_cell_matrix;
+  gboolean atoms_are_fractional;
   gdouble cell_matrix[9];
   gdouble cell_inverse[9];
+  guint symmetry_number;
+  g_autofree gchar *symmetry_label = NULL;
+  g_autofree gchar *symmetry_qualifier = NULL;
 
   g_return_val_if_fail(model != NULL, FALSE);
   g_return_val_if_fail(contents != NULL, FALSE);
@@ -4193,6 +5423,10 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
   lines = g_strsplit(contents, "\n", -1);
   in_atoms = FALSE;
   have_cell_matrix = FALSE;
+  atoms_are_fractional = TRUE;
+  symmetry_number = 0u;
+  model->periodic = TRUE;
+  model->periodicity = 3u;
 
   for (guint i = 0; lines[i] != NULL; i++)
     {
@@ -4229,22 +5463,39 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
           continue;
         }
 
+      if (g_str_equal(first_lower, "dimension"))
+        {
+          guint parsed_dimension;
+
+          if (token_count > 1 && gdis_try_parse_uint(tokens[1], &parsed_dimension))
+            {
+              if (parsed_dimension >= 1u && parsed_dimension <= 3u)
+                {
+                  model->periodic = TRUE;
+                  model->periodicity = parsed_dimension;
+                }
+            }
+          continue;
+        }
+
       if (g_str_equal(first_lower, "cell"))
         {
-          gdouble values[6] = {0.0, 0.0, 0.0, 90.0, 90.0, 90.0};
+          gdouble values[6] = {0.0, 0.0, 1.0, 90.0, 90.0, 90.0};
+          guint required;
           guint found;
           guint line_index;
 
-          found = gdis_collect_doubles_from_line(trimmed, values, 6u);
+          required = (model->periodicity == 2u) ? 3u : 6u;
+          found = gdis_collect_doubles_from_line(trimmed, values, required);
           line_index = i;
-          while (found < 6u && lines[line_index + 1] != NULL)
+          while (found < required && lines[line_index + 1] != NULL)
             {
               guint added;
 
               line_index++;
               added = gdis_collect_doubles_from_line(lines[line_index],
                                                      values + found,
-                                                     6u - found);
+                                                     required - found);
               if (added == 0u)
                 {
                   line_index--;
@@ -4254,12 +5505,24 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
             }
           i = line_index;
 
-          if (found >= 6u)
+          if (found >= required)
             {
-              memcpy(model->cell_lengths, values, 3u * sizeof(gdouble));
-              memcpy(model->cell_angles, values + 3, 3u * sizeof(gdouble));
-              model->periodic = TRUE;
-              model->periodicity = 3u;
+              if (model->periodicity == 2u)
+                {
+                  model->cell_lengths[0] = values[0];
+                  model->cell_lengths[1] = values[1];
+                  model->cell_lengths[2] = 1.0;
+                  model->cell_angles[0] = 90.0;
+                  model->cell_angles[1] = 90.0;
+                  model->cell_angles[2] = values[2];
+                }
+              else
+                {
+                  memcpy(model->cell_lengths, values, 3u * sizeof(gdouble));
+                  memcpy(model->cell_angles, values + 3, 3u * sizeof(gdouble));
+                  model->periodic = TRUE;
+                  model->periodicity = 3u;
+                }
               have_cell_matrix = gdis_model_build_cell_matrix(model,
                                                               cell_matrix,
                                                               cell_inverse);
@@ -4269,30 +5532,88 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
 
       if (g_str_equal(first_lower, "symmetry"))
         {
-          for (gint j = 1; j + 1 < token_count; j++)
+          for (gint j = 1; j < token_count; )
             {
               g_autofree gchar *keyword = g_ascii_strdown(tokens[j], -1);
-              if (g_str_equal(keyword, "label"))
-                {
-                  GString *space_group;
 
-                  space_group = g_string_new(tokens[j + 1]);
-                  for (gint k = j + 2; k < token_count; k++)
-                    {
-                      g_string_append_c(space_group, ' ');
-                      g_string_append(space_group, tokens[k]);
-                    }
-                  g_clear_pointer(&model->space_group, g_free);
-                  model->space_group = g_string_free(space_group, FALSE);
-                  break;
+              if (g_str_equal(keyword, "number") && j + 1 < token_count)
+                {
+                  guint parsed_number;
+
+                  if (gdis_try_parse_uint(tokens[j + 1], &parsed_number))
+                    symmetry_number = parsed_number;
+                  j += 2;
+                  continue;
                 }
+
+              if ((g_str_equal(keyword, "label") ||
+                   g_str_equal(keyword, "qualifier")) &&
+                  j + 1 < token_count)
+                {
+                  GString *value;
+
+                  value = g_string_new("");
+                  for (j = j + 1; j < token_count; j++)
+                    {
+                      g_autofree gchar *next_keyword = NULL;
+
+                      next_keyword = g_ascii_strdown(tokens[j], -1);
+                      if (g_str_equal(next_keyword, "number") ||
+                          g_str_equal(next_keyword, "label") ||
+                          g_str_equal(next_keyword, "qualifier"))
+                        break;
+
+                      if (value->len > 0)
+                        g_string_append_c(value, ' ');
+                      g_string_append(value, tokens[j]);
+                    }
+
+                  if (g_str_equal(keyword, "label"))
+                    {
+                      g_clear_pointer(&symmetry_label, g_free);
+                      symmetry_label = g_string_free(value, FALSE);
+                    }
+                  else
+                    {
+                      g_clear_pointer(&symmetry_qualifier, g_free);
+                      symmetry_qualifier = g_string_free(value, FALSE);
+                    }
+                  continue;
+                }
+
+              j++;
             }
+
+          g_clear_pointer(&model->space_group, g_free);
+          model->space_group = gdis_xtl_compose_space_group(symmetry_label,
+                                                            symmetry_number,
+                                                            symmetry_qualifier);
           continue;
         }
 
       if (g_str_equal(first_lower, "atoms"))
         {
           in_atoms = TRUE;
+          atoms_are_fractional = TRUE;
+          if (lines[i + 1] != NULL)
+            {
+              g_auto(GStrv) header_tokens = NULL;
+              gint header_count = 0;
+
+              header_tokens = gdis_split_simple(lines[i + 1], &header_count);
+              for (gint h = 0; h < header_count; h++)
+                {
+                  g_autofree gchar *header_lower = g_ascii_strdown(header_tokens[h], -1);
+
+                  if (g_str_equal(header_lower, "carx") ||
+                      g_str_equal(header_lower, "cary") ||
+                      g_str_equal(header_lower, "carz"))
+                    {
+                      atoms_are_fractional = FALSE;
+                      break;
+                    }
+                }
+            }
           continue;
         }
 
@@ -4312,7 +5633,7 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
           if (!gdis_collect_three_doubles_from_tokens(tokens, token_count, 1, frac_or_cart))
             continue;
 
-          if (have_cell_matrix)
+          if (atoms_are_fractional && have_cell_matrix)
             gdis_frac_to_cart(cell_matrix, frac_or_cart, cart);
           else
             {
@@ -4345,6 +5666,13 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
 
   g_strfreev(lines);
 
+  if (have_cell_matrix &&
+      model->periodic &&
+      model->periodicity == 3u &&
+      model->space_group &&
+      model->space_group[0] != '\0')
+    gdis_model_expand_space_group_atoms(model, 0);
+
   if (model->atoms->len == 0u)
     {
       g_set_error(error,
@@ -4361,11 +5689,12 @@ gdis_model_load_xtl(GdisModel *model, const gchar *contents, GError **error)
 static gboolean
 gdis_qe_unit_scale_from_header(const gchar *header,
                                gdouble alat_bohr,
+                               gboolean default_bohr_when_unspecified,
                                gdouble *scale_out,
                                gboolean *fractional_out)
 {
   g_autofree gchar *lower = NULL;
-  gdouble scale = 1.0;
+  gdouble scale = default_bohr_when_unspecified ? 0.529177210903 : 1.0;
   gboolean fractional = FALSE;
   gdouble parsed[1];
 
@@ -4374,7 +5703,7 @@ gdis_qe_unit_scale_from_header(const gchar *header,
 
   if (!header)
     {
-      *scale_out = 1.0;
+      *scale_out = scale;
       *fractional_out = FALSE;
       return TRUE;
     }
@@ -4406,7 +5735,10 @@ gdis_qe_unit_scale_from_header(const gchar *header,
 }
 
 static gboolean
-gdis_model_load_qe_like(GdisModel *model, const gchar *contents, GError **error)
+gdis_model_load_qe_like(GdisModel *model,
+                        const gchar *contents,
+                        gboolean default_bohr_when_unspecified,
+                        GError **error)
 {
   gchar **lines;
   gdouble alat_bohr;
@@ -4571,6 +5903,7 @@ gdis_model_load_qe_like(GdisModel *model, const gchar *contents, GError **error)
 
           if (!gdis_qe_unit_scale_from_header(trimmed,
                                               alat_bohr,
+                                              default_bohr_when_unspecified,
                                               &unit_scale,
                                               &fractional_units))
             continue;
@@ -4636,6 +5969,7 @@ gdis_model_load_qe_like(GdisModel *model, const gchar *contents, GError **error)
 
           if (!gdis_qe_unit_scale_from_header(trimmed,
                                               alat_bohr,
+                                              default_bohr_when_unspecified,
                                               &unit_scale,
                                               &fractional_units))
             continue;
@@ -4800,13 +6134,13 @@ gdis_model_load_qe_like(GdisModel *model, const gchar *contents, GError **error)
 static gboolean
 gdis_model_load_qe_input(GdisModel *model, const gchar *contents, GError **error)
 {
-  return gdis_model_load_qe_like(model, contents, error);
+  return gdis_model_load_qe_like(model, contents, FALSE, error);
 }
 
 static gboolean
 gdis_model_load_qe_output(GdisModel *model, const gchar *contents, GError **error)
 {
-  return gdis_model_load_qe_like(model, contents, error);
+  return gdis_model_load_qe_like(model, contents, TRUE, error);
 }
 
 static gboolean
@@ -4905,12 +6239,18 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
 {
   gchar **lines;
   GPtrArray *records;
+  GArray *symmetry_ops;
   gboolean in_multiline;
+  gboolean can_expand_symmetry;
+  guint expected_symmetry_atom_count;
   guint i;
 
   lines = g_strsplit(contents, "\n", -1);
   records = g_ptr_array_new_with_free_func(gdis_cif_atom_record_free);
+  symmetry_ops = g_array_new(FALSE, FALSE, sizeof(GdisSymmetryOp));
   in_multiline = FALSE;
+  can_expand_symmetry = FALSE;
+  expected_symmetry_atom_count = 0u;
 
   for (i = 0; lines[i] != NULL; )
     {
@@ -4936,6 +6276,9 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
 
       if (g_ascii_strncasecmp(trimmed, "data_", 5) == 0)
         {
+          if (records->len > 0u)
+            break;
+
           if (!model->title || model->title[0] == '\0')
             {
               g_clear_pointer(&model->title, g_free);
@@ -4949,15 +6292,18 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
         {
           GPtrArray *headers;
           gboolean atom_loop;
+          gint symop_pos;
 
           headers = g_ptr_array_new_with_free_func(g_free);
           atom_loop = FALSE;
+          symop_pos = -1;
           i++;
 
           while (lines[i] != NULL)
             {
               gchar *header_line;
               gchar *header_trimmed;
+              g_autofree gchar *lower_header = NULL;
 
               header_line = lines[i];
               g_strchomp(header_line);
@@ -4966,9 +6312,15 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
               if (header_trimmed[0] != '_')
                 break;
 
+              lower_header = g_ascii_strdown(header_trimmed, -1);
               g_ptr_array_add(headers, g_strdup(header_trimmed));
               if (g_str_has_prefix(header_trimmed, "_atom_site_"))
                 atom_loop = TRUE;
+              else if (g_str_equal(lower_header, "_symmetry_equiv_pos_as_xyz") ||
+                       g_str_equal(lower_header, "_equiv_pos_as_xyz") ||
+                       g_str_equal(lower_header, "_space_group_symop_operation_xyz") ||
+                       g_str_equal(lower_header, "_space_group_symop.operation_xyz"))
+                symop_pos = (gint) headers->len - 1;
               i++;
             }
 
@@ -4988,6 +6340,8 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                   gint cart_x_pos;
                   gint cart_y_pos;
                   gint cart_z_pos;
+                  gint mult_pos;
+                  gint calc_flag_pos;
                   guint h;
 
                   row_line = lines[i];
@@ -5030,6 +6384,8 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                       cart_x_pos = -1;
                       cart_y_pos = -1;
                       cart_z_pos = -1;
+                      mult_pos = -1;
+                      calc_flag_pos = -1;
 
                       for (h = 0; h < headers->len; h++)
                         {
@@ -5060,6 +6416,10 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                           else if (g_str_equal(lower_header, "_atom_site_cartn_z") ||
                                    g_str_equal(lower_header, "_atom_site_cart_z"))
                             cart_z_pos = (gint) h;
+                          else if (g_str_equal(lower_header, "_atom_site_symmetry_multiplicity"))
+                            mult_pos = (gint) h;
+                          else if (g_str_equal(lower_header, "_atom_site_calc_flag"))
+                            calc_flag_pos = (gint) h;
 
                           g_free(lower_header);
                         }
@@ -5067,6 +6427,20 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                       fractional = (frac_x_pos >= 0 && frac_y_pos >= 0 && frac_z_pos >= 0);
                       if (fractional || (cart_x_pos >= 0 && cart_y_pos >= 0 && cart_z_pos >= 0))
                         {
+                          if (calc_flag_pos >= 0 && tokens->len > (guint) calc_flag_pos)
+                            {
+                              const gchar *calc_flag;
+
+                              calc_flag = g_ptr_array_index(tokens, calc_flag_pos);
+                              if (g_ascii_strcasecmp(calc_flag, "dum") == 0 ||
+                                  g_ascii_strcasecmp(calc_flag, "dummy") == 0)
+                                {
+                                  g_ptr_array_free(tokens, TRUE);
+                                  i++;
+                                  continue;
+                                }
+                            }
+
                           record = g_new0(GdisCifAtomRecord, 1);
 
                           label = label_pos >= 0 ? g_ptr_array_index(tokens, label_pos) : NULL;
@@ -5079,6 +6453,36 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                           record->occupancy = occ_pos >= 0 ?
                                               gdis_parse_cif_number(g_ptr_array_index(tokens, occ_pos)) :
                                               1.0;
+                          record->multiplicity = 0u;
+                          record->have_multiplicity = FALSE;
+                          if (mult_pos >= 0 && tokens->len > (guint) mult_pos)
+                            {
+                              const gchar *multiplicity_text;
+                              guint multiplicity;
+
+                              multiplicity_text = g_ptr_array_index(tokens, mult_pos);
+                              multiplicity = 0u;
+                              if (gdis_try_parse_uint(multiplicity_text, &multiplicity) &&
+                                  multiplicity > 0u)
+                                {
+                                  record->multiplicity = multiplicity;
+                                  record->have_multiplicity = TRUE;
+                                }
+                              else
+                                {
+                                  gdouble multiplicity_value;
+                                  glong rounded;
+
+                                  multiplicity_value = gdis_parse_cif_number(multiplicity_text);
+                                  rounded = lround(multiplicity_value);
+                                  if (multiplicity_value > 0.0 &&
+                                      fabs(multiplicity_value - (gdouble) rounded) < 1.0e-4)
+                                    {
+                                      record->multiplicity = (guint) rounded;
+                                      record->have_multiplicity = TRUE;
+                                    }
+                                }
+                            }
                           record->fractional = fractional;
 
                           if (fractional)
@@ -5099,6 +6503,47 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                           record->coords[2] = z;
                           g_ptr_array_add(records, record);
                         }
+                    }
+
+                  g_ptr_array_free(tokens, TRUE);
+                  i++;
+                }
+            }
+          else if (symop_pos >= 0)
+            {
+              while (lines[i] != NULL)
+                {
+                  GPtrArray *tokens;
+                  gchar *row_line;
+                  gchar *row_trimmed;
+
+                  row_line = lines[i];
+                  g_strchomp(row_line);
+                  row_trimmed = g_strstrip(row_line);
+
+                  if (row_trimmed[0] == ';')
+                    {
+                      in_multiline = !in_multiline;
+                      i++;
+                      continue;
+                    }
+
+                  if (in_multiline)
+                    {
+                      i++;
+                      continue;
+                    }
+
+                  if (gdis_cif_is_control_line(row_trimmed))
+                    break;
+
+                  tokens = gdis_tokenize_cif(row_trimmed);
+                  if (symop_pos >= 0 && tokens->len > (guint) symop_pos)
+                    {
+                      GdisSymmetryOp op;
+
+                      if (gdis_parse_cif_symmetry_operation(g_ptr_array_index(tokens, symop_pos), &op))
+                        g_array_append_val(symmetry_ops, op);
                     }
 
                   g_ptr_array_free(tokens, TRUE);
@@ -5193,6 +6638,9 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
         }
 
       has_cell_matrix = gdis_model_build_cell_matrix(model, matrix, inverse);
+      can_expand_symmetry = (has_cell_matrix &&
+                             model->periodic &&
+                             model->periodicity == 3u);
 
       for (idx = 0; idx < records->len; idx++)
         {
@@ -5209,6 +6657,7 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
                               GDIS_MODEL_ERROR_PARSE,
                               "CIF atom loop in '%s' uses fractional coordinates without a valid cell.",
                               model->path);
+                  g_array_unref(symmetry_ops);
                   g_ptr_array_free(records, TRUE);
                   g_strfreev(lines);
                   return FALSE;
@@ -5236,6 +6685,21 @@ gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error)
         }
     }
 
+  expected_symmetry_atom_count = gdis_cif_sum_reported_multiplicities(records);
+
+  if (can_expand_symmetry)
+    {
+      if (symmetry_ops->len > 0u)
+        gdis_model_expand_atoms_with_symmetry_ops(model, symmetry_ops);
+      else if (model->space_group && model->space_group[0] != '\0')
+        {
+          if (!gdis_model_expand_space_group_atoms_best_match(model,
+                                                              expected_symmetry_atom_count))
+            gdis_model_expand_space_group_atoms(model, 0);
+        }
+    }
+
+  g_array_unref(symmetry_ops);
   g_ptr_array_free(records, TRUE);
   g_strfreev(lines);
 
@@ -5271,14 +6735,19 @@ gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error
 
   state.model = model;
   state.species_symbols = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+  state.frames = g_ptr_array_new_with_free_func(gdis_model_frame_free);
   state.text = g_string_new("");
 
   context = g_markup_parse_context_new(&parser, G_MARKUP_TREAT_CDATA_AS_TEXT, &state, NULL);
   ok = g_markup_parse_context_parse(context, contents, strlen(contents), error);
   if (ok)
     ok = g_markup_parse_context_end_parse(context, error);
+  if (ok)
+    ok = gdis_qbox_finish_current_frame(&state, error);
   g_markup_parse_context_free(context);
 
+  if (state.current_frame)
+    gdis_model_frame_free(state.current_frame);
   g_clear_pointer(&state.current_species_name, g_free);
   g_clear_pointer(&state.current_atom_name, g_free);
   g_clear_pointer(&state.current_atom_species, g_free);
@@ -5287,7 +6756,10 @@ gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error
   g_clear_pointer(&state.species_symbols, g_hash_table_unref);
 
   if (!ok)
-    return FALSE;
+    {
+      g_clear_pointer(&state.frames, g_ptr_array_unref);
+      return FALSE;
+    }
 
   if (!state.looks_like_qbox)
     {
@@ -5299,36 +6771,22 @@ gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error
       return FALSE;
     }
 
-  if (state.have_cell)
-    {
-      gdouble lengths[3];
-      gdouble angles[3];
-
-      if (!gdis_surface_build_cell_from_vectors(state.a_vec, state.b_vec, state.c_vec, lengths, angles))
-        {
-          g_set_error(error,
-                      GDIS_MODEL_ERROR,
-                      GDIS_MODEL_ERROR_PARSE,
-                      "Qbox XML cell vectors in '%s' are invalid.",
-                      model->path);
-          return FALSE;
-        }
-
-      model->periodic = TRUE;
-      model->periodicity = 3;
-      memcpy(model->cell_lengths, lengths, sizeof(lengths));
-      memcpy(model->cell_angles, angles, sizeof(angles));
-    }
-
-  if (model->atoms->len == 0)
+  if (!state.frames || state.frames->len == 0u)
     {
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_PARSE,
-                  "No atoms were parsed from Qbox XML '%s'.",
+                  "No atoms were parsed from Qbox result '%s'.",
                   model->path);
       return FALSE;
     }
+
+  gdis_model_frame_apply(model, g_ptr_array_index(state.frames, 0u));
+  model->current_frame_index = 0u;
+  if (state.frames->len > 1u)
+    model->frames = g_steal_pointer(&state.frames);
+  else
+    g_clear_pointer(&state.frames, g_ptr_array_unref);
 
   return TRUE;
 }
@@ -5354,11 +6812,41 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
   if (g_str_equal(local_name, "sample") || g_str_equal(local_name, "simulation"))
     state->looks_like_qbox = TRUE;
 
+  if (g_str_equal(local_name, "iteration"))
+    {
+      state->inside_iteration = TRUE;
+      state->current_iteration_count = 0u;
+
+      for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
+        {
+          guint parsed_count;
+
+          if (!g_str_equal(gdis_xml_local_name(attribute_names[i]), "count"))
+            continue;
+          if (gdis_try_parse_uint(attribute_values[i], &parsed_count))
+            state->current_iteration_count = parsed_count;
+          break;
+        }
+      return;
+    }
+
+  if (g_str_equal(local_name, "atomset"))
+    {
+      if (state->current_frame && !gdis_qbox_finish_current_frame(state, parse_error))
+        return;
+      if (!gdis_qbox_begin_frame(state, parse_error))
+        return;
+      return;
+    }
+
   if (g_str_equal(local_name, "unit_cell"))
     {
       const gchar *attr_a = NULL;
       const gchar *attr_b = NULL;
       const gchar *attr_c = NULL;
+      gdouble a_vec[3];
+      gdouble b_vec[3];
+      gdouble c_vec[3];
 
       for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
         {
@@ -5374,25 +6862,43 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
         }
 
       if (!attr_a || !attr_b || !attr_c ||
-          !gdis_parse_vector3_text(attr_a, state->a_vec) ||
-          !gdis_parse_vector3_text(attr_b, state->b_vec) ||
-          !gdis_parse_vector3_text(attr_c, state->c_vec))
+          !gdis_parse_vector3_text(attr_a, a_vec) ||
+          !gdis_parse_vector3_text(attr_b, b_vec) ||
+          !gdis_parse_vector3_text(attr_c, c_vec))
         {
           g_set_error(parse_error,
                       GDIS_MODEL_ERROR,
                       GDIS_MODEL_ERROR_PARSE,
-                      "Qbox XML unit_cell in '%s' is missing or invalid.",
+                      "Qbox unit_cell in '%s' is missing or invalid.",
                       state->model->path);
           return;
         }
 
       for (guint axis = 0; axis < 3; axis++)
         {
-          state->a_vec[axis] *= 0.529177210903;
-          state->b_vec[axis] *= 0.529177210903;
-          state->c_vec[axis] *= 0.529177210903;
+          a_vec[axis] *= 0.529177210903;
+          b_vec[axis] *= 0.529177210903;
+          c_vec[axis] *= 0.529177210903;
         }
-      state->have_cell = TRUE;
+
+      if (state->current_frame)
+        {
+          if (!gdis_qbox_apply_cell_vectors_to_frame(state,
+                                                     state->current_frame,
+                                                     a_vec,
+                                                     b_vec,
+                                                     c_vec,
+                                                     parse_error))
+            return;
+          state->current_frame_has_cell = TRUE;
+        }
+      else
+        {
+          gdis_vec3_copy(state->default_a_vec, a_vec);
+          gdis_vec3_copy(state->default_b_vec, b_vec);
+          gdis_vec3_copy(state->default_c_vec, c_vec);
+          state->have_default_cell = TRUE;
+        }
       return;
     }
 
@@ -5496,6 +7002,10 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
       const gchar *mapped_symbol;
       const gchar *element_text;
       const gchar *label_text;
+      GPtrArray *target_atoms;
+
+      if (!state->current_frame && !gdis_qbox_begin_frame(state, parse_error))
+        return;
 
       if (!state->have_current_atom_position)
         {
@@ -5515,7 +7025,8 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
       label_text = (state->current_atom_name && state->current_atom_name[0]) ?
         state->current_atom_name : element_text;
 
-      g_ptr_array_add(state->model->atoms,
+      target_atoms = state->current_frame ? state->current_frame->atoms : state->model->atoms;
+      g_ptr_array_add(target_atoms,
                       gdis_atom_new(label_text,
                                     element_text,
                                     element_text,
@@ -5524,7 +7035,7 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
                                     state->current_atom_position[2],
                                     1.0,
                                     -1,
-                                    state->model->atoms->len + 1));
+                                    target_atoms->len + 1u));
 
       g_clear_pointer(&state->current_atom_name, g_free);
       g_clear_pointer(&state->current_atom_species, g_free);
@@ -5532,8 +7043,21 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
       return;
     }
 
+  if (g_str_equal(local_name, "atomset"))
+    {
+      if (!gdis_qbox_finish_current_frame(state, parse_error))
+        return;
+      return;
+    }
+
   if (g_str_equal(local_name, "species"))
     g_clear_pointer(&state->current_species_name, g_free);
+
+  if (g_str_equal(local_name, "iteration"))
+    {
+      state->inside_iteration = FALSE;
+      state->current_iteration_count = 0u;
+    }
 }
 
 static void
@@ -5551,6 +7075,125 @@ gdis_qbox_xml_text(GMarkupParseContext *context,
   state = user_data;
   if (state->inside_species_symbol || state->inside_atom_position)
     g_string_append_len(state->text, text, text_len);
+}
+
+gboolean
+gdis_qbox_apply_cell_vectors_to_frame(GdisQboxXmlParseState *state,
+                                      GdisModelFrame *frame,
+                                      const gdouble a_vec[3],
+                                      const gdouble b_vec[3],
+                                      const gdouble c_vec[3],
+                                      GError **error)
+{
+  gdouble lengths[3];
+  gdouble angles[3];
+
+  g_return_val_if_fail(state != NULL, FALSE);
+  g_return_val_if_fail(frame != NULL, FALSE);
+
+  if (!gdis_surface_build_cell_from_vectors(a_vec, b_vec, c_vec, lengths, angles))
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "Qbox cell vectors in '%s' are invalid.",
+                  state->model->path);
+      return FALSE;
+    }
+
+  frame->periodic = TRUE;
+  frame->periodicity = 3u;
+  memcpy(frame->cell_lengths, lengths, sizeof(lengths));
+  memcpy(frame->cell_angles, angles, sizeof(angles));
+  return TRUE;
+}
+
+gboolean
+gdis_qbox_begin_frame(GdisQboxXmlParseState *state,
+                      GError **error)
+{
+  const char *base_title;
+
+  g_return_val_if_fail(state != NULL, FALSE);
+
+  if (state->current_frame)
+    return TRUE;
+
+  state->atomset_count++;
+  state->current_frame = gdis_model_frame_new();
+  state->current_frame_has_cell = FALSE;
+
+  base_title = state->model->basename ? state->model->basename : "qbox";
+  if (state->inside_iteration)
+    {
+      guint iteration;
+
+      iteration = state->current_iteration_count > 0u
+        ? state->current_iteration_count
+        : state->atomset_count;
+      state->current_frame->title = g_strdup_printf("%s iteration %u",
+                                                    base_title,
+                                                    iteration);
+    }
+  else if (state->atomset_count == 1u)
+    {
+      state->current_frame->title = g_strdup(base_title);
+    }
+  else
+    {
+      state->current_frame->title = g_strdup_printf("%s frame %u",
+                                                    base_title,
+                                                    state->atomset_count);
+    }
+
+  if (state->have_default_cell)
+    {
+      if (!gdis_qbox_apply_cell_vectors_to_frame(state,
+                                                 state->current_frame,
+                                                 state->default_a_vec,
+                                                 state->default_b_vec,
+                                                 state->default_c_vec,
+                                                 error))
+        return FALSE;
+      state->current_frame_has_cell = TRUE;
+    }
+
+  return TRUE;
+}
+
+gboolean
+gdis_qbox_finish_current_frame(GdisQboxXmlParseState *state,
+                               GError **error)
+{
+  g_return_val_if_fail(state != NULL, FALSE);
+
+  if (!state->current_frame)
+    return TRUE;
+
+  if (state->current_frame->atoms->len == 0u)
+    {
+      gdis_model_frame_free(state->current_frame);
+      state->current_frame = NULL;
+      state->current_frame_has_cell = FALSE;
+      return TRUE;
+    }
+
+  if (!state->current_frame_has_cell && state->have_default_cell)
+    {
+      if (!gdis_qbox_apply_cell_vectors_to_frame(state,
+                                                 state->current_frame,
+                                                 state->default_a_vec,
+                                                 state->default_b_vec,
+                                                 state->default_c_vec,
+                                                 error))
+        return FALSE;
+      state->current_frame_has_cell = TRUE;
+    }
+
+  g_ptr_array_add(state->frames, state->current_frame);
+  state->current_frame = NULL;
+  state->current_frame_has_cell = FALSE;
+  return TRUE;
 }
 
 static const gchar *
@@ -5613,10 +7256,101 @@ gdis_model_add_bond(GdisModel *model,
   return TRUE;
 }
 
+gboolean
+gdis_model_set_element_covalent_override(GdisModel *model,
+                                         const gchar *symbol,
+                                         gdouble radius)
+{
+  g_autofree gchar *normalized_symbol = NULL;
+  gdouble *radius_copy;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  normalized_symbol = gdis_normalize_element_symbol(symbol);
+  if (!normalized_symbol || normalized_symbol[0] == '\0')
+    return FALSE;
+
+  if (!model->element_covalent_overrides)
+    {
+      model->element_covalent_overrides = g_hash_table_new_full(g_str_hash,
+                                                                g_str_equal,
+                                                                g_free,
+                                                                g_free);
+    }
+
+  radius_copy = g_new(gdouble, 1);
+  *radius_copy = MAX(radius, 0.0);
+  g_hash_table_replace(model->element_covalent_overrides,
+                       g_strdup(normalized_symbol),
+                       radius_copy);
+  return TRUE;
+}
+
+void
+gdis_model_copy_element_overrides(GdisModel *dest, const GdisModel *src)
+{
+  GHashTableIter iter;
+  gpointer key;
+  gpointer value;
+
+  g_return_if_fail(dest != NULL);
+
+  g_clear_pointer(&dest->element_covalent_overrides, g_hash_table_unref);
+  if (!src || !src->element_covalent_overrides)
+    return;
+
+  g_hash_table_iter_init(&iter, src->element_covalent_overrides);
+  while (g_hash_table_iter_next(&iter, &key, &value))
+    gdis_model_set_element_covalent_override(dest, key, *((const gdouble *) value));
+}
+
+gdouble
+gdis_model_lookup_covalent_radius(const GdisModel *model, const GdisAtom *atom)
+{
+  const gdouble *override_radius;
+
+  if (!atom)
+    return gdis_lookup_covalent_radius(NULL);
+
+  if (model &&
+      model->element_covalent_overrides &&
+      atom->element &&
+      atom->element[0] != '\0')
+    {
+      override_radius = g_hash_table_lookup(model->element_covalent_overrides, atom->element);
+      if (override_radius)
+        return MAX(*override_radius, 0.0);
+    }
+
+  return gdis_lookup_covalent_radius(atom->element);
+}
+
+gboolean
+gdis_model_should_infer_bond(const GdisModel *model,
+                             const GdisAtom *atom_i,
+                             const GdisAtom *atom_j,
+                             gdouble radius_i,
+                             gdouble radius_j,
+                             gdouble *max_distance_out)
+{
+  gdouble max_distance;
+
+  g_return_val_if_fail(atom_i != NULL, FALSE);
+  g_return_val_if_fail(atom_j != NULL, FALSE);
+
+  max_distance = (MAX(radius_i, 0.0) + MAX(radius_j, 0.0)) * 1.10;
+  if (model && model->periodic)
+    max_distance = MIN(max_distance, 3.2);
+
+  if (max_distance_out)
+    *max_distance_out = max_distance;
+
+  return max_distance > 0.0;
+}
+
 static gboolean
 gdis_model_infer_bonds(GdisModel *model)
 {
-  GHashTable *seen;
   gdouble matrix[9];
   gdouble inverse[9];
   gboolean use_periodic_image;
@@ -5634,7 +7368,6 @@ gdis_model_infer_bonds(GdisModel *model)
   if (model->bonds->len > model->explicit_bond_count)
     g_array_set_size(model->bonds, model->explicit_bond_count);
 
-  seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   use_periodic_image = gdis_model_build_cell_matrix(model, matrix, inverse) && model->periodic;
 
   for (i = 0; i + 1 < model->atoms->len; i++)
@@ -5643,7 +7376,7 @@ gdis_model_infer_bonds(GdisModel *model)
       gdouble radius_i;
 
       atom_i = g_ptr_array_index(model->atoms, i);
-      radius_i = gdis_lookup_covalent_radius(atom_i->element);
+      radius_i = gdis_model_lookup_covalent_radius(model, atom_i);
 
       for (j = i + 1; j < model->atoms->len; j++)
         {
@@ -5651,11 +7384,16 @@ gdis_model_infer_bonds(GdisModel *model)
           gdouble radius_j;
           gdouble max_distance;
           gdouble distance2;
-          gchar *key;
 
           atom_j = g_ptr_array_index(model->atoms, j);
-          radius_j = gdis_lookup_covalent_radius(atom_j->element);
-          max_distance = MIN(radius_i + radius_j + 0.45, 3.2);
+          radius_j = gdis_model_lookup_covalent_radius(model, atom_j);
+          if (!gdis_model_should_infer_bond(model,
+                                            atom_i,
+                                            atom_j,
+                                            radius_i,
+                                            radius_j,
+                                            &max_distance))
+            continue;
 
           distance2 = gdis_model_distance2(model,
                                            atom_i->position,
@@ -5666,13 +7404,10 @@ gdis_model_infer_bonds(GdisModel *model)
           if (distance2 < 0.16 || distance2 > max_distance * max_distance)
             continue;
 
-          key = g_strdup_printf("%u:%u", i, j);
-          if (g_hash_table_add(seen, key))
-            gdis_model_add_bond(model, i, j, 1, TRUE);
+          gdis_model_add_bond(model, i, j, 1, TRUE);
         }
     }
 
-  g_hash_table_destroy(seen);
   gdis_model_refresh_counts(model);
   return TRUE;
 }
@@ -5757,6 +7492,8 @@ gdis_model_find_bond_index(const GdisModel *model,
 static void
 gdis_model_finalize_metadata(GdisModel *model)
 {
+  gdouble visible_charge_total;
+
   if (!model)
     return;
 
@@ -5770,6 +7507,15 @@ gdis_model_finalize_metadata(GdisModel *model)
     {
       g_clear_pointer(&model->space_group, g_free);
       model->space_group = g_strdup("P 1");
+    }
+
+  if (!model->has_total_charge)
+    {
+      if (gdis_model_sum_legacy_visible_charge(model->atoms, &visible_charge_total))
+        model->total_charge_e = visible_charge_total;
+      else
+        model->total_charge_e = 0.0;
+      model->has_total_charge = TRUE;
     }
 
   gdis_model_refresh_counts(model);
@@ -5829,6 +7575,31 @@ gdis_cif_atom_record_free(gpointer data)
   g_free(record->label);
   g_free(record->element);
   g_free(record);
+}
+
+static guint
+gdis_cif_sum_reported_multiplicities(const GPtrArray *records)
+{
+  guint64 total;
+
+  if (!records || records->len == 0u)
+    return 0u;
+
+  total = 0u;
+  for (guint i = 0; i < records->len; i++)
+    {
+      const GdisCifAtomRecord *record;
+
+      record = g_ptr_array_index(records, i);
+      if (!record || !record->have_multiplicity || record->multiplicity == 0u)
+        return 0u;
+
+      total += record->multiplicity;
+      if (total > G_MAXUINT)
+        return 0u;
+    }
+
+  return (guint) total;
 }
 
 static gchar *
@@ -5922,6 +7693,762 @@ gdis_model_write_pdb(const GdisModel *model)
 
   g_string_append(out, "END\n");
   return g_string_free(out, FALSE);
+}
+
+static gint
+gdis_str_ibegin(const char *s1, const char *s2)
+{
+  char u1;
+  char u2;
+
+  while (*s1 && *s2)
+    {
+      u1 = (char) g_ascii_toupper((guchar) *s1++);
+      u2 = (char) g_ascii_toupper((guchar) *s2++);
+      if (u1 < u2)
+        return -1;
+      if (u1 > u2)
+        return 1;
+    }
+
+  if (*s2)
+    return -1;
+
+  return 0;
+}
+
+static gint
+gdis_build_sginfo_compat(T_SgInfo *sg_info, const gchar *space_group_text)
+{
+  gint volume_letter;
+  const T_TabSgName *table_entry;
+
+  g_return_val_if_fail(sg_info != NULL, -1);
+  g_return_val_if_fail(space_group_text != NULL, -1);
+
+  while (*space_group_text && g_ascii_isspace(*space_group_text))
+    space_group_text++;
+
+  volume_letter = -1;
+  if (g_ascii_isdigit(*space_group_text))
+    volume_letter = 'A';
+  else if (gdis_str_ibegin(space_group_text, "VolA") == 0)
+    {
+      volume_letter = 'A';
+      space_group_text += 4;
+    }
+  else if (gdis_str_ibegin(space_group_text, "VolI") == 0 ||
+           gdis_str_ibegin(space_group_text, "Vol1") == 0)
+    {
+      volume_letter = 'I';
+      space_group_text += 4;
+    }
+  else if (gdis_str_ibegin(space_group_text, "Hall") == 0)
+    {
+      volume_letter = 0;
+      space_group_text += 4;
+    }
+
+  while (*space_group_text && g_ascii_isspace(*space_group_text))
+    space_group_text++;
+
+  if (volume_letter == -1)
+    volume_letter = 'A';
+
+  table_entry = NULL;
+  if (volume_letter != 0)
+    {
+      table_entry = FindTabSgNameEntry(space_group_text, volume_letter);
+      if (!table_entry)
+        return -1;
+      space_group_text = table_entry->HallSymbol;
+    }
+
+  SgError = NULL;
+  sg_info->MaxList = 192;
+  sg_info->ListSeitzMx = g_malloc(sg_info->MaxList * sizeof(*sg_info->ListSeitzMx));
+  sg_info->ListRotMxInfo = g_malloc(sg_info->MaxList * sizeof(*sg_info->ListRotMxInfo));
+
+  InitSgInfo(sg_info);
+  sg_info->TabSgName = table_entry;
+
+  ParseHallSymbol(space_group_text, sg_info);
+  if (SgError != NULL)
+    return -1;
+
+  return CompleteSgInfo(sg_info);
+}
+
+static void
+gdis_free_sginfo_compat(T_SgInfo *sg_info)
+{
+  if (!sg_info)
+    return;
+
+  g_free(sg_info->ListSeitzMx);
+  g_free(sg_info->ListRotMxInfo);
+  sg_info->ListSeitzMx = NULL;
+  sg_info->ListRotMxInfo = NULL;
+}
+
+static gchar *
+gdis_format_space_group_label(const T_SgInfo *sg_info)
+{
+  gchar *label;
+  gchar *equals;
+  gchar *stripped;
+
+  if (!sg_info || !sg_info->TabSgName || !sg_info->TabSgName->SgLabels)
+    return NULL;
+
+  label = g_strdup(sg_info->TabSgName->SgLabels);
+  equals = strstr(label, "=");
+  if (equals)
+    *equals = '\0';
+
+  for (gchar *iter = label; *iter != '\0'; iter++)
+    {
+      if (*iter == '_')
+        *iter = ' ';
+    }
+
+  stripped = gdis_strdup_strip(label);
+  g_free(label);
+  return stripped;
+}
+
+static gboolean
+gdis_model_uses_rhombohedral_setting(const GdisModel *model,
+                                     const gchar *space_group_text)
+{
+  const gchar *iter;
+  gchar *endptr;
+  long sg_number;
+  gdouble dx;
+  gdouble x2;
+
+  g_return_val_if_fail(space_group_text != NULL, FALSE);
+
+  iter = space_group_text;
+  while (*iter && g_ascii_isspace(*iter))
+    iter++;
+
+  if (strchr(iter, ':') != NULL)
+    return g_strrstr(iter, ":R") != NULL;
+
+  if (g_ascii_toupper(*iter) == 'R')
+    goto cell_check;
+
+  sg_number = strtol(iter, &endptr, 10);
+  if (endptr == iter ||
+      (sg_number != 146 && sg_number != 148 && sg_number != 155 &&
+       sg_number != 160 && sg_number != 161 && sg_number != 166 &&
+       sg_number != 167))
+    return FALSE;
+
+cell_check:
+  if (!model)
+    return FALSE;
+
+  dx = model->cell_lengths[0] - model->cell_lengths[1];
+  x2 = dx * dx;
+  dx = model->cell_lengths[0] - model->cell_lengths[2];
+  x2 += dx * dx;
+  dx = model->cell_lengths[1] - model->cell_lengths[2];
+  x2 += dx * dx;
+
+  return x2 < 0.001;
+}
+
+static gboolean
+gdis_space_group_is_r_lattice(const gchar *space_group_text)
+{
+  const gchar *iter;
+  gchar *endptr;
+  long sg_number;
+
+  g_return_val_if_fail(space_group_text != NULL, FALSE);
+
+  iter = space_group_text;
+  while (*iter && g_ascii_isspace(*iter))
+    iter++;
+
+  if (g_ascii_toupper(*iter) == 'R')
+    return TRUE;
+
+  sg_number = strtol(iter, &endptr, 10);
+  if (endptr == iter)
+    return FALSE;
+
+  return sg_number == 146 || sg_number == 148 || sg_number == 155 ||
+         sg_number == 160 || sg_number == 161 || sg_number == 166 ||
+         sg_number == 167;
+}
+
+static gboolean
+gdis_build_space_group_operations(const GdisModel *model,
+                                  const gchar *space_group_text,
+                                  gint origin_choice,
+                                  GArray **ops_out,
+                                  gchar **canonical_label_out)
+{
+  T_SgInfo sg_info = {0};
+  g_autofree gchar *lookup_name = NULL;
+  GArray *ops;
+  const gint *tr_vector;
+  gint translation_count;
+  gint inversion_loops;
+
+  g_return_val_if_fail(space_group_text != NULL, FALSE);
+  g_return_val_if_fail(ops_out != NULL, FALSE);
+
+  if (!strchr(space_group_text, ':') &&
+      gdis_model_uses_rhombohedral_setting(model, space_group_text))
+    lookup_name = g_strdup_printf("%s:R", space_group_text);
+  else if (!strchr(space_group_text, ':') &&
+           gdis_space_group_is_r_lattice(space_group_text))
+    lookup_name = g_strdup_printf("%s:H", space_group_text);
+  else
+    lookup_name = g_strdup(space_group_text);
+
+  if (origin_choice > 0 && !strchr(lookup_name, ':'))
+    {
+      g_autofree gchar *with_origin = g_strdup_printf("%s:%d", lookup_name, origin_choice);
+      g_free(lookup_name);
+      lookup_name = g_steal_pointer(&with_origin);
+    }
+
+  if (gdis_build_sginfo_compat(&sg_info, lookup_name) != 0)
+    return FALSE;
+
+  ops = g_array_new(FALSE, FALSE, sizeof(GdisSymmetryOp));
+  translation_count = sg_info.LatticeInfo ? sg_info.LatticeInfo->nTrVector : 0;
+  tr_vector = sg_info.LatticeInfo ? sg_info.LatticeInfo->TrVector : NULL;
+  inversion_loops = Sg_nLoopInv(&sg_info);
+
+  if (translation_count < 1 || tr_vector == NULL || sg_info.nList < 1)
+    {
+      g_array_unref(ops);
+      gdis_free_sginfo_compat(&sg_info);
+      return FALSE;
+    }
+
+  for (gint i_translation = 0; i_translation < translation_count; i_translation++, tr_vector += 3)
+    {
+      for (gint i_inversion = 0; i_inversion < inversion_loops; i_inversion++)
+        {
+          gint sign;
+
+          sign = (i_inversion == 0) ? 1 : -1;
+          for (gint i_list = 0; i_list < sg_info.nList; i_list++)
+            {
+              const T_RTMx *seitz;
+              GdisSymmetryOp op;
+
+              seitz = &sg_info.ListSeitzMx[i_list];
+              memset(&op, 0, sizeof(op));
+
+              for (gint row = 0; row < 3; row++)
+                {
+                  gint translated;
+
+                  for (gint col = 0; col < 3; col++)
+                    op.matrix[row * 3 + col] = (gdouble) (sign * seitz->s.R[row * 3 + col]);
+
+                  translated = iModPositive(sign * seitz->s.T[row] + tr_vector[row], STBF);
+                  if (translated > STBF / 2)
+                    translated -= STBF;
+                  op.offset[row] = (gdouble) translated / (gdouble) STBF;
+                }
+
+              g_array_append_val(ops, op);
+            }
+        }
+    }
+
+  if (canonical_label_out)
+    *canonical_label_out = gdis_format_space_group_label(&sg_info);
+
+  gdis_free_sginfo_compat(&sg_info);
+  *ops_out = ops;
+  return TRUE;
+}
+
+static gdouble
+gdis_wrap_fractional_coordinate(gdouble value)
+{
+  value -= floor(value);
+  if (value < 0.0)
+    value += 1.0;
+  if (value >= 1.0)
+    value -= floor(value);
+  if (fabs(value - 1.0) < 1.0e-10)
+    value = 0.0;
+  return value;
+}
+
+static void
+gdis_wrap_fractional_vector(gdouble frac[3], guint periodicity)
+{
+  guint dims;
+
+  dims = MIN(periodicity, 3u);
+  for (guint i = 0; i < dims; i++)
+    frac[i] = gdis_wrap_fractional_coordinate(frac[i]);
+}
+
+static gboolean
+gdis_fractional_positions_equal(const gdouble left[3],
+                                const gdouble right[3],
+                                guint periodicity,
+                                gdouble tolerance)
+{
+  guint dims;
+
+  dims = MIN(periodicity, 3u);
+  for (guint i = 0; i < 3u; i++)
+    {
+      gdouble delta;
+
+      delta = fabs(left[i] - right[i]);
+      if (i < dims)
+        delta = MIN(delta, fabs(1.0 - delta));
+      if (delta > tolerance)
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+static GdisAtom *
+gdis_atom_clone_with_position(const GdisAtom *source,
+                              const gdouble position[3],
+                              guint serial)
+{
+  GdisAtom *copy;
+
+  g_return_val_if_fail(source != NULL, NULL);
+  g_return_val_if_fail(position != NULL, NULL);
+
+  copy = g_new0(GdisAtom, 1);
+  copy->serial = serial;
+  copy->label = g_strdup(source->label);
+  copy->element = g_strdup(source->element);
+  copy->ff_type = g_strdup(source->ff_type);
+  copy->position[0] = position[0];
+  copy->position[1] = position[1];
+  copy->position[2] = position[2];
+  copy->occupancy = source->occupancy;
+  copy->charge = source->charge;
+  copy->has_charge = source->has_charge;
+  copy->region = source->region;
+  return copy;
+}
+
+static gboolean
+gdis_model_sum_charge_atoms_impl(const GPtrArray *atoms,
+                                 gboolean periodic,
+                                 guint periodicity,
+                                 const gdouble lengths[3],
+                                 const gdouble angles[3],
+                                 const gchar *space_group,
+                                 gint origin_choice,
+                                 gboolean expand_space_group,
+                                 gboolean require_mixed_signs,
+                                 gdouble *total_charge_out)
+{
+  GdisModel charge_model = {0};
+  gboolean saw_positive;
+  gboolean saw_negative;
+  gdouble total_charge;
+
+  g_return_val_if_fail(total_charge_out != NULL, FALSE);
+
+  *total_charge_out = 0.0;
+  if (!atoms || atoms->len == 0u)
+    return FALSE;
+
+  saw_positive = FALSE;
+  saw_negative = FALSE;
+  total_charge = 0.0;
+  charge_model.atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  for (guint i = 0; i < atoms->len; i++)
+    {
+      const GdisAtom *source_atom;
+
+      source_atom = g_ptr_array_index(atoms, i);
+      if (!source_atom || !source_atom->has_charge)
+        continue;
+      if (source_atom->charge > 1.0e-8)
+        saw_positive = TRUE;
+      if (source_atom->charge < -1.0e-8)
+        saw_negative = TRUE;
+
+      g_ptr_array_add(charge_model.atoms,
+                      gdis_atom_clone_with_position(source_atom,
+                                                    source_atom->position,
+                                                    source_atom->serial));
+    }
+
+  if (charge_model.atoms->len == 0u)
+    {
+      g_ptr_array_free(charge_model.atoms, TRUE);
+      return FALSE;
+    }
+
+  if (require_mixed_signs && (!saw_positive || !saw_negative))
+    {
+      g_ptr_array_free(charge_model.atoms, TRUE);
+      return FALSE;
+    }
+
+  charge_model.periodic = periodic;
+  charge_model.periodicity = periodicity;
+  memcpy(charge_model.cell_lengths, lengths, sizeof(charge_model.cell_lengths));
+  memcpy(charge_model.cell_angles, angles, sizeof(charge_model.cell_angles));
+  charge_model.space_group = g_strdup(space_group);
+
+  if (expand_space_group &&
+      charge_model.periodic &&
+      charge_model.periodicity == 3u &&
+      charge_model.space_group &&
+      charge_model.space_group[0] != '\0')
+    gdis_model_expand_space_group_atoms(&charge_model, origin_choice);
+
+  for (guint i = 0; i < charge_model.atoms->len; i++)
+    {
+      const GdisAtom *atom;
+
+      atom = g_ptr_array_index(charge_model.atoms, i);
+      if (!atom || !atom->has_charge)
+        continue;
+      total_charge += atom->charge;
+    }
+
+  g_ptr_array_free(charge_model.atoms, TRUE);
+  g_free(charge_model.space_group);
+  *total_charge_out = total_charge;
+  return TRUE;
+}
+
+static gboolean
+gdis_model_sum_charge_atoms(const GPtrArray *atoms,
+                            gboolean periodic,
+                            guint periodicity,
+                            const gdouble lengths[3],
+                            const gdouble angles[3],
+                            const gchar *space_group,
+                            gint origin_choice,
+                            gboolean expand_space_group,
+                            gdouble *total_charge_out)
+{
+  return gdis_model_sum_charge_atoms_impl(atoms,
+                                          periodic,
+                                          periodicity,
+                                          lengths,
+                                          angles,
+                                          space_group,
+                                          origin_choice,
+                                          expand_space_group,
+                                          TRUE,
+                                          total_charge_out);
+}
+
+static gboolean
+gdis_model_sum_known_charge_atoms(const GPtrArray *atoms,
+                                  gboolean periodic,
+                                  guint periodicity,
+                                  const gdouble lengths[3],
+                                  const gdouble angles[3],
+                                  const gchar *space_group,
+                                  gint origin_choice,
+                                  gboolean expand_space_group,
+                                  gdouble *total_charge_out)
+{
+  return gdis_model_sum_charge_atoms_impl(atoms,
+                                          periodic,
+                                          periodicity,
+                                          lengths,
+                                          angles,
+                                          space_group,
+                                          origin_choice,
+                                          expand_space_group,
+                                          FALSE,
+                                          total_charge_out);
+}
+
+static gboolean
+gdis_model_sum_legacy_visible_charge(const GPtrArray *atoms,
+                                     gdouble *total_charge_out)
+{
+  gboolean saw_atom;
+  gdouble total_charge;
+
+  g_return_val_if_fail(total_charge_out != NULL, FALSE);
+
+  *total_charge_out = 0.0;
+  if (!atoms || atoms->len == 0u)
+    return FALSE;
+
+  saw_atom = FALSE;
+  total_charge = 0.0;
+  for (guint i = 0; i < atoms->len; i++)
+    {
+      const GdisAtom *atom;
+
+      atom = g_ptr_array_index(atoms, i);
+      if (!atom)
+        continue;
+
+      saw_atom = TRUE;
+      if (atom->has_charge)
+        {
+          total_charge += atom->charge;
+        }
+      else
+        {
+          gdouble legacy_charge;
+
+          if (gdis_element_lookup_legacy_charge(atom->element, &legacy_charge))
+            total_charge += legacy_charge;
+        }
+    }
+
+  if (!saw_atom)
+    return FALSE;
+
+  if (fabs(total_charge) < 1.0e-8)
+    total_charge = 0.0;
+
+  *total_charge_out = total_charge;
+  return TRUE;
+}
+
+static gboolean
+gdis_model_expand_atoms_with_symmetry_ops(GdisModel *model,
+                                          const GArray *ops)
+{
+  GArray *fractional_positions;
+  GPtrArray *expanded_atoms;
+  gdouble matrix[9];
+  gdouble inverse[9];
+  gboolean expanded;
+  guint original_count;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(ops != NULL, FALSE);
+
+  if (!model->periodic ||
+      model->periodicity < 3u ||
+      !model->atoms ||
+      model->atoms->len == 0u ||
+      ops->len == 0u ||
+      !gdis_model_build_cell_matrix(model, matrix, inverse))
+    return FALSE;
+
+  expanded_atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  fractional_positions = g_array_new(FALSE, FALSE, sizeof(GdisFractionalPosition));
+  expanded = FALSE;
+  original_count = model->atoms->len;
+
+  for (guint atom_index = 0; atom_index < original_count; atom_index++)
+    {
+      const GdisAtom *source_atom;
+      gdouble source_frac[3];
+
+      source_atom = g_ptr_array_index(model->atoms, atom_index);
+      gdis_cart_to_frac(inverse, source_atom->position, source_frac);
+
+      for (guint op_index = 0; op_index < ops->len; op_index++)
+        {
+          const GdisSymmetryOp *op;
+          gdouble frac[3];
+          gdouble cart[3];
+          gboolean duplicate;
+
+          op = &g_array_index(ops, GdisSymmetryOp, op_index);
+          frac[0] = op->matrix[0] * source_frac[0] +
+                    op->matrix[1] * source_frac[1] +
+                    op->matrix[2] * source_frac[2] +
+                    op->offset[0];
+          frac[1] = op->matrix[3] * source_frac[0] +
+                    op->matrix[4] * source_frac[1] +
+                    op->matrix[5] * source_frac[2] +
+                    op->offset[1];
+          frac[2] = op->matrix[6] * source_frac[0] +
+                    op->matrix[7] * source_frac[1] +
+                    op->matrix[8] * source_frac[2] +
+                    op->offset[2];
+          gdis_wrap_fractional_vector(frac, model->periodicity);
+
+          duplicate = FALSE;
+          for (guint existing_index = 0; existing_index < expanded_atoms->len; existing_index++)
+            {
+              const GdisAtom *existing_atom;
+              const GdisFractionalPosition *existing_frac;
+
+              existing_atom = g_ptr_array_index(expanded_atoms, existing_index);
+              existing_frac = &g_array_index(fractional_positions, GdisFractionalPosition, existing_index);
+
+              if (existing_atom->region != source_atom->region)
+                continue;
+              if (g_strcmp0(existing_atom->label, source_atom->label) != 0)
+                continue;
+              if (g_strcmp0(existing_atom->ff_type, source_atom->ff_type) != 0)
+                continue;
+              if (!gdis_fractional_positions_equal(existing_frac->values,
+                                                   frac,
+                                                   model->periodicity,
+                                                   5.0e-5))
+                continue;
+
+              duplicate = TRUE;
+              break;
+            }
+
+          if (duplicate)
+            continue;
+
+          gdis_frac_to_cart(matrix, frac, cart);
+          g_ptr_array_add(expanded_atoms,
+                          gdis_atom_clone_with_position(source_atom,
+                                                        cart,
+                                                        expanded_atoms->len + 1u));
+
+          {
+            GdisFractionalPosition stored_frac;
+
+            stored_frac.values[0] = frac[0];
+            stored_frac.values[1] = frac[1];
+            stored_frac.values[2] = frac[2];
+            g_array_append_val(fractional_positions, stored_frac);
+          }
+        }
+    }
+
+  if (expanded_atoms->len >= original_count && expanded_atoms->len > 0u)
+    {
+      g_ptr_array_unref(model->atoms);
+      model->atoms = expanded_atoms;
+      expanded = TRUE;
+      expanded_atoms = NULL;
+    }
+
+  if (expanded_atoms)
+    g_ptr_array_unref(expanded_atoms);
+  if (fractional_positions)
+    g_array_unref(fractional_positions);
+
+  return expanded;
+}
+
+gboolean
+gdis_model_expand_space_group_atoms(GdisModel *model,
+                                    gint origin_choice)
+{
+  GArray *ops;
+  gchar *canonical_label;
+  gboolean expanded;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  if (!model->periodic ||
+      model->periodicity < 3u ||
+      !model->space_group ||
+      model->space_group[0] == '\0')
+    return FALSE;
+
+  ops = NULL;
+  canonical_label = NULL;
+  if (!gdis_build_space_group_operations(model,
+                                         model->space_group,
+                                         origin_choice,
+                                         &ops,
+                                         &canonical_label))
+    return FALSE;
+
+  expanded = gdis_model_expand_atoms_with_symmetry_ops(model, ops);
+
+  if (canonical_label && canonical_label[0] != '\0')
+    {
+      g_clear_pointer(&model->space_group, g_free);
+      model->space_group = canonical_label;
+      canonical_label = NULL;
+    }
+
+  if (ops)
+    g_array_unref(ops);
+  g_free(canonical_label);
+
+  return expanded;
+}
+
+static gboolean
+gdis_model_expand_space_group_atoms_best_match(GdisModel *model,
+                                               guint expected_atom_count)
+{
+  static const gint choices[] = { 0, 1, 2 };
+  GdisModel *best_model;
+  guint best_delta;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  if (expected_atom_count == 0u)
+    return FALSE;
+
+  best_model = NULL;
+  best_delta = G_MAXUINT;
+
+  for (guint i = 0; i < G_N_ELEMENTS(choices); i++)
+    {
+      GdisModel *trial;
+      guint trial_atom_count;
+      guint delta;
+
+      trial = gdis_model_clone(model);
+      if (!trial)
+        continue;
+
+      if (!gdis_model_expand_space_group_atoms(trial, choices[i]))
+        {
+          gdis_model_free(trial);
+          continue;
+        }
+
+      trial_atom_count = trial->atoms ? trial->atoms->len : 0u;
+      if (trial_atom_count > expected_atom_count)
+        delta = trial_atom_count - expected_atom_count;
+      else
+        delta = expected_atom_count - trial_atom_count;
+
+      if (!best_model ||
+          delta < best_delta ||
+          (delta == best_delta && choices[i] == 0))
+        {
+          if (best_model)
+            gdis_model_free(best_model);
+          best_model = trial;
+          best_delta = delta;
+        }
+      else
+        {
+          gdis_model_free(trial);
+        }
+    }
+
+  if (!best_model)
+    return FALSE;
+
+  {
+    GError *copy_error;
+    gboolean copied;
+
+    copy_error = NULL;
+    copied = gdis_model_copy_from(model, best_model, &copy_error);
+    g_clear_error(&copy_error);
+    gdis_model_free(best_model);
+    return copied;
+  }
 }
 
 static gchar *
@@ -6593,6 +9120,30 @@ gdis_try_parse_double_relaxed(const gchar *text, gdouble *value)
   if (clean[0] == '\0')
     return FALSE;
 
+  {
+    gchar *slash;
+
+    slash = strchr(clean, '/');
+    if (slash &&
+        slash != clean &&
+        slash[1] != '\0' &&
+        strchr(slash + 1, '/') == NULL)
+      {
+        gdouble numerator;
+        gdouble denominator;
+
+        *slash = '\0';
+        if (gdis_try_parse_double(clean, &numerator) &&
+            gdis_try_parse_double(slash + 1, &denominator) &&
+            fabs(denominator) > 1.0e-12)
+          {
+            *value = numerator / denominator;
+            return TRUE;
+          }
+        *slash = '/';
+      }
+  }
+
   parsed = g_ascii_strtod(clean, &endptr);
   if (endptr == clean)
     return FALSE;
@@ -6635,6 +9186,73 @@ gdis_try_parse_uint(const gchar *text, guint *value)
 
   *value = (guint) parsed;
   return TRUE;
+}
+
+static gboolean
+gdis_gulp_type_is_core(const gchar *text)
+{
+  g_autofree gchar *lower = NULL;
+
+  if (!text || text[0] == '\0')
+    return FALSE;
+
+  lower = g_ascii_strdown(text, -1);
+  return g_str_equal(lower, "core") ||
+         g_str_equal(lower, "c") ||
+         g_str_has_prefix(lower, "bcor");
+}
+
+static gboolean
+gdis_gulp_type_is_shell(const gchar *text)
+{
+  g_autofree gchar *lower = NULL;
+
+  if (!text || text[0] == '\0')
+    return FALSE;
+
+  lower = g_ascii_strdown(text, -1);
+  return g_str_has_prefix(lower, "shel") ||
+         g_str_equal(lower, "s") ||
+         g_str_has_prefix(lower, "bshe");
+}
+
+static gchar *
+gdis_gulp_make_species_key(const gchar *name, const gchar *type_text)
+{
+  g_autofree gchar *name_lower = NULL;
+
+  name_lower = g_ascii_strdown(name ? name : "", -1);
+  return g_strdup_printf("%s|%s",
+                         name_lower,
+                         gdis_gulp_type_is_shell(type_text) ? "shell" : "core");
+}
+
+static const gdouble *
+gdis_gulp_lookup_species_charge(GHashTable *species_charges,
+                                const gchar *label,
+                                const gchar *element,
+                                const gchar *type_text)
+{
+  const gdouble *mapped_charge = NULL;
+  g_autofree gchar *exact_key = NULL;
+  g_autofree gchar *element_key = NULL;
+
+  if (!species_charges)
+    return NULL;
+
+  if (label && label[0] != '\0')
+    {
+      exact_key = gdis_gulp_make_species_key(label, type_text);
+      mapped_charge = g_hash_table_lookup(species_charges, exact_key);
+    }
+
+  if (!mapped_charge && element && element[0] != '\0')
+    {
+      element_key = gdis_gulp_make_species_key(element, type_text);
+      mapped_charge = g_hash_table_lookup(species_charges, element_key);
+    }
+
+  return mapped_charge;
 }
 
 static guint
@@ -6835,24 +9453,247 @@ gdis_cif_is_control_line(const gchar *line)
          line[0] == '_';
 }
 
+static gboolean
+gdis_parse_cif_symmetry_operation(const gchar *text, GdisSymmetryOp *op_out)
+{
+  g_auto(GStrv) components = NULL;
+  g_autofree gchar *normalized = NULL;
+  GdisSymmetryOp op;
+  gsize len;
+
+  g_return_val_if_fail(op_out != NULL, FALSE);
+
+  if (!text)
+    return FALSE;
+
+  normalized = gdis_strdup_strip(text);
+  if (!normalized || normalized[0] == '\0')
+    return FALSE;
+
+  len = strlen(normalized);
+  if (len >= 2 &&
+      ((normalized[0] == '\'' && normalized[len - 1] == '\'') ||
+       (normalized[0] == '"' && normalized[len - 1] == '"')))
+    {
+      normalized[len - 1] = '\0';
+      memmove(normalized, normalized + 1, len - 1);
+    }
+
+  components = g_strsplit(normalized, ",", -1);
+  if (!components || !components[0] || !components[1] || !components[2] || components[3] != NULL)
+    return FALSE;
+
+  memset(&op, 0, sizeof(op));
+  for (guint row = 0; row < 3u; row++)
+    {
+      gchar *component;
+      const gchar *cursor;
+      gint sign;
+
+      component = g_strstrip(components[row]);
+      if (!component || component[0] == '\0')
+        return FALSE;
+
+      cursor = component;
+      sign = 1;
+      while (*cursor)
+        {
+          if (g_ascii_isspace(*cursor))
+            {
+              cursor++;
+              continue;
+            }
+
+          if (*cursor == '+')
+            {
+              sign = 1;
+              cursor++;
+              continue;
+            }
+          if (*cursor == '-')
+            {
+              sign = -1;
+              cursor++;
+              continue;
+            }
+
+          switch (g_ascii_tolower(*cursor))
+            {
+            case 'x':
+              op.matrix[row * 3u] += (gdouble) sign;
+              sign = 1;
+              cursor++;
+              continue;
+            case 'y':
+              op.matrix[row * 3u + 1u] += (gdouble) sign;
+              sign = 1;
+              cursor++;
+              continue;
+            case 'z':
+              op.matrix[row * 3u + 2u] += (gdouble) sign;
+              sign = 1;
+              cursor++;
+              continue;
+            default:
+              break;
+            }
+
+          if (g_ascii_isdigit(*cursor) || *cursor == '.')
+            {
+              gchar *endptr;
+              gdouble numerator;
+              gdouble value;
+
+              numerator = g_ascii_strtod(cursor, &endptr);
+              if (endptr == cursor)
+                return FALSE;
+
+              value = numerator;
+              if (*endptr == '/')
+                {
+                  gchar *den_endptr;
+                  gdouble denominator;
+
+                  denominator = g_ascii_strtod(endptr + 1, &den_endptr);
+                  if (den_endptr == endptr + 1 || fabs(denominator) <= 1.0e-12)
+                    return FALSE;
+                  value = numerator / denominator;
+                  endptr = den_endptr;
+                }
+
+              op.offset[row] += (gdouble) sign * value;
+              sign = 1;
+              cursor = endptr;
+              continue;
+            }
+
+          return FALSE;
+        }
+    }
+
+  *op_out = op;
+  return TRUE;
+}
+
 static gdouble
 gdis_lookup_covalent_radius(const gchar *element)
 {
   static const GdisRadiusEntry radii[] = {
-    { "H", 0.31 },  { "B", 0.85 },  { "C", 0.76 },  { "N", 0.71 },
-    { "O", 0.66 },  { "F", 0.57 },  { "Na", 1.66 }, { "Mg", 1.41 },
-    { "Al", 1.21 }, { "Si", 1.11 }, { "P", 1.07 },  { "S", 1.05 },
-    { "Cl", 1.02 }, { "K", 2.03 },  { "Ca", 1.76 }, { "Ti", 1.60 },
-    { "Cr", 1.39 }, { "Mn", 1.39 }, { "Fe", 1.32 }, { "Co", 1.26 },
-    { "Ni", 1.24 }, { "Cu", 1.32 }, { "Zn", 1.22 }, { "Br", 1.20 },
-    { "Ag", 1.45 }, { "I", 1.39 },  { "Ba", 1.98 }, { "Pt", 1.36 },
-    { "Au", 1.36 }, { "Pb", 1.46 }, { "Se", 1.20 }, { "As", 1.19 },
-    { "Li", 1.28 }, { "Sn", 1.39 }
+    { "X", 0.100000 },
+    { "H", 0.330000 },
+    { "He", 0.460000 },
+    { "Li", 0.680000 },
+    { "Be", 0.350000 },
+    { "B", 0.820000 },
+    { "C", 0.770000 },
+    { "N", 0.750000 },
+    { "O", 0.730000 },
+    { "F", 0.720000 },
+    { "Ne", 0.670000 },
+    { "Na", 0.970000 },
+    { "Mg", 1.100000 },
+    { "Al", 1.180000 },
+    { "Si", 1.110000 },
+    { "P", 1.060000 },
+    { "S", 1.020000 },
+    { "Cl", 0.990000 },
+    { "Ar", 1.060000 },
+    { "K", 1.330000 },
+    { "Ca", 0.990000 },
+    { "Sc", 1.440000 },
+    { "Ti", 1.470000 },
+    { "V", 1.330000 },
+    { "Cr", 1.350000 },
+    { "Mn", 1.350000 },
+    { "Fe", 1.340000 },
+    { "Co", 1.330000 },
+    { "Ni", 1.500000 },
+    { "Cu", 1.520000 },
+    { "Zn", 1.450000 },
+    { "Ga", 1.220000 },
+    { "Ge", 1.170000 },
+    { "As", 1.210000 },
+    { "Se", 1.220000 },
+    { "Br", 1.210000 },
+    { "Kr", 1.890000 },
+    { "Rb", 1.470000 },
+    { "Sr", 1.120000 },
+    { "Y", 1.780000 },
+    { "Zr", 1.560000 },
+    { "Nb", 1.480000 },
+    { "Mo", 1.470000 },
+    { "Tc", 1.350000 },
+    { "Ru", 1.400000 },
+    { "Rh", 1.450000 },
+    { "Pd", 1.500000 },
+    { "Ag", 1.590000 },
+    { "Cd", 1.690000 },
+    { "In", 1.630000 },
+    { "Sn", 1.460000 },
+    { "Sb", 1.460000 },
+    { "Te", 1.470000 },
+    { "I", 1.330000 },
+    { "Xe", 1.310000 },
+    { "Cs", 1.670000 },
+    { "Ba", 1.340000 },
+    { "La", 1.870000 },
+    { "Ce", 1.830000 },
+    { "Pr", 1.820000 },
+    { "Nd", 1.810000 },
+    { "Pm", 1.800000 },
+    { "Sm", 1.800000 },
+    { "Eu", 1.990000 },
+    { "Gd", 1.790000 },
+    { "Tb", 1.760000 },
+    { "Dy", 1.750000 },
+    { "Ho", 1.740000 },
+    { "Er", 1.730000 },
+    { "Tm", 1.720000 },
+    { "Yb", 1.940000 },
+    { "Lu", 1.720000 },
+    { "Hf", 1.570000 },
+    { "Ta", 1.430000 },
+    { "W", 1.370000 },
+    { "Re", 1.350000 },
+    { "Os", 1.370000 },
+    { "Ir", 1.320000 },
+    { "Pt", 1.500000 },
+    { "Au", 1.500000 },
+    { "Hg", 1.700000 },
+    { "Tl", 1.550000 },
+    { "Pb", 1.540000 },
+    { "Bi", 1.540000 },
+    { "Po", 1.680000 },
+    { "At", 1.470000 },
+    { "Rn", 1.420000 },
+    { "Fr", 2.600000 },
+    { "Ra", 1.900000 },
+    { "Ac", 1.880000 },
+    { "Th", 1.790000 },
+    { "Pa", 1.610000 },
+    { "U", 1.580000 },
+    { "Np", 1.550000 },
+    { "Pu", 1.530000 },
+    { "Am", 1.510000 },
+    { "Cm", 1.690000 },
+    { "Bk", 2.600000 },
+    { "Cf", 2.600000 },
+    { "Es", 2.600000 },
+    { "Fm", 2.600000 },
+    { "Md", 2.600000 },
+    { "No", 2.600000 },
+    { "Lr", 2.600000 },
+    { "Rf", 2.600000 },
+    { "Db", 2.600000 },
+    { "Sg", 2.600000 },
+    { "Bh", 2.600000 },
+    { "Hs", 2.600000 },
+    { "Mt", 2.600000 }
   };
   guint i;
 
   if (!element || element[0] == '\0')
-    return 0.77;
+    return 0.10;
 
   for (i = 0; i < G_N_ELEMENTS(radii); i++)
     {

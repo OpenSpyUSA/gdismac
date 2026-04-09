@@ -1,0 +1,135 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./capture-gdis-gtk4 --model PATH --output PNG [options]
+
+Options:
+  --iso                 Generate an iso-surface before exporting.
+  --mode MODE           Iso mode: molecular, promolecule, hirshfeld, electron-density.
+  --color MODE          Iso colour: default, afm, electrostatic, curvedness, shape-index, de.
+  --size WIDTHxHEIGHT   Output size. Default: 1360x852.
+  --keep-open           Leave the GTK4 window open after export.
+  --help                Show this help.
+
+Examples:
+  ./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-view.png
+  ./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-iso.png --iso
+  ./capture-gdis-gtk4 --model ../../models/water.car --output /tmp/water-shape.png --iso --color shape-index
+EOF
+}
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+BIN_PATH="${SCRIPT_DIR}/build/gdis-gtk4"
+
+MODEL_PATH=""
+OUTPUT_PATH=""
+EXPORT_SIZE="${GDIS_GTK4_STARTUP_EXPORT_SIZE:-1360x852}"
+CAPTURE_ISO=0
+KEEP_OPEN=0
+ISO_MODE=""
+ISO_COLOR=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --model." >&2
+        exit 1
+      }
+      MODEL_PATH="$2"
+      shift 2
+      ;;
+    --output)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --output." >&2
+        exit 1
+      }
+      OUTPUT_PATH="$2"
+      shift 2
+      ;;
+    --size)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --size." >&2
+        exit 1
+      }
+      EXPORT_SIZE="$2"
+      shift 2
+      ;;
+    --mode)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --mode." >&2
+        exit 1
+      }
+      ISO_MODE="$2"
+      shift 2
+      ;;
+    --color)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --color." >&2
+        exit 1
+      }
+      ISO_COLOR="$2"
+      shift 2
+      ;;
+    --iso)
+      CAPTURE_ISO=1
+      shift
+      ;;
+    --keep-open)
+      KEEP_OPEN=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+[ -n "$MODEL_PATH" ] || {
+  echo "You must provide --model PATH." >&2
+  usage >&2
+  exit 1
+}
+
+[ -n "$OUTPUT_PATH" ] || {
+  echo "You must provide --output PNG." >&2
+  usage >&2
+  exit 1
+}
+
+if [ ! -f "$MODEL_PATH" ]; then
+  echo "Model file not found: $MODEL_PATH" >&2
+  exit 1
+fi
+
+if [ ! -x "$BIN_PATH" ]; then
+  echo "Building gdis-gtk4 first..."
+  make -C "$SCRIPT_DIR"
+fi
+
+GDIS_GTK4_NON_UNIQUE=1 \
+GDIS_GTK4_FORCE_STARTUP_PATHS=1 \
+GDIS_GTK4_STARTUP_MODEL_PATH="$MODEL_PATH" \
+GDIS_GTK4_STARTUP_EXPORT_PNG="$OUTPUT_PATH" \
+GDIS_GTK4_STARTUP_EXPORT_SIZE="$EXPORT_SIZE" \
+GDIS_GTK4_STARTUP_CAPTURE_ISO="$CAPTURE_ISO" \
+GDIS_GTK4_STARTUP_ISO_MODE="$ISO_MODE" \
+GDIS_GTK4_STARTUP_ISO_COLOR="$ISO_COLOR" \
+GDIS_GTK4_STARTUP_EXPORT_AND_QUIT=$([ "$KEEP_OPEN" -eq 1 ] && printf '%s' 0 || printf '%s' 1) \
+"$BIN_PATH" "$MODEL_PATH"
+
+if [ ! -f "$OUTPUT_PATH" ]; then
+  echo "Export did not produce: $OUTPUT_PATH" >&2
+  exit 1
+fi
+
+echo "Exported PNG: $OUTPUT_PATH"

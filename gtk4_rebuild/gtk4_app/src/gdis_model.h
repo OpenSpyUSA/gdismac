@@ -37,6 +37,8 @@ typedef struct
   gchar *ff_type;
   gdouble position[3];
   gdouble occupancy;
+  gdouble charge;
+  gboolean has_charge;
   gint region;
 } GdisAtom;
 
@@ -68,9 +70,18 @@ typedef struct
   guint atom_count;
   guint bond_count;
   guint explicit_bond_count;
+  gboolean has_total_charge;
+  gdouble total_charge_e;
+  gboolean has_density;
+  gdouble density_g_cm3;
+  gboolean has_energy;
+  gdouble energy_ev;
+  gboolean has_force_rms;
+  gdouble force_rms_ev_ang;
 
   GPtrArray *atoms;
   GArray *bonds;
+  GHashTable *element_covalent_overrides;
   GPtrArray *frames;
   guint current_frame_index;
 } GdisModel;
@@ -160,6 +171,17 @@ gboolean gdis_model_set_frame_index(GdisModel *model,
                                     guint frame_index,
                                     GError **error);
 void gdis_model_discard_frames(GdisModel *model);
+guint gdis_model_get_component_count(const GdisModel *model);
+gboolean gdis_model_get_cell_volume(const GdisModel *model, gdouble *volume_out);
+gboolean gdis_model_get_cell_matrix(const GdisModel *model,
+                                    gdouble matrix[9],
+                                    gdouble inverse[9]);
+void gdis_model_compute_minimum_image_delta(const GdisModel *model,
+                                            const gdouble matrix[9],
+                                            const gdouble inverse[9],
+                                            const gdouble from[3],
+                                            const gdouble to[3],
+                                            gdouble delta[3]);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GdisModel, gdis_model_free)
 

@@ -18,3 +18,8 @@ tmp/
 
 # Local screenshots and captures
 Screenshot*.png
+
+# Local Qbox runtime/output folders and scratch helpers
+models/GDIS/qbox_jobs/
+examples/GDIS/
+gtk4_rebuild/gtk4_app/tools/model_probe.c
