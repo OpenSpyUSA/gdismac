@@ -12,6 +12,7 @@ typedef enum
   GDIS_MODEL_FORMAT_ARC,
   GDIS_MODEL_FORMAT_CAR,
   GDIS_MODEL_FORMAT_CIF,
+  GDIS_MODEL_FORMAT_VASP_XML,
   GDIS_MODEL_FORMAT_QBOX_XML,
   GDIS_MODEL_FORMAT_GULP_INPUT,
   GDIS_MODEL_FORMAT_GULP_OUTPUT,
@@ -78,6 +79,22 @@ typedef struct
   gdouble energy_ev;
   gboolean has_force_rms;
   gdouble force_rms_ev_ang;
+  gboolean has_pressure;
+  gdouble pressure_gpa;
+  gboolean has_fermi_energy;
+  gdouble fermi_energy_ev;
+  GArray *pressure_x_values;
+  GArray *pressure_y_values_gpa;
+  GArray *dos_x_values_ev;
+  GArray *dos_y_values;
+  GArray *band_x_values;
+  GArray *band_y_values_ev;
+  guint band_path_count;
+  guint band_series_count;
+  GArray *frequency_x_values_cm1;
+  GArray *frequency_y_values;
+  GArray *raman_x_values_cm1;
+  GArray *raman_y_values;
 
   GPtrArray *atoms;
   GArray *bonds;

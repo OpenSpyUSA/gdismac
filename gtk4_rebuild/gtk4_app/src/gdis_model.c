@@ -98,6 +98,7 @@ static gboolean gdis_model_load_arc_like(GdisModel *model,
                                          GdisModelFormat format,
                                          GError **error);
 static gboolean gdis_model_load_cif(GdisModel *model, const gchar *contents, GError **error);
+static gboolean gdis_model_load_vasp_xml(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_qbox_xml(GdisModel *model, const gchar *contents, GError **error);
 static gboolean gdis_model_load_gulp_input_like(GdisModel *model,
                                                 const gchar *contents,
@@ -238,6 +239,51 @@ static gboolean gdis_surface_build_cell_from_vectors(const gdouble a_vec[3],
                                                      const gdouble c_vec[3],
                                                      gdouble lengths[3],
                                                      gdouble angles[3]);
+static GArray *gdis_double_array_new(void);
+static GArray *gdis_double_array_clone(const GArray *source);
+static GPtrArray *gdis_double_array_ptr_array_clone(const GPtrArray *source);
+static void gdis_model_clear_plot_arrays(GdisModel *model);
+static void gdis_model_build_stick_spectrum_arrays(const GArray *positions,
+                                                   const GArray *intensities,
+                                                   GArray **x_values_out,
+                                                   GArray **y_values_out);
+static guint gdis_collect_doubles_from_text_scan(const gchar *text,
+                                                 gdouble *values,
+                                                 guint max_values);
+static guint gdis_model_parse_vasp_atom_symbols(const gchar *contents,
+                                                GPtrArray *symbols_out);
+static gboolean gdis_model_parse_vasp_structure_block(GdisModel *model,
+                                                      gchar **lines,
+                                                      guint start_index,
+                                                      const GPtrArray *atom_symbols,
+                                                      GPtrArray **atoms_out,
+                                                      gdouble lengths_out[3],
+                                                      gdouble angles_out[3],
+                                                      guint *end_index_out);
+static gboolean gdis_model_build_band_arrays_from_triplets(const GArray *kpoint_triplets,
+                                                           GPtrArray *kpoint_bands,
+                                                           gdouble fermi_energy_ev,
+                                                           GArray **x_values_out,
+                                                           GArray **y_values_out,
+                                                           guint *path_count_out,
+                                                           guint *series_count_out);
+static gboolean gdis_model_parse_vasp_dos_block(gchar **lines,
+                                                guint start_index,
+                                                GArray **dos_x_values_out,
+                                                GArray **dos_y_values_out,
+                                                gboolean *have_fermi_energy_out,
+                                                gdouble *fermi_energy_ev_out,
+                                                guint *end_index_out);
+static gboolean gdis_model_parse_vasp_eigenvalues_block(gchar **lines,
+                                                        guint start_index,
+                                                        const GArray *kpoint_triplets,
+                                                        gboolean have_fermi_energy,
+                                                        gdouble fermi_energy_ev,
+                                                        GArray **band_x_values_out,
+                                                        GArray **band_y_values_out,
+                                                        guint *path_count_out,
+                                                        guint *series_count_out,
+                                                        guint *end_index_out);
 static gint gdis_str_ibegin(const char *s1, const char *s2);
 static gint gdis_build_sginfo_compat(T_SgInfo *sg_info, const gchar *space_group_text);
 static void gdis_free_sginfo_compat(T_SgInfo *sg_info);
@@ -314,6 +360,11 @@ static gboolean gdis_model_sum_known_charge_atoms(const GPtrArray *atoms,
 static gboolean gdis_model_sum_legacy_visible_charge(const GPtrArray *atoms,
                                                      gdouble *total_charge_out);
 
+static const gdouble GDIS_QBOX_BOHR_TO_ANGSTROM = 0.529177210903;
+static const gdouble GDIS_QBOX_HARTREE_TO_EV = 27.211386245988;
+static const gdouble GDIS_QBOX_HARTREE_PER_BOHR_TO_EV_PER_ANG =
+  GDIS_QBOX_HARTREE_TO_EV / GDIS_QBOX_BOHR_TO_ANGSTROM;
+
 GQuark
 gdis_model_error_quark(void)
 {
@@ -388,6 +439,9 @@ gdis_model_load(const char *path, GError **error)
       break;
     case GDIS_MODEL_FORMAT_CIF:
       ok = gdis_model_load_cif(model, contents, error);
+      break;
+    case GDIS_MODEL_FORMAT_VASP_XML:
+      ok = gdis_model_load_vasp_xml(model, contents, error);
       break;
     case GDIS_MODEL_FORMAT_QBOX_XML:
       ok = gdis_model_load_qbox_xml(model, contents, error);
@@ -478,6 +532,24 @@ gdis_model_clone(const GdisModel *model)
   copy->density_g_cm3 = model->density_g_cm3;
   copy->has_energy = model->has_energy;
   copy->energy_ev = model->energy_ev;
+  copy->has_force_rms = model->has_force_rms;
+  copy->force_rms_ev_ang = model->force_rms_ev_ang;
+  copy->has_pressure = model->has_pressure;
+  copy->pressure_gpa = model->pressure_gpa;
+  copy->has_fermi_energy = model->has_fermi_energy;
+  copy->fermi_energy_ev = model->fermi_energy_ev;
+  copy->pressure_x_values = gdis_double_array_clone(model->pressure_x_values);
+  copy->pressure_y_values_gpa = gdis_double_array_clone(model->pressure_y_values_gpa);
+  copy->dos_x_values_ev = gdis_double_array_clone(model->dos_x_values_ev);
+  copy->dos_y_values = gdis_double_array_clone(model->dos_y_values);
+  copy->band_x_values = gdis_double_array_clone(model->band_x_values);
+  copy->band_y_values_ev = gdis_double_array_clone(model->band_y_values_ev);
+  copy->band_path_count = model->band_path_count;
+  copy->band_series_count = model->band_series_count;
+  copy->frequency_x_values_cm1 = gdis_double_array_clone(model->frequency_x_values_cm1);
+  copy->frequency_y_values = gdis_double_array_clone(model->frequency_y_values);
+  copy->raman_x_values_cm1 = gdis_double_array_clone(model->raman_x_values_cm1);
+  copy->raman_y_values = gdis_double_array_clone(model->raman_y_values);
   copy->atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
   copy->bonds = g_array_sized_new(FALSE,
                                   FALSE,
@@ -589,6 +661,7 @@ gdis_model_clear_contents(GdisModel *model)
   g_clear_pointer(&model->format_label, g_free);
   g_clear_pointer(&model->space_group, g_free);
   g_clear_pointer(&model->element_covalent_overrides, g_hash_table_unref);
+  gdis_model_clear_plot_arrays(model);
 
   if (model->atoms)
     g_ptr_array_free(model->atoms, TRUE);
@@ -599,6 +672,119 @@ gdis_model_clear_contents(GdisModel *model)
   model->atoms = NULL;
   model->bonds = NULL;
   model->frames = NULL;
+}
+
+static GArray *
+gdis_double_array_new(void)
+{
+  return g_array_new(FALSE, FALSE, sizeof(gdouble));
+}
+
+static GArray *
+gdis_double_array_clone(const GArray *source)
+{
+  GArray *copy;
+
+  if (!source)
+    return NULL;
+
+  copy = gdis_double_array_new();
+  if (source->len > 0u)
+    g_array_append_vals(copy, source->data, source->len);
+  return copy;
+}
+
+static GPtrArray *
+gdis_double_array_ptr_array_clone(const GPtrArray *source)
+{
+  GPtrArray *copy;
+
+  if (!source)
+    return NULL;
+
+  copy = g_ptr_array_new_with_free_func((GDestroyNotify) g_array_unref);
+  for (guint i = 0; i < source->len; i++)
+    {
+      const GArray *row;
+
+      row = g_ptr_array_index((GPtrArray *) source, i);
+      if (!row)
+        continue;
+      g_ptr_array_add(copy, gdis_double_array_clone(row));
+    }
+  return copy;
+}
+
+static void
+gdis_model_clear_plot_arrays(GdisModel *model)
+{
+  g_return_if_fail(model != NULL);
+
+  g_clear_pointer(&model->pressure_x_values, g_array_unref);
+  g_clear_pointer(&model->pressure_y_values_gpa, g_array_unref);
+  g_clear_pointer(&model->dos_x_values_ev, g_array_unref);
+  g_clear_pointer(&model->dos_y_values, g_array_unref);
+  g_clear_pointer(&model->band_x_values, g_array_unref);
+  g_clear_pointer(&model->band_y_values_ev, g_array_unref);
+  g_clear_pointer(&model->frequency_x_values_cm1, g_array_unref);
+  g_clear_pointer(&model->frequency_y_values, g_array_unref);
+  g_clear_pointer(&model->raman_x_values_cm1, g_array_unref);
+  g_clear_pointer(&model->raman_y_values, g_array_unref);
+  model->has_pressure = FALSE;
+  model->pressure_gpa = 0.0;
+  model->has_fermi_energy = FALSE;
+  model->fermi_energy_ev = 0.0;
+  model->band_path_count = 0u;
+  model->band_series_count = 0u;
+}
+
+static void
+gdis_model_build_stick_spectrum_arrays(const GArray *positions,
+                                       const GArray *intensities,
+                                       GArray **x_values_out,
+                                       GArray **y_values_out)
+{
+  GArray *x_values;
+  GArray *y_values;
+  guint count;
+
+  g_return_if_fail(x_values_out != NULL);
+  g_return_if_fail(y_values_out != NULL);
+
+  *x_values_out = NULL;
+  *y_values_out = NULL;
+
+  if (!positions || positions->len == 0u)
+    return;
+
+  count = positions->len;
+  if (intensities && intensities->len > 0u)
+    count = MIN(count, intensities->len);
+
+  if (count == 0u)
+    return;
+
+  x_values = gdis_double_array_new();
+  y_values = gdis_double_array_new();
+
+  for (guint i = 0; i < count; i++)
+    {
+      const gdouble x_value = g_array_index(positions, gdouble, i);
+      const gdouble y_value = intensities
+                                ? fabs(g_array_index(intensities, gdouble, i))
+                                : 1.0;
+      const gdouble baseline = 0.0;
+
+      g_array_append_val(x_values, x_value);
+      g_array_append_val(y_values, baseline);
+      g_array_append_val(x_values, x_value);
+      g_array_append_val(y_values, y_value);
+      g_array_append_val(x_values, x_value);
+      g_array_append_val(y_values, baseline);
+    }
+
+  *x_values_out = x_values;
+  *y_values_out = y_values;
 }
 
 gboolean
@@ -636,6 +822,12 @@ gdis_model_save(GdisModel *model, const char *path, GError **error)
       break;
     case GDIS_MODEL_FORMAT_CIF:
       contents = gdis_model_write_cif(model, error);
+      break;
+    case GDIS_MODEL_FORMAT_VASP_XML:
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_UNSUPPORTED_FORMAT,
+                  "Saving VASP XML is not available from this app.");
       break;
     case GDIS_MODEL_FORMAT_QBOX_XML:
       g_set_error(error,
@@ -1868,7 +2060,7 @@ gdis_model_format_from_path(const char *path)
       g_autofree gchar *basename_lower = g_ascii_strdown(basename ? basename : "", -1);
 
       if (g_str_has_prefix(basename_lower, "vasprun"))
-        format = GDIS_MODEL_FORMAT_UNKNOWN;
+        format = GDIS_MODEL_FORMAT_VASP_XML;
       else
         format = GDIS_MODEL_FORMAT_QBOX_XML;
     }
@@ -1906,6 +2098,8 @@ gdis_model_format_label(GdisModelFormat format)
       return "BIOSYM CAR";
     case GDIS_MODEL_FORMAT_CIF:
       return "CIF";
+    case GDIS_MODEL_FORMAT_VASP_XML:
+      return "VASP XML";
     case GDIS_MODEL_FORMAT_QBOX_XML:
       return "Qbox XML";
     case GDIS_MODEL_FORMAT_GULP_INPUT:
@@ -2181,6 +2375,10 @@ gdis_model_frame_clone(const GdisModelFrame *frame)
   copy->periodicity = frame->periodicity;
   memcpy(copy->cell_lengths, frame->cell_lengths, sizeof(copy->cell_lengths));
   memcpy(copy->cell_angles, frame->cell_angles, sizeof(copy->cell_angles));
+  copy->has_energy = frame->has_energy;
+  copy->energy_ev = frame->energy_ev;
+  copy->has_force_rms = frame->has_force_rms;
+  copy->force_rms_ev_ang = frame->force_rms_ev_ang;
 
   if (frame->atoms)
     {
@@ -2271,6 +2469,10 @@ gdis_model_frame_apply(GdisModel *model, const GdisModelFrame *frame)
   model->periodicity = frame->periodicity;
   memcpy(model->cell_lengths, frame->cell_lengths, sizeof(model->cell_lengths));
   memcpy(model->cell_angles, frame->cell_angles, sizeof(model->cell_angles));
+  model->has_energy = frame->has_energy;
+  model->energy_ev = frame->energy_ev;
+  model->has_force_rms = frame->has_force_rms;
+  model->force_rms_ev_ang = frame->force_rms_ev_ang;
 
   if (gdis_model_frame_bonds_need_reset(model))
     {
@@ -4412,6 +4614,13 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   guint best_charge_priority;
   guint best_charge_config_index;
   gboolean best_has_total_charge;
+  gboolean have_pressure;
+  gdouble last_pressure_gpa;
+  GArray *pressure_x_values;
+  GArray *pressure_y_values;
+  GArray *frequency_values;
+  GArray *frequency_intensities;
+  GArray *raman_values;
   gboolean selected_config_has_shell_species;
   g_autofree gchar *selected_context_space_group = NULL;
   gdouble selected_context_surface_a[3];
@@ -4447,6 +4656,13 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   best_charge_priority = 0u;
   best_charge_config_index = 0u;
   best_has_total_charge = FALSE;
+  have_pressure = FALSE;
+  last_pressure_gpa = 0.0;
+  pressure_x_values = gdis_double_array_new();
+  pressure_y_values = gdis_double_array_new();
+  frequency_values = NULL;
+  frequency_intensities = NULL;
+  raman_values = NULL;
   selected_config_has_shell_species = FALSE;
   gdis_vec3_set(context_surface_a, 0.0, 0.0, 0.0);
   gdis_vec3_set(context_surface_b, 0.0, 0.0, 0.0);
@@ -4505,6 +4721,115 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
             {
               model->density_g_cm3 = values[0];
               model->has_density = TRUE;
+            }
+          continue;
+        }
+
+      if (current_config_index == selected_config_index &&
+          g_strstr_len(lower, -1, "pressure of configuration") != NULL &&
+          g_strstr_len(lower, -1, "gpa") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_text_scan(trimmed, values, 1u) >= 1u)
+            {
+              const gdouble x_value = (gdouble) pressure_y_values->len + 1.0;
+
+              g_array_append_val(pressure_x_values, x_value);
+              g_array_append_val(pressure_y_values, values[0]);
+              last_pressure_gpa = values[0];
+              have_pressure = TRUE;
+            }
+          continue;
+        }
+
+      if (current_config_index == selected_config_index &&
+          g_strstr_len(lower, -1, "frequencies (cm-1)") != NULL)
+        {
+          GArray *parsed_frequencies;
+          guint scan_index;
+
+          parsed_frequencies = gdis_double_array_new();
+          scan_index = i + 1u;
+          for (; lines[scan_index] != NULL; scan_index++)
+            {
+              gchar *freq_line;
+              g_autofree gchar *freq_lower = NULL;
+              gdouble values[64];
+              guint count;
+
+              freq_line = g_strstrip(lines[scan_index]);
+              if (freq_line[0] == '\0')
+                {
+                  if (parsed_frequencies->len > 0u)
+                    break;
+                  continue;
+                }
+
+              freq_lower = g_ascii_strdown(freq_line, -1);
+              if (freq_line[0] == '-')
+                {
+                  if (parsed_frequencies->len > 0u)
+                    break;
+                  continue;
+                }
+              if (g_strstr_len(freq_lower, -1, "phonon properties") != NULL ||
+                  g_strstr_len(freq_lower, -1, "phonon density of states") != NULL)
+                {
+                  if (parsed_frequencies->len > 0u)
+                    {
+                      scan_index--;
+                      break;
+                    }
+                  continue;
+                }
+
+              count = gdis_collect_doubles_from_text_scan(freq_line,
+                                                          values,
+                                                          G_N_ELEMENTS(values));
+              if (count == 0u)
+                {
+                  if (parsed_frequencies->len > 0u)
+                    {
+                      scan_index--;
+                      break;
+                    }
+                  continue;
+                }
+              g_array_append_vals(parsed_frequencies, values, count);
+            }
+
+          if (parsed_frequencies->len > 0u)
+            {
+              g_clear_pointer(&frequency_values, g_array_unref);
+              frequency_values = parsed_frequencies;
+            }
+          else
+            {
+              g_array_unref(parsed_frequencies);
+            }
+
+          if (lines[scan_index] != NULL)
+            i = scan_index;
+          else
+            i = scan_index - 1u;
+          continue;
+        }
+
+      if (current_config_index == selected_config_index &&
+          g_str_has_prefix(lower, "raman"))
+        {
+          gdouble values[64];
+          guint count;
+
+          count = gdis_collect_doubles_from_text_scan(trimmed,
+                                                      values,
+                                                      G_N_ELEMENTS(values));
+          if (count > 0u)
+            {
+              if (!raman_values)
+                raman_values = gdis_double_array_new();
+              g_array_append_vals(raman_values, values, count);
             }
           continue;
         }
@@ -5241,6 +5566,7 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
     }
 
   g_strfreev(lines);
+  gdis_model_clear_plot_arrays(model);
 
   if (!best_atoms)
     {
@@ -5328,6 +5654,11 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
     {
       if (best_atoms)
         g_ptr_array_free(best_atoms, TRUE);
+      g_clear_pointer(&pressure_x_values, g_array_unref);
+      g_clear_pointer(&pressure_y_values, g_array_unref);
+      g_clear_pointer(&frequency_values, g_array_unref);
+      g_clear_pointer(&frequency_intensities, g_array_unref);
+      g_clear_pointer(&raman_values, g_array_unref);
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_PARSE,
@@ -5343,10 +5674,59 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
   model->periodicity = best_periodicity;
   memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
   memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+  model->has_pressure = have_pressure;
+  model->pressure_gpa = last_pressure_gpa;
   if (best_space_group && best_space_group[0] != '\0')
     {
       g_clear_pointer(&model->space_group, g_free);
       model->space_group = g_strdup(best_space_group);
+    }
+
+  if (have_pressure && pressure_y_values->len > 0u)
+    {
+      model->pressure_x_values = pressure_x_values;
+      model->pressure_y_values_gpa = pressure_y_values;
+      pressure_x_values = NULL;
+      pressure_y_values = NULL;
+    }
+
+  if (frequency_values && frequency_values->len > 0u)
+    {
+      frequency_intensities = gdis_double_array_new();
+      for (guint i = 0; i < frequency_values->len; i++)
+        {
+          const gdouble intensity = 1.0;
+
+          g_array_append_val(frequency_intensities, intensity);
+        }
+      gdis_model_build_stick_spectrum_arrays(frequency_values,
+                                             frequency_intensities,
+                                             &model->frequency_x_values_cm1,
+                                             &model->frequency_y_values);
+    }
+
+  if (raman_values && raman_values->len > 0u)
+    {
+      GArray *raman_positions;
+
+      if (frequency_values && frequency_values->len > 0u)
+        raman_positions = gdis_double_array_clone(frequency_values);
+      else
+        {
+          raman_positions = gdis_double_array_new();
+          for (guint i = 0; i < raman_values->len; i++)
+            {
+              const gdouble mode_index = (gdouble) i + 1.0;
+
+              g_array_append_val(raman_positions, mode_index);
+            }
+        }
+
+      gdis_model_build_stick_spectrum_arrays(raman_positions,
+                                             raman_values,
+                                             &model->raman_x_values_cm1,
+                                             &model->raman_y_values);
+      g_array_unref(raman_positions);
     }
 
   if (best_from_fractional_block &&
@@ -5355,6 +5735,12 @@ gdis_model_load_gulp_output(GdisModel *model, const gchar *contents, GError **er
       model->space_group &&
       model->space_group[0] != '\0')
     gdis_model_expand_space_group_atoms(model, 0);
+
+  g_clear_pointer(&pressure_x_values, g_array_unref);
+  g_clear_pointer(&pressure_y_values, g_array_unref);
+  g_clear_pointer(&frequency_values, g_array_unref);
+  g_clear_pointer(&frequency_intensities, g_array_unref);
+  g_clear_pointer(&raman_values, g_array_unref);
 
   return TRUE;
 }
@@ -5756,6 +6142,25 @@ gdis_model_load_qe_like(GdisModel *model,
   guint best_periodicity;
   gdouble best_lengths[3];
   gdouble best_angles[3];
+  GArray *pressure_x_values;
+  GArray *pressure_y_values;
+  GPtrArray *current_band_rows;
+  GPtrArray *best_band_rows;
+  GArray *current_band_kpoint_triplets;
+  GArray *best_band_kpoint_triplets;
+  GArray *band_x_values;
+  GArray *band_y_values;
+  guint expected_kpoint_count;
+  guint pressure_step;
+  guint band_path_count;
+  guint band_series_count;
+  gboolean have_pressure;
+  gdouble last_pressure_gpa;
+  gboolean have_fermi_energy;
+  gdouble fermi_energy_ev;
+  gboolean have_energy;
+  gdouble last_energy_ev;
+  const gdouble ry_to_ev = 13.605693122994;
 
   g_return_val_if_fail(model != NULL, FALSE);
   g_return_val_if_fail(contents != NULL, FALSE);
@@ -5776,6 +6181,24 @@ gdis_model_load_qe_like(GdisModel *model,
   best_periodicity = 0u;
   best_lengths[0] = best_lengths[1] = best_lengths[2] = 0.0;
   best_angles[0] = best_angles[1] = best_angles[2] = 90.0;
+  pressure_x_values = gdis_double_array_new();
+  pressure_y_values = gdis_double_array_new();
+  current_band_rows = g_ptr_array_new_with_free_func((GDestroyNotify) g_array_unref);
+  best_band_rows = NULL;
+  current_band_kpoint_triplets = gdis_double_array_new();
+  best_band_kpoint_triplets = NULL;
+  band_x_values = NULL;
+  band_y_values = NULL;
+  expected_kpoint_count = 0u;
+  pressure_step = 0u;
+  band_path_count = 0u;
+  band_series_count = 0u;
+  have_pressure = FALSE;
+  last_pressure_gpa = 0.0;
+  have_fermi_energy = FALSE;
+  fermi_energy_ev = 0.0;
+  have_energy = FALSE;
+  last_energy_ev = 0.0;
 
   for (guint i = 0; lines[i] != NULL; i++)
     {
@@ -5796,6 +6219,16 @@ gdis_model_load_qe_like(GdisModel *model,
           gdouble values[1];
           if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u)
             alat_bohr = values[0];
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "number of k points") != NULL && strchr(trimmed, '=') != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_line(trimmed, values, 1u) >= 1u &&
+              values[0] > 0.0)
+            expected_kpoint_count = (guint) llround(values[0]);
           continue;
         }
 
@@ -5887,6 +6320,54 @@ gdis_model_load_qe_like(GdisModel *model,
                     }
                 }
             }
+        }
+
+      if (g_strstr_len(lower, -1, "total energy") != NULL &&
+          g_strstr_len(lower, -1, "ry") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_text_scan(trimmed, values, 1u) >= 1u)
+            {
+              last_energy_ev = values[0] * ry_to_ev;
+              have_energy = TRUE;
+            }
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "fermi energy") != NULL ||
+          g_strstr_len(lower, -1, "highest occupied level") != NULL)
+        {
+          gdouble values[2];
+
+          if (gdis_collect_doubles_from_text_scan(trimmed, values, 2u) >= 1u)
+            {
+              fermi_energy_ev = values[0];
+              have_fermi_energy = TRUE;
+            }
+          continue;
+        }
+
+      if (g_strstr_len(lower, -1, "total   stress") != NULL)
+        {
+          const gchar *pressure_text;
+          gdouble values[1];
+
+          pressure_text = strstr(trimmed, "P=");
+          if (!pressure_text)
+            pressure_text = strstr(trimmed, "p=");
+          if (pressure_text &&
+              gdis_collect_doubles_from_text_scan(pressure_text, values, 1u) >= 1u)
+            {
+              const gdouble pressure_gpa = values[0] * 0.1;
+              const gdouble x_value = (gdouble) (++pressure_step);
+
+              g_array_append_val(pressure_x_values, x_value);
+              g_array_append_val(pressure_y_values, pressure_gpa);
+              last_pressure_gpa = pressure_gpa;
+              have_pressure = TRUE;
+            }
+          continue;
         }
 
       if (g_str_has_prefix(lower, "cell_parameters"))
@@ -6104,14 +6585,146 @@ gdis_model_load_qe_like(GdisModel *model,
 
           continue;
         }
+
+      if (g_strstr_len(lower, -1, "bands (ev):") != NULL &&
+          strchr(trimmed, '=') != NULL)
+        {
+          gdouble header_values[16];
+          guint header_count;
+          GArray *band_values;
+          guint scan_index;
+
+          header_count = gdis_collect_doubles_from_text_scan(trimmed,
+                                                             header_values,
+                                                             G_N_ELEMENTS(header_values));
+          if (header_count < 3u)
+            continue;
+
+          if (expected_kpoint_count > 0u &&
+              current_band_rows->len >= expected_kpoint_count)
+            {
+              if (best_band_rows)
+                g_ptr_array_free(best_band_rows, TRUE);
+              best_band_rows = gdis_double_array_ptr_array_clone(current_band_rows);
+              g_clear_pointer(&best_band_kpoint_triplets, g_array_unref);
+              best_band_kpoint_triplets = gdis_double_array_clone(current_band_kpoint_triplets);
+              g_ptr_array_set_size(current_band_rows, 0u);
+              g_array_set_size(current_band_kpoint_triplets, 0u);
+            }
+
+          band_values = gdis_double_array_new();
+          scan_index = i + 1u;
+          for (; lines[scan_index] != NULL; scan_index++)
+            {
+              gchar *row_line;
+              g_autofree gchar *row_lower = NULL;
+              gdouble row_values[64];
+              guint row_count;
+
+              row_line = g_strstrip(lines[scan_index]);
+              if (row_line[0] == '\0')
+                {
+                  if (band_values->len > 0u)
+                    break;
+                  continue;
+                }
+
+              row_lower = g_ascii_strdown(row_line, -1);
+              if (g_strstr_len(row_lower, -1, "bands (ev):") != NULL ||
+                  g_strstr_len(row_lower, -1, "highest occupied level") != NULL ||
+                  g_strstr_len(row_lower, -1, "fermi energy") != NULL ||
+                  g_strstr_len(row_lower, -1, "total   stress") != NULL ||
+                  g_str_has_prefix(row_lower, "atomic_positions") ||
+                  g_str_has_prefix(row_lower, "cell_parameters") ||
+                  g_str_has_prefix(row_lower, "end") ||
+                  g_str_has_prefix(row_lower, "begin") ||
+                  g_str_has_prefix(row_lower, "&"))
+                {
+                  if (band_values->len > 0u)
+                    {
+                      scan_index--;
+                      break;
+                    }
+                  continue;
+                }
+
+              row_count = gdis_collect_doubles_from_text_scan(row_line,
+                                                              row_values,
+                                                              G_N_ELEMENTS(row_values));
+              if (row_count == 0u)
+                {
+                  if (band_values->len > 0u)
+                    {
+                      scan_index--;
+                      break;
+                    }
+                  continue;
+                }
+
+              g_array_append_vals(band_values, row_values, row_count);
+            }
+
+          if (band_values->len > 0u)
+            {
+              const gdouble coords[3] = {
+                header_values[0],
+                header_values[1],
+                header_values[2]
+              };
+
+              g_array_append_vals(current_band_kpoint_triplets, coords, 3u);
+              g_ptr_array_add(current_band_rows, band_values);
+            }
+          else
+            {
+              g_array_unref(band_values);
+            }
+
+          if (expected_kpoint_count > 0u &&
+              current_band_rows->len == expected_kpoint_count)
+            {
+              if (best_band_rows)
+                g_ptr_array_free(best_band_rows, TRUE);
+              best_band_rows = gdis_double_array_ptr_array_clone(current_band_rows);
+              g_clear_pointer(&best_band_kpoint_triplets, g_array_unref);
+              best_band_kpoint_triplets = gdis_double_array_clone(current_band_kpoint_triplets);
+              g_ptr_array_set_size(current_band_rows, 0u);
+              g_array_set_size(current_band_kpoint_triplets, 0u);
+            }
+
+          if (lines[scan_index] != NULL)
+            i = scan_index;
+          else
+            i = scan_index - 1u;
+          continue;
+        }
     }
 
   g_strfreev(lines);
+  if (current_band_rows->len > 0u &&
+      (!best_band_rows || current_band_rows->len >= best_band_rows->len))
+    {
+      if (best_band_rows)
+        g_ptr_array_free(best_band_rows, TRUE);
+      best_band_rows = gdis_double_array_ptr_array_clone(current_band_rows);
+      g_clear_pointer(&best_band_kpoint_triplets, g_array_unref);
+      best_band_kpoint_triplets = gdis_double_array_clone(current_band_kpoint_triplets);
+    }
+  g_ptr_array_free(current_band_rows, TRUE);
+  g_array_unref(current_band_kpoint_triplets);
+  gdis_model_clear_plot_arrays(model);
 
   if (!best_atoms || best_atoms->len == 0u)
     {
       if (best_atoms)
         g_ptr_array_free(best_atoms, TRUE);
+      g_clear_pointer(&pressure_x_values, g_array_unref);
+      g_clear_pointer(&pressure_y_values, g_array_unref);
+      g_clear_pointer(&best_band_kpoint_triplets, g_array_unref);
+      g_clear_pointer(&band_x_values, g_array_unref);
+      g_clear_pointer(&band_y_values, g_array_unref);
+      if (best_band_rows)
+        g_ptr_array_free(best_band_rows, TRUE);
       g_set_error(error,
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_PARSE,
@@ -6127,6 +6740,527 @@ gdis_model_load_qe_like(GdisModel *model,
   model->periodicity = best_periodicity;
   memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
   memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+  model->has_energy = have_energy;
+  model->energy_ev = last_energy_ev;
+  model->has_pressure = have_pressure;
+  model->pressure_gpa = last_pressure_gpa;
+  model->has_fermi_energy = have_fermi_energy;
+  model->fermi_energy_ev = fermi_energy_ev;
+
+  if (pressure_y_values->len > 0u)
+    {
+      model->pressure_x_values = pressure_x_values;
+      model->pressure_y_values_gpa = pressure_y_values;
+    }
+  else
+    {
+      g_array_unref(pressure_x_values);
+      g_array_unref(pressure_y_values);
+    }
+
+  if (best_band_rows && best_band_rows->len > 0u)
+    {
+      gdis_model_build_band_arrays_from_triplets(best_band_kpoint_triplets,
+                                                 best_band_rows,
+                                                 have_fermi_energy ? fermi_energy_ev : 0.0,
+                                                 &band_x_values,
+                                                 &band_y_values,
+                                                 &band_path_count,
+                                                 &band_series_count);
+    }
+  model->band_x_values = band_x_values;
+  model->band_y_values_ev = band_y_values;
+  model->band_path_count = band_path_count;
+  model->band_series_count = band_series_count;
+
+  g_clear_pointer(&best_band_kpoint_triplets, g_array_unref);
+  if (best_band_rows)
+    g_ptr_array_free(best_band_rows, TRUE);
+
+  return TRUE;
+}
+
+static gboolean
+gdis_model_load_vasp_xml(GdisModel *model, const gchar *contents, GError **error)
+{
+  gchar **lines;
+  GPtrArray *atom_symbols;
+  GPtrArray *best_atoms;
+  gdouble best_lengths[3];
+  gdouble best_angles[3];
+  GArray *kpoint_triplets;
+  GArray *pressure_x_values;
+  GArray *pressure_y_values;
+  GArray *dos_x_values;
+  GArray *dos_y_values;
+  GArray *band_x_values;
+  GArray *band_y_values;
+  guint band_path_count;
+  guint band_series_count;
+  guint pressure_step;
+  gdouble last_pressure_gpa;
+  gboolean have_pressure;
+  gboolean have_energy;
+  gdouble last_energy_ev;
+  gboolean have_fermi_energy;
+  gdouble fermi_energy_ev;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(contents != NULL, FALSE);
+
+  lines = g_strsplit(contents, "\n", -1);
+  atom_symbols = g_ptr_array_new_with_free_func(g_free);
+  best_atoms = NULL;
+  best_lengths[0] = best_lengths[1] = best_lengths[2] = 0.0;
+  best_angles[0] = best_angles[1] = best_angles[2] = 90.0;
+  kpoint_triplets = gdis_double_array_new();
+  pressure_x_values = gdis_double_array_new();
+  pressure_y_values = gdis_double_array_new();
+  dos_x_values = NULL;
+  dos_y_values = NULL;
+  band_x_values = NULL;
+  band_y_values = NULL;
+  band_path_count = 0u;
+  band_series_count = 0u;
+  pressure_step = 0u;
+  last_pressure_gpa = 0.0;
+  have_pressure = FALSE;
+  have_energy = FALSE;
+  last_energy_ev = 0.0;
+  have_fermi_energy = FALSE;
+  fermi_energy_ev = 0.0;
+
+  gdis_model_parse_vasp_atom_symbols(contents, atom_symbols);
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+
+      trimmed = g_strstrip(lines[i]);
+      if (trimmed[0] == '\0')
+        continue;
+
+      if ((!model->title || model->title[0] == '\0') &&
+          g_strstr_len(trimmed, -1, "name=\"SYSTEM\"") != NULL)
+        {
+          const gchar *start;
+          const gchar *end;
+
+          start = strchr(trimmed, '>');
+          end = start ? strstr(start + 1, "</i>") : NULL;
+          if (start && end && end > start + 1)
+            {
+              g_clear_pointer(&model->title, g_free);
+              model->title = g_strndup(start + 1, (gsize) (end - (start + 1)));
+              g_strstrip(model->title);
+            }
+          continue;
+        }
+
+      if (g_str_has_prefix(trimmed, "<varray name=\"kpointlist\""))
+        {
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *k_line;
+              gdouble values[3];
+
+              k_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(k_line, "</varray>"))
+                break;
+              if (gdis_collect_doubles_from_text_scan(k_line, values, 3u) < 3u)
+                continue;
+              g_array_append_vals(kpoint_triplets, values, 3u);
+            }
+          continue;
+        }
+
+      if (g_str_has_prefix(trimmed, "<calculation>"))
+        {
+          gboolean calc_have_stress;
+          gboolean calc_have_energy;
+          gdouble calc_pressure_gpa;
+          gdouble calc_energy_ev;
+
+          calc_have_stress = FALSE;
+          calc_have_energy = FALSE;
+          calc_pressure_gpa = 0.0;
+          calc_energy_ev = 0.0;
+
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *calc_line;
+
+              calc_line = g_strstrip(lines[i]);
+              if (calc_line[0] == '\0')
+                continue;
+              if (g_str_has_prefix(calc_line, "</calculation>"))
+                break;
+
+              if (g_strstr_len(calc_line, -1, "name=\"e_fr_energy\"") != NULL)
+                {
+                  gdouble values[1];
+
+                  if (gdis_collect_doubles_from_text_scan(calc_line, values, 1u) >= 1u)
+                    {
+                      calc_energy_ev = values[0];
+                      calc_have_energy = TRUE;
+                    }
+                  continue;
+                }
+
+              if (g_str_has_prefix(calc_line, "<varray name=\"stress\""))
+                {
+                  gdouble diag_sum;
+                  guint row_count;
+
+                  diag_sum = 0.0;
+                  row_count = 0u;
+                  for (i = i + 1u; lines[i] != NULL && row_count < 3u; i++)
+                    {
+                      gchar *stress_line;
+                      gdouble values[3];
+
+                      stress_line = g_strstrip(lines[i]);
+                      if (g_str_has_prefix(stress_line, "</varray>"))
+                        break;
+                      if (gdis_collect_doubles_from_text_scan(stress_line, values, 3u) < 3u)
+                        continue;
+                      diag_sum += values[row_count];
+                      row_count++;
+                    }
+                  if (row_count == 3u)
+                    {
+                      calc_pressure_gpa = -(diag_sum / 3.0) * 0.1;
+                      calc_have_stress = TRUE;
+                    }
+                  continue;
+                }
+
+              if (g_str_has_prefix(calc_line, "<structure>"))
+                {
+                  GPtrArray *structure_atoms;
+                  gdouble structure_lengths[3];
+                  gdouble structure_angles[3];
+                  guint structure_end = i;
+
+                  structure_atoms = NULL;
+                  if (gdis_model_parse_vasp_structure_block(model,
+                                                            lines,
+                                                            i,
+                                                            atom_symbols,
+                                                            &structure_atoms,
+                                                            structure_lengths,
+                                                            structure_angles,
+                                                            &structure_end))
+                    {
+                      if (best_atoms)
+                        g_ptr_array_free(best_atoms, TRUE);
+                      best_atoms = structure_atoms;
+                      memcpy(best_lengths, structure_lengths, sizeof(best_lengths));
+                      memcpy(best_angles, structure_angles, sizeof(best_angles));
+                    }
+                  i = structure_end;
+                  continue;
+                }
+            }
+
+          if (calc_have_stress)
+            {
+              gdouble x_value;
+
+              pressure_step++;
+              x_value = (gdouble) pressure_step;
+              g_array_append_val(pressure_x_values, x_value);
+              g_array_append_val(pressure_y_values, calc_pressure_gpa);
+              last_pressure_gpa = calc_pressure_gpa;
+              have_pressure = TRUE;
+            }
+          if (calc_have_energy)
+            {
+              last_energy_ev = calc_energy_ev;
+              have_energy = TRUE;
+            }
+          continue;
+        }
+
+      if (g_str_equal(trimmed, "<dos>"))
+        {
+          GArray *energies;
+          GArray *totals;
+          guint spin_index;
+
+          energies = gdis_double_array_new();
+          totals = gdis_double_array_new();
+          spin_index = 0u;
+
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *dos_line;
+
+              dos_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(dos_line, "</dos>"))
+                break;
+              if (g_strstr_len(dos_line, -1, "name=\"efermi\"") != NULL)
+                {
+                  gdouble values[1];
+
+                  if (gdis_collect_doubles_from_text_scan(dos_line, values, 1u) >= 1u)
+                    {
+                      fermi_energy_ev = values[0];
+                      have_fermi_energy = TRUE;
+                    }
+                  continue;
+                }
+              if (g_str_has_prefix(dos_line, "<set comment=\"spin "))
+                {
+                  spin_index++;
+                  guint dos_index = 0u;
+
+                  for (i = i + 1u; lines[i] != NULL; i++)
+                    {
+                      gchar *row_line;
+                      gdouble values[3];
+
+                      row_line = g_strstrip(lines[i]);
+                      if (g_str_has_prefix(row_line, "</set>"))
+                        break;
+                      if (gdis_collect_doubles_from_text_scan(row_line, values, 3u) < 2u)
+                        continue;
+
+                      if (spin_index == 1u)
+                        {
+                          g_array_append_val(energies, values[0]);
+                          g_array_append_val(totals, values[1]);
+                        }
+                      else if (dos_index < totals->len)
+                        {
+                          gdouble sum_value;
+
+                          sum_value = g_array_index(totals, gdouble, dos_index) + values[1];
+                          g_array_index(totals, gdouble, dos_index) = sum_value;
+                        }
+                      dos_index++;
+                    }
+                }
+            }
+
+          if (energies->len > 0u && totals->len == energies->len)
+            {
+              for (guint idx = 0; idx < energies->len; idx++)
+                {
+                  gdouble shifted;
+
+                  shifted = g_array_index(energies, gdouble, idx) -
+                            (have_fermi_energy ? fermi_energy_ev : 0.0);
+                  g_array_index(energies, gdouble, idx) = shifted;
+                }
+              g_clear_pointer(&dos_x_values, g_array_unref);
+              g_clear_pointer(&dos_y_values, g_array_unref);
+              dos_x_values = energies;
+              dos_y_values = totals;
+              energies = NULL;
+              totals = NULL;
+            }
+
+          g_clear_pointer(&energies, g_array_unref);
+          g_clear_pointer(&totals, g_array_unref);
+          continue;
+        }
+
+      if (g_str_equal(trimmed, "<eigenvalues>"))
+        {
+          GPtrArray *kpoint_bands;
+          gboolean in_spin_one;
+
+          kpoint_bands = g_ptr_array_new_with_free_func((GDestroyNotify) g_array_unref);
+          in_spin_one = FALSE;
+
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *band_line;
+
+              band_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(band_line, "<set comment=\"spin 1\""))
+                {
+                  in_spin_one = TRUE;
+                  continue;
+                }
+              if (g_str_has_prefix(band_line, "<set comment=\"spin 2\"") ||
+                  g_str_has_prefix(band_line, "</eigenvalues>"))
+                break;
+              if (!in_spin_one)
+                continue;
+
+              if (g_str_has_prefix(band_line, "<set comment=\"kpoint "))
+                {
+                  GArray *band_values;
+
+                  band_values = gdis_double_array_new();
+                  for (i = i + 1u; lines[i] != NULL; i++)
+                    {
+                      gchar *row_line;
+                      gdouble values[2];
+
+                      row_line = g_strstrip(lines[i]);
+                      if (g_str_has_prefix(row_line, "</set>"))
+                        break;
+                      if (gdis_collect_doubles_from_text_scan(row_line, values, 2u) < 1u)
+                        continue;
+                      g_array_append_val(band_values, values[0]);
+                    }
+
+                  if (band_values->len > 0u)
+                    g_ptr_array_add(kpoint_bands, band_values);
+                  else
+                    g_array_unref(band_values);
+                }
+            }
+
+          if (kpoint_bands->len > 0u)
+            {
+              g_clear_pointer(&band_x_values, g_array_unref);
+              g_clear_pointer(&band_y_values, g_array_unref);
+              gdis_model_build_band_arrays_from_triplets(kpoint_triplets,
+                                                         kpoint_bands,
+                                                         have_fermi_energy ? fermi_energy_ev : 0.0,
+                                                         &band_x_values,
+                                                         &band_y_values,
+                                                         &band_path_count,
+                                                         &band_series_count);
+            }
+
+          g_ptr_array_free(kpoint_bands, TRUE);
+          continue;
+        }
+    }
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+      GArray *parsed_dos_x;
+      GArray *parsed_dos_y;
+      gboolean parsed_have_fermi;
+      gdouble parsed_fermi_energy_ev;
+      guint end_index;
+
+      trimmed = g_strstrip(lines[i]);
+      if (!g_str_equal(trimmed, "<dos>"))
+        continue;
+
+      parsed_dos_x = NULL;
+      parsed_dos_y = NULL;
+      parsed_have_fermi = have_fermi_energy;
+      parsed_fermi_energy_ev = fermi_energy_ev;
+      end_index = i;
+      if (gdis_model_parse_vasp_dos_block(lines,
+                                          i,
+                                          &parsed_dos_x,
+                                          &parsed_dos_y,
+                                          &parsed_have_fermi,
+                                          &parsed_fermi_energy_ev,
+                                          &end_index))
+        {
+          g_clear_pointer(&dos_x_values, g_array_unref);
+          g_clear_pointer(&dos_y_values, g_array_unref);
+          dos_x_values = parsed_dos_x;
+          dos_y_values = parsed_dos_y;
+          have_fermi_energy = parsed_have_fermi;
+          fermi_energy_ev = parsed_fermi_energy_ev;
+          i = end_index;
+        }
+    }
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+      GArray *parsed_band_x;
+      GArray *parsed_band_y;
+      guint parsed_path_count;
+      guint parsed_series_count;
+      guint end_index;
+
+      trimmed = g_strstrip(lines[i]);
+      if (!g_str_equal(trimmed, "<eigenvalues>"))
+        continue;
+
+      parsed_band_x = NULL;
+      parsed_band_y = NULL;
+      parsed_path_count = 0u;
+      parsed_series_count = 0u;
+      end_index = i;
+      if (gdis_model_parse_vasp_eigenvalues_block(lines,
+                                                  i,
+                                                  kpoint_triplets,
+                                                  have_fermi_energy,
+                                                  fermi_energy_ev,
+                                                  &parsed_band_x,
+                                                  &parsed_band_y,
+                                                  &parsed_path_count,
+                                                  &parsed_series_count,
+                                                  &end_index))
+        {
+          g_clear_pointer(&band_x_values, g_array_unref);
+          g_clear_pointer(&band_y_values, g_array_unref);
+          band_x_values = parsed_band_x;
+          band_y_values = parsed_band_y;
+          band_path_count = parsed_path_count;
+          band_series_count = parsed_series_count;
+          i = end_index;
+        }
+    }
+
+  g_strfreev(lines);
+  g_ptr_array_free(atom_symbols, TRUE);
+  g_array_unref(kpoint_triplets);
+  gdis_model_clear_plot_arrays(model);
+
+  if (!best_atoms || best_atoms->len == 0u)
+    {
+      if (best_atoms)
+        g_ptr_array_free(best_atoms, TRUE);
+      g_clear_pointer(&pressure_x_values, g_array_unref);
+      g_clear_pointer(&pressure_y_values, g_array_unref);
+      g_clear_pointer(&dos_x_values, g_array_unref);
+      g_clear_pointer(&dos_y_values, g_array_unref);
+      g_clear_pointer(&band_x_values, g_array_unref);
+      g_clear_pointer(&band_y_values, g_array_unref);
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_PARSE,
+                  "No final structure was parsed from VASP XML '%s'.",
+                  model->path);
+      return FALSE;
+    }
+
+  if (model->atoms)
+    g_ptr_array_free(model->atoms, TRUE);
+  model->atoms = best_atoms;
+  model->periodic = TRUE;
+  model->periodicity = 3u;
+  memcpy(model->cell_lengths, best_lengths, sizeof(best_lengths));
+  memcpy(model->cell_angles, best_angles, sizeof(best_angles));
+  model->has_energy = have_energy;
+  model->energy_ev = last_energy_ev;
+  model->has_pressure = have_pressure;
+  model->pressure_gpa = last_pressure_gpa;
+  model->has_fermi_energy = have_fermi_energy;
+  model->fermi_energy_ev = fermi_energy_ev;
+  if (pressure_y_values->len > 0u)
+    {
+      model->pressure_x_values = pressure_x_values;
+      model->pressure_y_values_gpa = pressure_y_values;
+    }
+  else
+    {
+      g_array_unref(pressure_x_values);
+      g_array_unref(pressure_y_values);
+    }
+  model->dos_x_values_ev = dos_x_values;
+  model->dos_y_values = dos_y_values;
+  model->band_x_values = band_x_values;
+  model->band_y_values_ev = band_y_values;
+  model->band_path_count = band_path_count;
+  model->band_series_count = band_series_count;
 
   return TRUE;
 }
@@ -6816,6 +7950,7 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
     {
       state->inside_iteration = TRUE;
       state->current_iteration_count = 0u;
+      state->have_current_iteration_energy = FALSE;
 
       for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
         {
@@ -6836,6 +7971,13 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
         return;
       if (!gdis_qbox_begin_frame(state, parse_error))
         return;
+      return;
+    }
+
+  if (g_str_equal(local_name, "etotal"))
+    {
+      state->inside_etotal = TRUE;
+      g_string_truncate(state->text, 0);
       return;
     }
 
@@ -6928,6 +8070,7 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
       g_clear_pointer(&state->current_atom_name, g_free);
       g_clear_pointer(&state->current_atom_species, g_free);
       state->have_current_atom_position = FALSE;
+      state->have_current_atom_force = FALSE;
 
       for (guint i = 0; attribute_names && attribute_names[i] != NULL; i++)
         {
@@ -6945,6 +8088,13 @@ gdis_qbox_xml_start_element(GMarkupParseContext *context,
   if (g_str_equal(local_name, "position"))
     {
       state->inside_atom_position = TRUE;
+      g_string_truncate(state->text, 0);
+      return;
+    }
+
+  if (g_str_equal(local_name, "force"))
+    {
+      state->inside_atom_force = TRUE;
       g_string_truncate(state->text, 0);
     }
 }
@@ -6996,6 +8146,32 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
       return;
     }
 
+  if (g_str_equal(local_name, "force"))
+    {
+      state->inside_atom_force = FALSE;
+      state->have_current_atom_force = gdis_parse_vector3_text(state->text->str,
+                                                               state->current_atom_force);
+      return;
+    }
+
+  if (g_str_equal(local_name, "etotal"))
+    {
+      gdouble parsed_energy = 0.0;
+
+      state->inside_etotal = FALSE;
+      if (!gdis_try_parse_double_relaxed(state->text->str, &parsed_energy))
+        return;
+
+      state->have_current_iteration_energy = TRUE;
+      state->current_iteration_energy_ev = parsed_energy * GDIS_QBOX_HARTREE_TO_EV;
+      if (state->current_frame)
+        {
+          state->current_frame->has_energy = TRUE;
+          state->current_frame->energy_ev = state->current_iteration_energy_ev;
+        }
+      return;
+    }
+
   if (g_str_equal(local_name, "atom"))
     {
       g_autofree gchar *species_symbol = NULL;
@@ -7037,9 +8213,20 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
                                     -1,
                                     target_atoms->len + 1u));
 
+      if (state->have_current_atom_force && state->current_frame)
+        {
+          const gdouble fx = state->current_atom_force[0] * GDIS_QBOX_HARTREE_PER_BOHR_TO_EV_PER_ANG;
+          const gdouble fy = state->current_atom_force[1] * GDIS_QBOX_HARTREE_PER_BOHR_TO_EV_PER_ANG;
+          const gdouble fz = state->current_atom_force[2] * GDIS_QBOX_HARTREE_PER_BOHR_TO_EV_PER_ANG;
+
+          state->current_frame_force_sum_sq += fx * fx + fy * fy + fz * fz;
+          state->current_frame_force_count++;
+        }
+
       g_clear_pointer(&state->current_atom_name, g_free);
       g_clear_pointer(&state->current_atom_species, g_free);
       state->have_current_atom_position = FALSE;
+      state->have_current_atom_force = FALSE;
       return;
     }
 
@@ -7057,6 +8244,7 @@ gdis_qbox_xml_end_element(GMarkupParseContext *context,
     {
       state->inside_iteration = FALSE;
       state->current_iteration_count = 0u;
+      state->have_current_iteration_energy = FALSE;
     }
 }
 
@@ -7073,7 +8261,10 @@ gdis_qbox_xml_text(GMarkupParseContext *context,
   (void) parse_error;
 
   state = user_data;
-  if (state->inside_species_symbol || state->inside_atom_position)
+  if (state->inside_species_symbol ||
+      state->inside_atom_position ||
+      state->inside_etotal ||
+      state->inside_atom_force)
     g_string_append_len(state->text, text, text_len);
 }
 
@@ -7122,6 +8313,8 @@ gdis_qbox_begin_frame(GdisQboxXmlParseState *state,
   state->atomset_count++;
   state->current_frame = gdis_model_frame_new();
   state->current_frame_has_cell = FALSE;
+  state->current_frame_force_sum_sq = 0.0;
+  state->current_frame_force_count = 0u;
 
   base_title = state->model->basename ? state->model->basename : "qbox";
   if (state->inside_iteration)
@@ -7158,6 +8351,12 @@ gdis_qbox_begin_frame(GdisQboxXmlParseState *state,
       state->current_frame_has_cell = TRUE;
     }
 
+  if (state->have_current_iteration_energy)
+    {
+      state->current_frame->has_energy = TRUE;
+      state->current_frame->energy_ev = state->current_iteration_energy_ev;
+    }
+
   return TRUE;
 }
 
@@ -7190,9 +8389,18 @@ gdis_qbox_finish_current_frame(GdisQboxXmlParseState *state,
       state->current_frame_has_cell = TRUE;
     }
 
+  if (state->current_frame_force_count > 0u)
+    {
+      state->current_frame->has_force_rms = TRUE;
+      state->current_frame->force_rms_ev_ang =
+        sqrt(state->current_frame_force_sum_sq / (gdouble) state->current_frame_force_count);
+    }
+
   g_ptr_array_add(state->frames, state->current_frame);
   state->current_frame = NULL;
   state->current_frame_has_cell = FALSE;
+  state->current_frame_force_sum_sq = 0.0;
+  state->current_frame_force_count = 0u;
   return TRUE;
 }
 
@@ -9277,6 +10485,45 @@ gdis_collect_doubles_from_line(const gchar *line, gdouble *values, guint max_val
   return found;
 }
 
+static guint
+gdis_collect_doubles_from_text_scan(const gchar *text, gdouble *values, guint max_values)
+{
+  const gchar *cursor;
+  guint found;
+
+  if (!text || !values || max_values == 0u)
+    return 0u;
+
+  cursor = text;
+  found = 0u;
+  while (*cursor != '\0' && found < max_values)
+    {
+      gchar *endptr = NULL;
+      gdouble parsed;
+
+      if (!(g_ascii_isdigit(*cursor) ||
+            *cursor == '+' ||
+            *cursor == '-' ||
+            *cursor == '.'))
+        {
+          cursor++;
+          continue;
+        }
+
+      parsed = g_ascii_strtod(cursor, &endptr);
+      if (endptr != cursor)
+        {
+          values[found++] = parsed;
+          cursor = endptr;
+          continue;
+        }
+
+      cursor++;
+    }
+
+  return found;
+}
+
 static gboolean
 gdis_collect_three_doubles_from_tokens(gchar **tokens,
                                        gint token_count,
@@ -9330,6 +10577,508 @@ gdis_split_simple(const gchar *line, gint *count)
     *count = g_strv_length(result);
 
   return result;
+}
+
+static guint
+gdis_model_parse_vasp_atom_symbols(const gchar *contents, GPtrArray *symbols_out)
+{
+  gchar **lines;
+  guint parsed_count;
+
+  g_return_val_if_fail(symbols_out != NULL, 0u);
+
+  parsed_count = 0u;
+  lines = g_strsplit(contents ? contents : "", "\n", -1);
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+
+      trimmed = g_strstrip(lines[i]);
+      if (!g_str_has_prefix(trimmed, "<array name=\"atoms\""))
+        continue;
+
+      for (i = i + 1u; lines[i] != NULL; i++)
+        {
+          gchar *row;
+          const gchar *cell_start;
+          const gchar *cell_end;
+          g_autofree gchar *symbol = NULL;
+
+          row = g_strstrip(lines[i]);
+          if (g_str_has_prefix(row, "</array>"))
+            break;
+          if (!g_strstr_len(row, -1, "<rc><c>"))
+            continue;
+
+          cell_start = strstr(row, "<c>");
+          cell_end = cell_start ? strstr(cell_start + 3, "</c>") : NULL;
+          if (!cell_start || !cell_end || cell_end <= cell_start + 3)
+            continue;
+
+          symbol = g_strndup(cell_start + 3, (gsize) (cell_end - (cell_start + 3)));
+          g_strstrip(symbol);
+          if (!symbol[0])
+            continue;
+
+          symbol = gdis_normalize_element_symbol(symbol);
+          if (symbol && symbol[0])
+            {
+              g_ptr_array_add(symbols_out, g_steal_pointer(&symbol));
+              parsed_count++;
+            }
+        }
+      break;
+    }
+
+  g_strfreev(lines);
+  return parsed_count;
+}
+
+static gboolean
+gdis_model_parse_vasp_structure_block(GdisModel *model,
+                                      gchar **lines,
+                                      guint start_index,
+                                      const GPtrArray *atom_symbols,
+                                      GPtrArray **atoms_out,
+                                      gdouble lengths_out[3],
+                                      gdouble angles_out[3],
+                                      guint *end_index_out)
+{
+  GPtrArray *atoms;
+  gdouble basis[9];
+  gboolean have_basis;
+  gboolean in_positions;
+  guint atom_index;
+
+  g_return_val_if_fail(model != NULL, FALSE);
+  g_return_val_if_fail(lines != NULL, FALSE);
+  g_return_val_if_fail(atoms_out != NULL, FALSE);
+  g_return_val_if_fail(lengths_out != NULL, FALSE);
+  g_return_val_if_fail(angles_out != NULL, FALSE);
+
+  atoms = g_ptr_array_new_with_free_func(gdis_atom_free);
+  memset(basis, 0, sizeof(basis));
+  lengths_out[0] = lengths_out[1] = lengths_out[2] = 0.0;
+  angles_out[0] = angles_out[1] = angles_out[2] = 90.0;
+  if (end_index_out)
+    *end_index_out = start_index;
+  have_basis = FALSE;
+  in_positions = FALSE;
+  atom_index = 0u;
+
+  for (guint i = start_index + 1u; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+
+      trimmed = g_strstrip(lines[i]);
+      if (trimmed[0] == '\0')
+        continue;
+
+      if (g_str_has_prefix(trimmed, "</structure>"))
+        {
+          if (end_index_out)
+            *end_index_out = i;
+          break;
+        }
+
+      if (g_str_has_prefix(trimmed, "<varray name=\"basis\""))
+        {
+          gdouble values[3];
+          guint row;
+
+          row = 0u;
+          for (i = i + 1u; lines[i] != NULL && row < 3u; i++)
+            {
+              gchar *vec_line;
+
+              vec_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(vec_line, "</varray>"))
+                break;
+              if (gdis_collect_doubles_from_text_scan(vec_line, values, 3u) < 3u)
+                continue;
+
+              basis[row] = values[0];
+              basis[row + 3u] = values[1];
+              basis[row + 6u] = values[2];
+              row++;
+            }
+
+          if (row == 3u &&
+              gdis_surface_build_cell_from_vectors((gdouble[3]) {basis[0], basis[3], basis[6]},
+                                                   (gdouble[3]) {basis[1], basis[4], basis[7]},
+                                                   (gdouble[3]) {basis[2], basis[5], basis[8]},
+                                                   lengths_out,
+                                                   angles_out))
+            have_basis = TRUE;
+          if (lines[i] == NULL)
+            break;
+          continue;
+        }
+
+      if (g_str_has_prefix(trimmed, "<varray name=\"positions\""))
+        {
+          in_positions = TRUE;
+          continue;
+        }
+
+      if (in_positions)
+        {
+          gdouble frac[3];
+          gdouble cart[3];
+          g_autofree gchar *element = NULL;
+          const gchar *label_text;
+
+          if (g_str_has_prefix(trimmed, "</varray>"))
+            {
+              in_positions = FALSE;
+              continue;
+            }
+
+          if (!have_basis || gdis_collect_doubles_from_text_scan(trimmed, frac, 3u) < 3u)
+            continue;
+
+          gdis_frac_to_cart(basis, frac, cart);
+          if (atom_symbols && atom_index < atom_symbols->len)
+            label_text = g_ptr_array_index((GPtrArray *) atom_symbols, atom_index);
+          else
+            label_text = "X";
+          element = gdis_normalize_element_symbol(label_text);
+          if (!element || !element[0])
+            {
+              g_clear_pointer(&element, g_free);
+              element = g_strdup("X");
+            }
+
+          g_ptr_array_add(atoms,
+                          gdis_atom_new(label_text,
+                                        element,
+                                        element,
+                                        cart[0],
+                                        cart[1],
+                                        cart[2],
+                                        1.0,
+                                        -1,
+                                        atom_index + 1u));
+          atom_index++;
+        }
+    }
+
+  if (!have_basis || atoms->len == 0u)
+    {
+      g_ptr_array_free(atoms, TRUE);
+      return FALSE;
+    }
+
+  *atoms_out = atoms;
+  return TRUE;
+}
+
+static gboolean
+gdis_model_build_band_arrays_from_triplets(const GArray *kpoint_triplets,
+                                           GPtrArray *kpoint_bands,
+                                           gdouble fermi_energy_ev,
+                                           GArray **x_values_out,
+                                           GArray **y_values_out,
+                                           guint *path_count_out,
+                                           guint *series_count_out)
+{
+  GArray *kpath;
+  GArray *x_values;
+  GArray *y_values;
+  guint kpoint_count;
+  guint band_count;
+  gdouble cumulative;
+
+  g_return_val_if_fail(x_values_out != NULL, FALSE);
+  g_return_val_if_fail(y_values_out != NULL, FALSE);
+
+  *x_values_out = NULL;
+  *y_values_out = NULL;
+  if (path_count_out)
+    *path_count_out = 0u;
+  if (series_count_out)
+    *series_count_out = 0u;
+
+  if (!kpoint_triplets || !kpoint_bands || kpoint_bands->len == 0u)
+    return FALSE;
+
+  kpoint_count = kpoint_bands->len;
+  band_count = G_MAXUINT;
+  for (guint i = 0; i < kpoint_count; i++)
+    {
+      GArray *band_row;
+
+      band_row = g_ptr_array_index(kpoint_bands, i);
+      if (!band_row || band_row->len == 0u)
+        return FALSE;
+      band_count = MIN(band_count, band_row->len);
+    }
+  if (band_count == 0u || band_count == G_MAXUINT)
+    return FALSE;
+
+  kpath = gdis_double_array_new();
+  cumulative = 0.0;
+  for (guint i = 0; i < kpoint_count; i++)
+    {
+      gdouble path_value;
+
+      if (i == 0u || !kpoint_triplets || kpoint_triplets->len < (i + 1u) * 3u)
+        {
+          path_value = (gdouble) i;
+        }
+      else
+        {
+          const gdouble *coords = &g_array_index(kpoint_triplets, gdouble, i * 3u);
+          const gdouble *prev = &g_array_index(kpoint_triplets, gdouble, (i - 1u) * 3u);
+          const gdouble dx = coords[0] - prev[0];
+          const gdouble dy = coords[1] - prev[1];
+          const gdouble dz = coords[2] - prev[2];
+
+          cumulative += sqrt(dx * dx + dy * dy + dz * dz);
+          path_value = cumulative;
+        }
+      g_array_append_val(kpath, path_value);
+    }
+
+  x_values = gdis_double_array_new();
+  y_values = gdis_double_array_new();
+  for (guint band_index = 0; band_index < band_count; band_index++)
+    {
+      for (guint kpoint_index = 0; kpoint_index < kpoint_count; kpoint_index++)
+        {
+          GArray *band_row;
+          gdouble x_value;
+          gdouble y_value;
+
+          band_row = g_ptr_array_index(kpoint_bands, kpoint_index);
+          x_value = g_array_index(kpath, gdouble, kpoint_index);
+          y_value = g_array_index(band_row, gdouble, band_index) - fermi_energy_ev;
+          g_array_append_val(x_values, x_value);
+          g_array_append_val(y_values, y_value);
+        }
+      if (band_index + 1u < band_count)
+        {
+          gdouble gap_x;
+          gdouble gap_y;
+
+          gap_x = g_array_index(kpath, gdouble, kpoint_count - 1u);
+          gap_y = NAN;
+          g_array_append_val(x_values, gap_x);
+          g_array_append_val(y_values, gap_y);
+        }
+    }
+
+  *x_values_out = x_values;
+  *y_values_out = y_values;
+  if (path_count_out)
+    *path_count_out = kpoint_count;
+  if (series_count_out)
+    *series_count_out = band_count;
+  g_array_unref(kpath);
+  return TRUE;
+}
+
+static gboolean
+gdis_model_parse_vasp_dos_block(gchar **lines,
+                                guint start_index,
+                                GArray **dos_x_values_out,
+                                GArray **dos_y_values_out,
+                                gboolean *have_fermi_energy_out,
+                                gdouble *fermi_energy_ev_out,
+                                guint *end_index_out)
+{
+  GArray *energies;
+  GArray *totals;
+  gboolean have_fermi_energy;
+  gdouble fermi_energy_ev;
+  guint spin_index;
+
+  g_return_val_if_fail(lines != NULL, FALSE);
+  g_return_val_if_fail(dos_x_values_out != NULL, FALSE);
+  g_return_val_if_fail(dos_y_values_out != NULL, FALSE);
+
+  *dos_x_values_out = NULL;
+  *dos_y_values_out = NULL;
+  if (end_index_out)
+    *end_index_out = start_index;
+
+  energies = gdis_double_array_new();
+  totals = gdis_double_array_new();
+  have_fermi_energy = have_fermi_energy_out ? *have_fermi_energy_out : FALSE;
+  fermi_energy_ev = fermi_energy_ev_out ? *fermi_energy_ev_out : 0.0;
+  spin_index = 0u;
+
+  for (guint i = start_index + 1u; lines[i] != NULL; i++)
+    {
+      gchar *dos_line;
+
+      dos_line = g_strstrip(lines[i]);
+      if (g_str_has_prefix(dos_line, "</dos>"))
+        {
+          if (end_index_out)
+            *end_index_out = i;
+          break;
+        }
+      if (g_strstr_len(dos_line, -1, "name=\"efermi\"") != NULL)
+        {
+          gdouble values[1];
+
+          if (gdis_collect_doubles_from_text_scan(dos_line, values, 1u) >= 1u)
+            {
+              fermi_energy_ev = values[0];
+              have_fermi_energy = TRUE;
+            }
+          continue;
+        }
+      if (g_str_has_prefix(dos_line, "<set comment=\"spin "))
+        {
+          guint dos_index = 0u;
+
+          spin_index++;
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *row_line;
+              gdouble values[3];
+
+              row_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(row_line, "</set>"))
+                break;
+              if (gdis_collect_doubles_from_text_scan(row_line, values, 3u) < 2u)
+                continue;
+
+              if (spin_index == 1u)
+                {
+                  g_array_append_val(energies, values[0]);
+                  g_array_append_val(totals, values[1]);
+                }
+              else if (dos_index < totals->len)
+                {
+                  gdouble sum_value;
+
+                  sum_value = g_array_index(totals, gdouble, dos_index) + values[1];
+                  g_array_index(totals, gdouble, dos_index) = sum_value;
+                }
+              dos_index++;
+            }
+        }
+    }
+
+  if (energies->len == 0u || totals->len != energies->len)
+    {
+      g_array_unref(energies);
+      g_array_unref(totals);
+      return FALSE;
+    }
+
+  for (guint idx = 0; idx < energies->len; idx++)
+    {
+      gdouble shifted;
+
+      shifted = g_array_index(energies, gdouble, idx) -
+                (have_fermi_energy ? fermi_energy_ev : 0.0);
+      g_array_index(energies, gdouble, idx) = shifted;
+    }
+
+  if (have_fermi_energy_out)
+    *have_fermi_energy_out = have_fermi_energy;
+  if (fermi_energy_ev_out)
+    *fermi_energy_ev_out = fermi_energy_ev;
+  *dos_x_values_out = energies;
+  *dos_y_values_out = totals;
+  return TRUE;
+}
+
+static gboolean
+gdis_model_parse_vasp_eigenvalues_block(gchar **lines,
+                                        guint start_index,
+                                        const GArray *kpoint_triplets,
+                                        gboolean have_fermi_energy,
+                                        gdouble fermi_energy_ev,
+                                        GArray **band_x_values_out,
+                                        GArray **band_y_values_out,
+                                        guint *path_count_out,
+                                        guint *series_count_out,
+                                        guint *end_index_out)
+{
+  GPtrArray *kpoint_bands;
+  gboolean in_spin_one;
+  gboolean ok;
+
+  g_return_val_if_fail(lines != NULL, FALSE);
+  g_return_val_if_fail(band_x_values_out != NULL, FALSE);
+  g_return_val_if_fail(band_y_values_out != NULL, FALSE);
+
+  *band_x_values_out = NULL;
+  *band_y_values_out = NULL;
+  if (path_count_out)
+    *path_count_out = 0u;
+  if (series_count_out)
+    *series_count_out = 0u;
+  if (end_index_out)
+    *end_index_out = start_index;
+
+  kpoint_bands = g_ptr_array_new_with_free_func((GDestroyNotify) g_array_unref);
+  in_spin_one = FALSE;
+  ok = FALSE;
+
+  for (guint i = start_index + 1u; lines[i] != NULL; i++)
+    {
+      gchar *band_line;
+
+      band_line = g_strstrip(lines[i]);
+      if (g_str_has_prefix(band_line, "<set comment=\"spin 1\""))
+        {
+          in_spin_one = TRUE;
+          continue;
+        }
+      if (g_str_has_prefix(band_line, "<set comment=\"spin 2\"") ||
+          g_str_has_prefix(band_line, "</eigenvalues>"))
+        {
+          if (end_index_out)
+            *end_index_out = i;
+          break;
+        }
+      if (!in_spin_one)
+        continue;
+
+      if (g_str_has_prefix(band_line, "<set comment=\"kpoint "))
+        {
+          GArray *band_values;
+
+          band_values = gdis_double_array_new();
+          for (i = i + 1u; lines[i] != NULL; i++)
+            {
+              gchar *row_line;
+              gdouble values[2];
+
+              row_line = g_strstrip(lines[i]);
+              if (g_str_has_prefix(row_line, "</set>"))
+                break;
+              if (gdis_collect_doubles_from_text_scan(row_line, values, 2u) < 1u)
+                continue;
+              g_array_append_val(band_values, values[0]);
+            }
+
+          if (band_values->len > 0u)
+            g_ptr_array_add(kpoint_bands, band_values);
+          else
+            g_array_unref(band_values);
+        }
+    }
+
+  if (kpoint_bands->len > 0u)
+    {
+      ok = gdis_model_build_band_arrays_from_triplets(kpoint_triplets,
+                                                      kpoint_bands,
+                                                      have_fermi_energy ? fermi_energy_ev : 0.0,
+                                                      band_x_values_out,
+                                                      band_y_values_out,
+                                                      path_count_out,
+                                                      series_count_out);
+    }
+
+  g_ptr_array_free(kpoint_bands, TRUE);
+  return ok;
 }
 
 static GPtrArray *

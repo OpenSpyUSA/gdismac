@@ -185,6 +185,12 @@ typedef enum
 
 typedef enum
 {
+  GDIS_PLOT_RENDER_LINE = 0,
+  GDIS_PLOT_RENDER_BANDDOS
+} GdisPlotRenderMode;
+
+typedef enum
+{
   GDIS_MD_ANALYSIS_MODE_PAIR_COUNT = 0,
   GDIS_MD_ANALYSIS_MODE_RDF,
   GDIS_MD_ANALYSIS_MODE_MEASUREMENTS
@@ -194,6 +200,10 @@ typedef struct _GdisPlotTool
 {
   struct _GdisGtk4Window *owner;
   GtkWidget *window;
+  GtkWidget *execute_button;
+  GtkWidget *busy_box;
+  GtkWidget *busy_spinner;
+  GtkLabel *busy_label;
   GtkWidget *mode_dropdown;
   GtkWidget *legacy_stack;
   GtkWidget *dynamic_energy_toggle;
@@ -214,11 +224,16 @@ typedef struct _GdisPlotTool
   GtkLabel *summary_label;
   GArray *x_values;
   GArray *y_values;
+  GArray *secondary_x_values;
+  GArray *secondary_y_values;
   gchar *plot_title;
   gchar *x_title;
+  gchar *secondary_x_title;
   gchar *y_title;
   guint valid_points;
   GdisPlotMode current_mode;
+  GdisPlotRenderMode render_mode;
+  gboolean show_active_marker;
   gboolean syncing_legacy_controls;
 } GdisPlotTool;
 
@@ -342,6 +357,13 @@ typedef struct _GdisQboxTool
 {
   struct _GdisGtk4Window *owner;
   GtkWidget *window;
+  GtkWidget *busy_box;
+  GtkWidget *busy_spinner;
+  GtkLabel *busy_label;
+  GtkWidget *regenerate_button;
+  GtkWidget *write_button;
+  GtkWidget *run_button;
+  GtkWidget *import_button;
   GtkWidget *job_entry;
   GtkWidget *workdir_entry;
   GtkWidget *input_entry;
@@ -817,6 +839,11 @@ static void gdis_gtk4_window_refresh_mdi_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_dislocation_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_docking_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_qbox_tool(GdisGtk4Window *self);
+static void gdis_gtk4_window_process_pending_ui(void);
+static void gdis_plot_tool_set_busy(GdisPlotTool *tool, gboolean busy, const char *message);
+static gboolean gdis_plot_mode_has_direct_dataset(const GdisModel *model,
+                                                  GdisPlotMode mode);
+static void gdis_qbox_tool_set_busy(GdisQboxTool *tool, gboolean busy, const char *message);
 static void gdis_gtk4_window_refresh_periodic_table_tool(GdisGtk4Window *self);
 static void gdis_gtk4_window_refresh_task_manager_tool(GdisGtk4Window *self);
 static void gdis_qbox_clear_last_run_state(GdisGtk4Window *self);
@@ -838,6 +865,7 @@ static gchar *gdis_qbox_make_unique_continue_name(const char *workdir,
                                                   const char *extension);
 static gchar *gdis_qbox_extract_last_etotal(const char *text);
 static gchar *gdis_qbox_tail_text(const char *text, gsize max_chars);
+static gboolean gdis_qbox_output_has_invalid_values(const char *text);
 static gchar *gdis_qbox_atom_deck_name_for_index(const GdisModel *model, guint atom_index);
 static gchar *gdis_qbox_default_plot_filename(GdisQboxTool *tool);
 static gchar *gdis_qbox_default_spectrum_filename(GdisQboxTool *tool);
@@ -1358,6 +1386,63 @@ gdis_text_buffer_set(GtkTextBuffer *buffer, const char *format, ...)
 
   gtk_text_buffer_set_text(buffer, message, -1);
   g_free(message);
+}
+
+static void
+gdis_gtk4_window_process_pending_ui(void)
+{
+  while (g_main_context_pending(NULL))
+    g_main_context_iteration(NULL, FALSE);
+}
+
+static void
+gdis_plot_tool_set_busy(GdisPlotTool *tool, gboolean busy, const char *message)
+{
+  g_return_if_fail(tool != NULL);
+
+  if (tool->busy_label)
+    gtk_label_set_text(tool->busy_label, message ? message : "");
+  if (tool->busy_box)
+    gtk_widget_set_visible(tool->busy_box, busy);
+  if (tool->busy_spinner)
+    {
+      if (busy)
+        gtk_spinner_start(GTK_SPINNER(tool->busy_spinner));
+      else
+        gtk_spinner_stop(GTK_SPINNER(tool->busy_spinner));
+    }
+  if (tool->execute_button)
+    gtk_widget_set_sensitive(tool->execute_button, !busy);
+
+  gdis_gtk4_window_process_pending_ui();
+}
+
+static void
+gdis_qbox_tool_set_busy(GdisQboxTool *tool, gboolean busy, const char *message)
+{
+  g_return_if_fail(tool != NULL);
+
+  if (tool->busy_label)
+    gtk_label_set_text(tool->busy_label, message ? message : "");
+  if (tool->busy_box)
+    gtk_widget_set_visible(tool->busy_box, busy);
+  if (tool->busy_spinner)
+    {
+      if (busy)
+        gtk_spinner_start(GTK_SPINNER(tool->busy_spinner));
+      else
+        gtk_spinner_stop(GTK_SPINNER(tool->busy_spinner));
+    }
+  if (tool->regenerate_button)
+    gtk_widget_set_sensitive(tool->regenerate_button, !busy);
+  if (tool->write_button)
+    gtk_widget_set_sensitive(tool->write_button, !busy);
+  if (tool->run_button)
+    gtk_widget_set_sensitive(tool->run_button, !busy);
+  if (tool->import_button)
+    gtk_widget_set_sensitive(tool->import_button, !busy);
+
+  gdis_gtk4_window_process_pending_ui();
 }
 
 static void
@@ -6840,10 +6925,15 @@ gdis_plot_tool_clear_dataset(GdisPlotTool *tool)
 
   g_clear_pointer(&tool->x_values, g_array_unref);
   g_clear_pointer(&tool->y_values, g_array_unref);
+  g_clear_pointer(&tool->secondary_x_values, g_array_unref);
+  g_clear_pointer(&tool->secondary_y_values, g_array_unref);
   g_clear_pointer(&tool->plot_title, g_free);
   g_clear_pointer(&tool->x_title, g_free);
+  g_clear_pointer(&tool->secondary_x_title, g_free);
   g_clear_pointer(&tool->y_title, g_free);
   tool->valid_points = 0u;
+  tool->render_mode = GDIS_PLOT_RENDER_LINE;
+  tool->show_active_marker = FALSE;
 }
 
 static guint
@@ -6961,7 +7051,7 @@ gdis_plot_mode_label(GdisPlotMode mode)
     case GDIS_PLOT_MODE_ENERGY:
       return "Energy";
     case GDIS_PLOT_MODE_FORCE:
-      return "Forces";
+      return "RMS Force";
     case GDIS_PLOT_MODE_PRESSURE:
       return "Pressure";
     case GDIS_PLOT_MODE_DOS:
@@ -7005,9 +7095,9 @@ gdis_plot_mode_y_label(GdisPlotMode mode)
     case GDIS_PLOT_MODE_ENERGY:
       return "Energy (eV)";
     case GDIS_PLOT_MODE_FORCE:
-      return "Force";
+      return "RMS force (eV/A)";
     case GDIS_PLOT_MODE_PRESSURE:
-      return "Pressure";
+      return "Pressure (GPa)";
     case GDIS_PLOT_MODE_DOS:
       return "DOS";
     case GDIS_PLOT_MODE_BAND:
@@ -7015,9 +7105,9 @@ gdis_plot_mode_y_label(GdisPlotMode mode)
     case GDIS_PLOT_MODE_BANDOS:
       return "Energy / DOS";
     case GDIS_PLOT_MODE_FREQUENCY:
-      return "Intensity";
+      return "Intensity (arb. unit)";
     case GDIS_PLOT_MODE_RAMAN:
-      return "Raman intensity";
+      return "Raman intensity (arb. unit)";
     default:
       return "Value";
     }
@@ -7265,6 +7355,18 @@ gdis_plot_mode_compute_value(GdisPlotMode mode,
       *value_out = model->energy_ev;
       return TRUE;
 
+    case GDIS_PLOT_MODE_FORCE:
+      if (!model->has_force_rms)
+        return FALSE;
+      *value_out = model->force_rms_ev_ang;
+      return TRUE;
+
+    case GDIS_PLOT_MODE_PRESSURE:
+      if (!model->has_pressure)
+        return FALSE;
+      *value_out = model->pressure_gpa;
+      return TRUE;
+
     default:
       return FALSE;
     }
@@ -7279,6 +7381,22 @@ gdis_gtk4_window_suggest_plot_mode(GdisGtk4Window *self)
   GPtrArray *records;
 
   g_return_val_if_fail(self != NULL, GDIS_PLOT_MODE_ATOM_COUNT);
+
+  if (self->active_model)
+    {
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_BANDOS))
+        return GDIS_PLOT_MODE_BANDOS;
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_DOS))
+        return GDIS_PLOT_MODE_DOS;
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_BAND))
+        return GDIS_PLOT_MODE_BAND;
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_FREQUENCY))
+        return GDIS_PLOT_MODE_FREQUENCY;
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_RAMAN))
+        return GDIS_PLOT_MODE_RAMAN;
+      if (gdis_plot_mode_has_direct_dataset(self->active_model, GDIS_PLOT_MODE_PRESSURE))
+        return GDIS_PLOT_MODE_PRESSURE;
+    }
 
   atom_count = gdis_gtk4_window_collect_plot_reference_atoms(self,
                                                              GDIS_PLOT_MODE_TORSION,
@@ -7384,13 +7502,41 @@ gdis_plot_mode_is_supported(GdisGtk4Window *self,
     case GDIS_PLOT_MODE_CELL_VOLUME:
       return self->active_model != NULL && self->active_model->periodic;
     case GDIS_PLOT_MODE_FORCE:
+      if (source == GDIS_ANIMATION_SOURCE_SESSION_MODELS && sample_count > 0u)
+        {
+          for (guint i = 0; i < sample_count; i++)
+            {
+              GdisModel *sample_model;
+
+              sample_model = g_ptr_array_index(self->models, i);
+              if (sample_model && sample_model->has_force_rms)
+                return TRUE;
+            }
+        }
+      return self->active_model && self->active_model->has_force_rms;
     case GDIS_PLOT_MODE_PRESSURE:
+      if (self->active_model &&
+          gdis_plot_mode_has_direct_dataset(self->active_model, mode))
+        return TRUE;
+      if (source == GDIS_ANIMATION_SOURCE_SESSION_MODELS && sample_count > 0u)
+        {
+          for (guint i = 0; i < sample_count; i++)
+            {
+              GdisModel *sample_model;
+
+              sample_model = g_ptr_array_index(self->models, i);
+              if (sample_model && sample_model->has_pressure)
+                return TRUE;
+            }
+        }
+      return self->active_model && self->active_model->has_pressure;
     case GDIS_PLOT_MODE_DOS:
     case GDIS_PLOT_MODE_BAND:
     case GDIS_PLOT_MODE_BANDOS:
     case GDIS_PLOT_MODE_FREQUENCY:
     case GDIS_PLOT_MODE_RAMAN:
-      return FALSE;
+      return self->active_model &&
+             gdis_plot_mode_has_direct_dataset(self->active_model, mode);
     case GDIS_PLOT_MODE_DISTANCE:
     case GDIS_PLOT_MODE_ANGLE:
     case GDIS_PLOT_MODE_TORSION:
@@ -7422,17 +7568,19 @@ gdis_gtk4_window_default_plot_mode_for_page(GdisGtk4Window *self,
     }
   if (g_strcmp0(page_name, "electronic") == 0)
     {
+      if (gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_BANDOS, source, sample_count))
+        return GDIS_PLOT_MODE_BANDOS;
       if (gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_DOS, source, sample_count))
         return GDIS_PLOT_MODE_DOS;
       if (gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_BAND, source, sample_count))
         return GDIS_PLOT_MODE_BAND;
-      return GDIS_PLOT_MODE_BANDOS;
+      return GDIS_PLOT_MODE_DOS;
     }
   if (g_strcmp0(page_name, "frequency") == 0)
     {
       if (gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_FREQUENCY, source, sample_count))
         return GDIS_PLOT_MODE_FREQUENCY;
-      return GDIS_PLOT_MODE_RAMAN;
+      return GDIS_PLOT_MODE_FREQUENCY;
     }
   return gdis_gtk4_window_suggest_geometry_plot_mode(self);
 }
@@ -7449,20 +7597,20 @@ gdis_plot_mode_unavailable_reason(GdisPlotMode mode,
                         ? ""
                         : "Energy / step is only available when the current source carries per-model energy data.");
     case GDIS_PLOT_MODE_FORCE:
-      return g_strdup("Forces / step data is not available in the current GTK4 trajectory bridge.");
+      return g_strdup("RMS force / step is only available when the current source carries per-step force data.");
     case GDIS_PLOT_MODE_CELL_VOLUME:
       return g_strdup(volume_supported
                         ? ""
                         : "Volume / step needs a periodic model or periodic trajectory source.");
     case GDIS_PLOT_MODE_PRESSURE:
-      return g_strdup("Pressure / step data is not available in the current GTK4 trajectory bridge.");
+      return g_strdup("Pressure / step needs parsed pressure history in the current file or pressure values across the current model set.");
     case GDIS_PLOT_MODE_DOS:
     case GDIS_PLOT_MODE_BAND:
     case GDIS_PLOT_MODE_BANDOS:
-      return g_strdup("Electronic plots need DOS or band arrays in the loaded source. Those arrays are not available in the current GTK4 model bridge.");
+      return g_strdup("Electronic plots need DOS and/or band arrays in the active source file.");
     case GDIS_PLOT_MODE_FREQUENCY:
     case GDIS_PLOT_MODE_RAMAN:
-      return g_strdup("Frequency plots need vibrational or Raman arrays in the loaded source. Those arrays are not available in the current GTK4 model bridge.");
+      return g_strdup("Frequency plots need vibrational or Raman arrays in the active source file.");
     case GDIS_PLOT_MODE_DISTANCE:
     case GDIS_PLOT_MODE_ANGLE:
     case GDIS_PLOT_MODE_TORSION:
@@ -7474,6 +7622,415 @@ gdis_plot_mode_unavailable_reason(GdisPlotMode mode,
     default:
       return g_strdup("");
     }
+}
+
+static GArray *
+gdis_plot_clone_double_array(const GArray *source)
+{
+  GArray *copy;
+
+  if (!source)
+    return NULL;
+
+  copy = g_array_new(FALSE, FALSE, sizeof(gdouble));
+  if (source->len > 0u)
+    g_array_append_vals(copy, source->data, source->len);
+  return copy;
+}
+
+static guint
+gdis_plot_count_valid_points(const GArray *x_values,
+                             const GArray *y_values)
+{
+  guint count;
+  guint valid = 0u;
+
+  if (!x_values || !y_values)
+    return 0u;
+
+  count = MIN(x_values->len, y_values->len);
+  for (guint i = 0; i < count; i++)
+    {
+      const gdouble y_value = g_array_index(y_values, gdouble, i);
+
+      if (isfinite(y_value))
+        valid++;
+    }
+  return valid;
+}
+
+static gboolean
+gdis_plot_mode_has_direct_dataset(const GdisModel *model,
+                                  GdisPlotMode mode)
+{
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  switch (mode)
+    {
+    case GDIS_PLOT_MODE_PRESSURE:
+      return model->pressure_x_values &&
+             model->pressure_y_values_gpa &&
+             model->pressure_x_values->len > 0u &&
+             model->pressure_y_values_gpa->len > 0u;
+    case GDIS_PLOT_MODE_DOS:
+      return model->dos_x_values_ev &&
+             model->dos_y_values &&
+             model->dos_x_values_ev->len > 0u &&
+             model->dos_y_values->len > 0u;
+    case GDIS_PLOT_MODE_BAND:
+      return model->band_x_values &&
+             model->band_y_values_ev &&
+             model->band_x_values->len > 0u &&
+             model->band_y_values_ev->len > 0u;
+    case GDIS_PLOT_MODE_BANDOS:
+      return gdis_plot_mode_has_direct_dataset(model, GDIS_PLOT_MODE_BAND) &&
+             gdis_plot_mode_has_direct_dataset(model, GDIS_PLOT_MODE_DOS);
+    case GDIS_PLOT_MODE_FREQUENCY:
+      return model->frequency_x_values_cm1 &&
+             model->frequency_y_values &&
+             model->frequency_x_values_cm1->len > 0u &&
+             model->frequency_y_values->len > 0u;
+    case GDIS_PLOT_MODE_RAMAN:
+      return model->raman_x_values_cm1 &&
+             model->raman_y_values &&
+             model->raman_x_values_cm1->len > 0u &&
+             model->raman_y_values->len > 0u;
+    default:
+      return FALSE;
+    }
+}
+
+static gboolean
+gdis_plot_tool_load_direct_dataset(GdisPlotTool *tool,
+                                   const GdisModel *model,
+                                   GdisPlotMode mode)
+{
+  g_return_val_if_fail(tool != NULL, FALSE);
+  g_return_val_if_fail(model != NULL, FALSE);
+
+  if (!gdis_plot_mode_has_direct_dataset(model, mode))
+    return FALSE;
+
+  switch (mode)
+    {
+    case GDIS_PLOT_MODE_PRESSURE:
+      tool->x_values = gdis_plot_clone_double_array(model->pressure_x_values);
+      tool->y_values = gdis_plot_clone_double_array(model->pressure_y_values_gpa);
+      tool->plot_title = g_strdup("Pressure / step");
+      tool->x_title = g_strdup("Ionic step");
+      tool->y_title = g_strdup("Pressure (GPa)");
+      break;
+
+    case GDIS_PLOT_MODE_DOS:
+      tool->x_values = gdis_plot_clone_double_array(model->dos_x_values_ev);
+      tool->y_values = gdis_plot_clone_double_array(model->dos_y_values);
+      tool->plot_title = g_strdup("Density of states");
+      tool->x_title = g_strdup(model->has_fermi_energy
+                                 ? "Energy relative to Fermi (eV)"
+                                 : "Energy (eV)");
+      tool->y_title = g_strdup("Density (states / eV)");
+      break;
+
+    case GDIS_PLOT_MODE_BAND:
+      tool->x_values = gdis_plot_clone_double_array(model->band_x_values);
+      tool->y_values = gdis_plot_clone_double_array(model->band_y_values_ev);
+      tool->plot_title = g_strdup("Band diagram");
+      tool->x_title = g_strdup("k-point distance");
+      tool->y_title = g_strdup(model->has_fermi_energy
+                                 ? "Energy relative to Fermi (eV)"
+                                 : "Energy (eV)");
+      break;
+
+    case GDIS_PLOT_MODE_BANDOS:
+      tool->x_values = gdis_plot_clone_double_array(model->band_x_values);
+      tool->y_values = gdis_plot_clone_double_array(model->band_y_values_ev);
+      tool->secondary_x_values = gdis_plot_clone_double_array(model->dos_y_values);
+      tool->secondary_y_values = gdis_plot_clone_double_array(model->dos_x_values_ev);
+      tool->plot_title = g_strdup("Band structure + DOS");
+      tool->x_title = g_strdup("k-point distance");
+      tool->secondary_x_title = g_strdup("Density (states / eV)");
+      tool->y_title = g_strdup(model->has_fermi_energy
+                                 ? "Energy relative to Fermi (eV)"
+                                 : "Energy (eV)");
+      tool->render_mode = GDIS_PLOT_RENDER_BANDDOS;
+      break;
+
+    case GDIS_PLOT_MODE_FREQUENCY:
+      tool->x_values = gdis_plot_clone_double_array(model->frequency_x_values_cm1);
+      tool->y_values = gdis_plot_clone_double_array(model->frequency_y_values);
+      tool->plot_title = g_strdup("Vibrational frequency");
+      tool->x_title = g_strdup("Frequency (cm-1)");
+      tool->y_title = g_strdup("Intensity (arb. unit)");
+      break;
+
+    case GDIS_PLOT_MODE_RAMAN:
+      tool->x_values = gdis_plot_clone_double_array(model->raman_x_values_cm1);
+      tool->y_values = gdis_plot_clone_double_array(model->raman_y_values);
+      tool->plot_title = g_strdup("Raman spectrum");
+      tool->x_title = g_strdup("Frequency (cm-1)");
+      tool->y_title = g_strdup("Raman intensity (arb. unit)");
+      break;
+
+    default:
+      return FALSE;
+    }
+
+  tool->valid_points = gdis_plot_count_valid_points(tool->x_values, tool->y_values);
+  tool->show_active_marker = FALSE;
+  return tool->x_values != NULL && tool->y_values != NULL;
+}
+
+static gboolean
+gdis_plot_tool_draw_banddos(cairo_t *cr,
+                            int width,
+                            int height,
+                            GdisPlotTool *tool,
+                            gdouble left,
+                            gdouble top,
+                            gdouble right,
+                            gdouble bottom,
+                            guint x_tick_count,
+                            guint y_tick_count)
+{
+  gdouble band_x_min = 0.0;
+  gdouble band_x_max = 1.0;
+  gdouble band_span;
+  gdouble dos_max = 0.0;
+  gdouble dos_scale;
+  gdouble domain_x_min;
+  gdouble domain_x_max;
+  gdouble y_min = 0.0;
+  gdouble y_max = 1.0;
+  gdouble y_padding;
+  gboolean have_band = FALSE;
+  gboolean have_dos = FALSE;
+  const gdouble plot_left = left;
+  const gdouble plot_right = width - right;
+  const gdouble plot_width = plot_right - plot_left;
+  gdouble divider_x;
+
+  if (!tool ||
+      !tool->x_values || !tool->y_values ||
+      !tool->secondary_x_values || !tool->secondary_y_values)
+    return FALSE;
+
+  for (guint i = 0; i < tool->x_values->len && i < tool->y_values->len; i++)
+    {
+      const gdouble x_value = g_array_index(tool->x_values, gdouble, i);
+      const gdouble y_value = g_array_index(tool->y_values, gdouble, i);
+
+      if (!isfinite(y_value))
+        continue;
+
+      if (!have_band)
+        {
+          band_x_min = x_value;
+          band_x_max = x_value;
+          y_min = y_value;
+          y_max = y_value;
+          have_band = TRUE;
+        }
+      else
+        {
+          band_x_min = MIN(band_x_min, x_value);
+          band_x_max = MAX(band_x_max, x_value);
+          y_min = MIN(y_min, y_value);
+          y_max = MAX(y_max, y_value);
+        }
+    }
+
+  for (guint i = 0; i < tool->secondary_x_values->len && i < tool->secondary_y_values->len; i++)
+    {
+      const gdouble x_value = g_array_index(tool->secondary_x_values, gdouble, i);
+      const gdouble y_value = g_array_index(tool->secondary_y_values, gdouble, i);
+
+      if (!isfinite(y_value) || !isfinite(x_value))
+        continue;
+
+      if (!have_dos)
+        {
+          if (!have_band)
+            {
+              y_min = y_value;
+              y_max = y_value;
+            }
+          have_dos = TRUE;
+        }
+
+      dos_max = MAX(dos_max, fabs(x_value));
+      y_min = MIN(y_min, y_value);
+      y_max = MAX(y_max, y_value);
+    }
+
+  if (!have_band || !have_dos)
+    return FALSE;
+
+  band_span = band_x_max - band_x_min;
+  if (band_span <= 1.0e-9)
+    band_span = 1.0;
+  if (dos_max <= 1.0e-9)
+    dos_max = 1.0;
+
+  if (fabs(y_max - y_min) < 1.0e-9)
+    {
+      y_padding = MAX(fabs(y_max) * 0.06, 1.0);
+      y_min -= y_padding;
+      y_max += y_padding;
+    }
+  else
+    {
+      y_padding = (y_max - y_min) * 0.08;
+      y_min -= y_padding;
+      y_max += y_padding;
+    }
+
+  dos_scale = MAX(band_span * 0.45, 1.0) / dos_max;
+  domain_x_min = -dos_max * dos_scale;
+  domain_x_max = band_span;
+  divider_x = plot_left + ((0.0 - domain_x_min) / (domain_x_max - domain_x_min)) * plot_width;
+
+  for (guint i = 0; i < y_tick_count; i++)
+    {
+      const gdouble fraction = y_tick_count > 1u ? (gdouble) i / (gdouble) (y_tick_count - 1u) : 0.0;
+      const gdouble y = height - bottom - fraction * (height - top - bottom);
+      g_autofree gchar *y_label = NULL;
+
+      cairo_set_source_rgba(cr, 0.18, 0.25, 0.32, 1.0);
+      cairo_move_to(cr, plot_left, y);
+      cairo_line_to(cr, plot_right, y);
+      cairo_stroke(cr);
+
+      cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
+      y_label = g_strdup_printf("%.4g", y_min + fraction * (y_max - y_min));
+      cairo_move_to(cr, 10.0, y + 4.0);
+      cairo_show_text(cr, y_label);
+    }
+
+  for (guint i = 0; i < MIN(x_tick_count, 5u); i++)
+    {
+      const guint tick_count = MIN(x_tick_count, 5u);
+      const gdouble fraction = tick_count > 1u ? (gdouble) i / (gdouble) (tick_count - 1u) : 0.0;
+      const gdouble x = plot_left + fraction * (divider_x - plot_left);
+      const gdouble dos_value = dos_max * (1.0 - fraction);
+      g_autofree gchar *dos_label = NULL;
+
+      cairo_set_source_rgba(cr, 0.18, 0.25, 0.32, 1.0);
+      cairo_move_to(cr, x, top);
+      cairo_line_to(cr, x, height - bottom);
+      cairo_stroke(cr);
+
+      cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
+      dos_label = g_strdup_printf("%.4g", dos_value);
+      cairo_move_to(cr, x - 10.0, height - bottom + 22.0);
+      cairo_show_text(cr, dos_label);
+    }
+
+  for (guint i = 0; i < x_tick_count; i++)
+    {
+      const gdouble fraction = x_tick_count > 1u ? (gdouble) i / (gdouble) (x_tick_count - 1u) : 0.0;
+      const gdouble x = divider_x + fraction * (plot_right - divider_x);
+      const gdouble band_value = fraction * band_span;
+      g_autofree gchar *band_label = NULL;
+
+      cairo_set_source_rgba(cr, 0.18, 0.25, 0.32, 1.0);
+      cairo_move_to(cr, x, top);
+      cairo_line_to(cr, x, height - bottom);
+      cairo_stroke(cr);
+
+      cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
+      band_label = g_strdup_printf("%.4g", band_value);
+      cairo_move_to(cr, x - 10.0, height - bottom + 22.0);
+      cairo_show_text(cr, band_label);
+    }
+
+  cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.92);
+  cairo_set_line_width(cr, 1.3);
+  cairo_move_to(cr, divider_x, top);
+  cairo_line_to(cr, divider_x, height - bottom);
+  cairo_stroke(cr);
+
+  if (y_min < 0.0 && y_max > 0.0)
+    {
+      const gdouble zero_y = height - bottom - ((0.0 - y_min) / (y_max - y_min)) * (height - top - bottom);
+
+      cairo_set_source_rgba(cr, 0.95, 0.70, 0.26, 0.55);
+      cairo_set_line_width(cr, 1.4);
+      cairo_move_to(cr, plot_left, zero_y);
+      cairo_line_to(cr, plot_right, zero_y);
+      cairo_stroke(cr);
+    }
+
+  cairo_move_to(cr, plot_left + (divider_x - plot_left) * 0.18, height - 14.0);
+  cairo_show_text(cr, tool->secondary_x_title ? tool->secondary_x_title : "Density (states / eV)");
+  cairo_move_to(cr, divider_x + (plot_right - divider_x) * 0.24, height - 14.0);
+  cairo_show_text(cr, tool->x_title ? tool->x_title : "k-point distance");
+  cairo_save(cr);
+  cairo_translate(cr, 24.0, height * 0.58);
+  cairo_rotate(cr, -G_PI / 2.0);
+  cairo_move_to(cr, 0.0, 0.0);
+  cairo_show_text(cr, tool->y_title ? tool->y_title : "Energy (eV)");
+  cairo_restore(cr);
+
+  cairo_set_source_rgba(cr, 0.36, 0.73, 0.97, 0.95);
+  cairo_set_line_width(cr, 1.9);
+  for (guint i = 0; i < tool->x_values->len && i < tool->y_values->len; i++)
+    {
+      const gdouble x_value = g_array_index(tool->x_values, gdouble, i);
+      const gdouble y_value = g_array_index(tool->y_values, gdouble, i);
+      const gdouble domain_x = x_value - band_x_min;
+      const gdouble plot_x = plot_left + ((domain_x - domain_x_min) / (domain_x_max - domain_x_min)) * plot_width;
+      const gdouble plot_y = height - bottom - ((y_value - y_min) / (y_max - y_min)) * (height - top - bottom);
+
+      if (!isfinite(y_value))
+        {
+          cairo_stroke(cr);
+          continue;
+        }
+
+      if (i == 0u ||
+          !isfinite(g_array_index(tool->y_values, gdouble, i - 1u)))
+        cairo_move_to(cr, plot_x, plot_y);
+      else
+        cairo_line_to(cr, plot_x, plot_y);
+    }
+  cairo_stroke(cr);
+
+  cairo_set_source_rgba(cr, 0.41, 0.92, 0.61, 0.92);
+  cairo_set_line_width(cr, 2.0);
+  for (guint i = 0; i < tool->secondary_x_values->len && i < tool->secondary_y_values->len; i++)
+    {
+      const gdouble x_value = g_array_index(tool->secondary_x_values, gdouble, i);
+      const gdouble y_value = g_array_index(tool->secondary_y_values, gdouble, i);
+      const gdouble domain_x = -MAX(0.0, x_value) * dos_scale;
+      const gdouble plot_x = plot_left + ((domain_x - domain_x_min) / (domain_x_max - domain_x_min)) * plot_width;
+      const gdouble plot_y = height - bottom - ((y_value - y_min) / (y_max - y_min)) * (height - top - bottom);
+
+      if (!isfinite(y_value) || !isfinite(x_value))
+        {
+          cairo_stroke(cr);
+          continue;
+        }
+
+      if (i == 0u ||
+          !isfinite(g_array_index(tool->secondary_y_values, gdouble, i - 1u)))
+        cairo_move_to(cr, plot_x, plot_y);
+      else
+        cairo_line_to(cr, plot_x, plot_y);
+    }
+  cairo_stroke(cr);
+
+  cairo_set_source_rgba(cr, 0.36, 0.73, 0.97, 0.95);
+  cairo_rectangle(cr, plot_right - 118.0, top + 10.0, 12.0, 3.0);
+  cairo_fill(cr);
+  cairo_move_to(cr, plot_right - 94.0, top + 14.0);
+  cairo_show_text(cr, "Bands");
+  cairo_set_source_rgba(cr, 0.41, 0.92, 0.61, 0.92);
+  cairo_rectangle(cr, plot_right - 118.0, top + 28.0, 12.0, 3.0);
+  cairo_fill(cr);
+  cairo_move_to(cr, plot_right - 94.0, top + 32.0);
+  cairo_show_text(cr, "DOS");
+
+  return TRUE;
 }
 
 static void
@@ -7496,6 +8053,9 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
   guint x_tick_count;
   guint y_tick_count;
   gboolean have_valid;
+  gboolean stick_mode;
+  gboolean band_mode;
+  gboolean dos_mode;
 
   (void) area;
 
@@ -7507,6 +8067,11 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
   y_max = 1.0;
   x_tick_count = tool ? gdis_plot_tick_count(tool->x_ticks_spin, 6u) : 6u;
   y_tick_count = tool ? gdis_plot_tick_count(tool->y_ticks_spin, 6u) : 6u;
+  stick_mode = tool &&
+               (tool->current_mode == GDIS_PLOT_MODE_FREQUENCY ||
+                tool->current_mode == GDIS_PLOT_MODE_RAMAN);
+  band_mode = tool && tool->current_mode == GDIS_PLOT_MODE_BAND;
+  dos_mode = tool && tool->current_mode == GDIS_PLOT_MODE_DOS;
 
   cairo_set_source_rgb(cr, 0.02, 0.03, 0.05);
   cairo_paint(cr);
@@ -7520,6 +8085,11 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
   cairo_set_font_size(cr, 18.0);
   cairo_move_to(cr, 28.0, 30.0);
   cairo_show_text(cr, tool && tool->plot_title ? tool->plot_title : "Plots");
+
+  if (tool &&
+      tool->render_mode == GDIS_PLOT_RENDER_BANDDOS &&
+      gdis_plot_tool_draw_banddos(cr, width, height, tool, left, top, right, bottom, x_tick_count, y_tick_count))
+    return;
 
   if (tool && tool->x_values && tool->y_values)
     {
@@ -7559,6 +8129,10 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
 
   if (x_max <= x_min)
     x_max = x_min + 1.0;
+  if (stick_mode)
+    y_min = 0.0;
+  else if (dos_mode)
+    y_min = MIN(0.0, y_min);
   if (fabs(y_max - y_min) < 1.0e-9)
     {
       y_padding = MAX(fabs(y_max) * 0.06, 1.0);
@@ -7571,6 +8145,10 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
       y_min -= y_padding;
       y_max += y_padding;
     }
+  if (stick_mode)
+    y_min = 0.0;
+  else if (dos_mode)
+    y_min = MIN(0.0, y_min);
 
   cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
   cairo_set_font_size(cr, 11.0);
@@ -7586,7 +8164,7 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
       cairo_stroke(cr);
 
       cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
-      x_label = g_strdup_printf("%.0f", x_min + fraction * (x_max - x_min));
+      x_label = g_strdup_printf("%.4g", x_min + fraction * (x_max - x_min));
       cairo_move_to(cr, x - 8.0, height - bottom + 22.0);
       cairo_show_text(cr, x_label);
     }
@@ -7603,9 +8181,12 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
       cairo_stroke(cr);
 
       cairo_set_source_rgba(cr, 0.70, 0.78, 0.84, 0.95);
-      y_label = g_strdup_printf("%.4g", y_min + fraction * (y_max - y_min));
-      cairo_move_to(cr, 10.0, y + 4.0);
-      cairo_show_text(cr, y_label);
+      if (!stick_mode)
+        {
+          y_label = g_strdup_printf("%.4g", y_min + fraction * (y_max - y_min));
+          cairo_move_to(cr, 10.0, y + 4.0);
+          cairo_show_text(cr, y_label);
+        }
     }
 
   cairo_move_to(cr, width * 0.45, height - 14.0);
@@ -7617,7 +8198,31 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
   cairo_show_text(cr, tool->y_title ? tool->y_title : "Value");
   cairo_restore(cr);
 
-  if (tool->owner && tool->owner->active_model)
+  if (dos_mode && x_min < 0.0 && x_max > 0.0)
+    {
+      const gdouble zero_x = left + ((0.0 - x_min) / (x_max - x_min)) * (width - left - right);
+
+      cairo_set_source_rgba(cr, 0.95, 0.70, 0.26, 0.55);
+      cairo_set_line_width(cr, 1.4);
+      cairo_move_to(cr, zero_x, top);
+      cairo_line_to(cr, zero_x, height - bottom);
+      cairo_stroke(cr);
+    }
+
+  if (band_mode && y_min < 0.0 && y_max > 0.0)
+    {
+      const gdouble zero_y = height - bottom - ((0.0 - y_min) / (y_max - y_min)) * (height - top - bottom);
+
+      cairo_set_source_rgba(cr, 0.95, 0.70, 0.26, 0.55);
+      cairo_set_line_width(cr, 1.4);
+      cairo_move_to(cr, left, zero_y);
+      cairo_line_to(cr, width - right, zero_y);
+      cairo_stroke(cr);
+    }
+
+  if (tool->show_active_marker &&
+      tool->owner &&
+      tool->owner->active_model)
     {
       guint source_count;
       gint active_index;
@@ -7667,19 +8272,50 @@ gdis_plot_tool_draw(GtkDrawingArea *area,
     }
   cairo_stroke(cr);
 
-  cairo_set_source_rgba(cr, 0.89, 0.94, 0.98, 0.96);
-  for (guint i = 0; i < tool->x_values->len && i < tool->y_values->len; i++)
+  if (!band_mode &&
+      !stick_mode &&
+      tool->x_values->len <= 240u)
     {
-      const gdouble x_value = g_array_index(tool->x_values, gdouble, i);
-      const gdouble y_value = g_array_index(tool->y_values, gdouble, i);
-      const gdouble plot_x = left + ((x_value - x_min) / (x_max - x_min)) * (width - left - right);
-      const gdouble plot_y = height - bottom - ((y_value - y_min) / (y_max - y_min)) * (height - top - bottom);
+      cairo_set_source_rgba(cr, 0.89, 0.94, 0.98, 0.96);
+      for (guint i = 0; i < tool->x_values->len && i < tool->y_values->len; i++)
+        {
+          const gdouble x_value = g_array_index(tool->x_values, gdouble, i);
+          const gdouble y_value = g_array_index(tool->y_values, gdouble, i);
+          const gdouble plot_x = left + ((x_value - x_min) / (x_max - x_min)) * (width - left - right);
+          const gdouble plot_y = height - bottom - ((y_value - y_min) / (y_max - y_min)) * (height - top - bottom);
 
-      if (!isfinite(y_value))
-        continue;
+          if (!isfinite(y_value))
+            continue;
 
-      cairo_arc(cr, plot_x, plot_y, 2.4, 0.0, 2.0 * G_PI);
-      cairo_fill(cr);
+          cairo_arc(cr, plot_x, plot_y, 2.4, 0.0, 2.0 * G_PI);
+          cairo_fill(cr);
+        }
+    }
+
+  if (stick_mode)
+    {
+      cairo_set_source_rgba(cr, 0.89, 0.94, 0.98, 0.96);
+      for (guint i = 1u; i + 1u < tool->x_values->len && i + 1u < tool->y_values->len; i++)
+        {
+          const gdouble left_x = g_array_index(tool->x_values, gdouble, i - 1u);
+          const gdouble x_value = g_array_index(tool->x_values, gdouble, i);
+          const gdouble right_x = g_array_index(tool->x_values, gdouble, i + 1u);
+          const gdouble y_value = g_array_index(tool->y_values, gdouble, i);
+          const gdouble left_y = g_array_index(tool->y_values, gdouble, i - 1u);
+          const gdouble right_y = g_array_index(tool->y_values, gdouble, i + 1u);
+          const gdouble plot_x = left + ((x_value - x_min) / (x_max - x_min)) * (width - left - right);
+          const gdouble plot_y = height - bottom - ((y_value - y_min) / (y_max - y_min)) * (height - top - bottom);
+
+          if (!isfinite(y_value) || y_value <= 0.0)
+            continue;
+          if (fabs(left_x - x_value) > 1.0e-9 || fabs(right_x - x_value) > 1.0e-9)
+            continue;
+          if (y_value < left_y || y_value < right_y)
+            continue;
+
+          cairo_rectangle(cr, plot_x - 2.3, plot_y - 2.3, 4.6, 4.6);
+          cairo_fill(cr);
+        }
     }
 }
 
@@ -7706,8 +8342,17 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
   gchar source_label[48];
   gchar atom_source[48];
   g_autofree gchar *summary = NULL;
+  g_autofree gchar *direct_detail = NULL;
   g_autofree gchar *unavailable_reason = NULL;
+  g_autofree gchar *progress_message = NULL;
   g_autofree GdisModel *frame_probe = NULL;
+  guint pressure_history_count;
+  guint dos_point_count;
+  guint band_point_count;
+  guint band_path_count;
+  guint band_series_count;
+  guint frequency_peak_count;
+  guint raman_peak_count;
 
   g_return_if_fail(self != NULL);
 
@@ -7722,6 +8367,7 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
       if (tool->summary_label)
         gtk_label_set_text(tool->summary_label,
                            "No active model loaded.\nOpen a trajectory or a set of models first.");
+      gdis_plot_tool_set_busy(tool, FALSE, NULL);
       if (tool->plot_area)
         gtk_widget_queue_draw(tool->plot_area);
       return;
@@ -7749,40 +8395,65 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
   banddos_supported = gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_BANDOS, source, sample_count);
   frequency_supported = gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_FREQUENCY, source, sample_count);
   raman_supported = gdis_plot_mode_is_supported(self, GDIS_PLOT_MODE_RAMAN, source, sample_count);
+  pressure_history_count = (self->active_model->pressure_x_values && self->active_model->pressure_y_values_gpa)
+                             ? MIN(self->active_model->pressure_x_values->len,
+                                   self->active_model->pressure_y_values_gpa->len)
+                             : 0u;
+  dos_point_count = (self->active_model->dos_x_values_ev && self->active_model->dos_y_values)
+                      ? MIN(self->active_model->dos_x_values_ev->len,
+                            self->active_model->dos_y_values->len)
+                      : 0u;
+  band_point_count = (self->active_model->band_x_values && self->active_model->band_y_values_ev)
+                       ? MIN(self->active_model->band_x_values->len,
+                             self->active_model->band_y_values_ev->len)
+                       : 0u;
+  band_path_count = self->active_model->band_path_count;
+  band_series_count = self->active_model->band_series_count;
+  frequency_peak_count = (self->active_model->frequency_x_values_cm1 && self->active_model->frequency_y_values)
+                           ? MIN(self->active_model->frequency_x_values_cm1->len,
+                                 self->active_model->frequency_y_values->len) / 3u
+                           : 0u;
+  raman_peak_count = (self->active_model->raman_x_values_cm1 && self->active_model->raman_y_values)
+                       ? MIN(self->active_model->raman_x_values_cm1->len,
+                             self->active_model->raman_y_values->len) / 3u
+                       : 0u;
 
   if (tool->dynamic_info_label)
     {
       g_autofree gchar *dynamic_info = NULL;
 
-      dynamic_info = g_strdup_printf("Ionic steps: %u\nEnergy / step: %s\nForces / step: %s\nVolume / step: %s\nPressure / step: %s",
+      dynamic_info = g_strdup_printf("Ionic steps: %u\nPressure history: %u\nEnergy / step: %s\nForces / step: %s\nVolume / step: %s\nPressure / step: %s",
                                      sample_count,
+                                     pressure_history_count,
                                      energy_supported ? "available" : "missing in current source",
-                                     force_supported ? "available" : "unavailable in current model bridge",
+                                     force_supported ? "available" : "missing in current source",
                                      volume_supported ? "available" : "missing in current source",
-                                     pressure_supported ? "available" : "unavailable in current model bridge");
+                                     pressure_supported ? "available" : "missing in current source");
       gtk_label_set_text(tool->dynamic_info_label, dynamic_info);
     }
   if (tool->electronic_info_label)
     {
       g_autofree gchar *electronic_info = NULL;
 
-      electronic_info = g_strdup_printf("DOS present: %u\nBAND present: %u\nDensity Of States: %s\nBand structure: %s\nBand / DOS: %s",
-                                        0u,
-                                        0u,
-                                        dos_supported ? "available" : "unavailable in current model bridge",
-                                        band_supported ? "available" : "unavailable in current model bridge",
-                                        banddos_supported ? "available" : "unavailable in current model bridge");
+      electronic_info = g_strdup_printf("DOS points: %u\nBand points: %u\nBand k-points: %u\nBand branches: %u\nDensity Of States: %s\nBand structure: %s\nBand / DOS: %s",
+                                        dos_point_count,
+                                        band_point_count,
+                                        band_path_count,
+                                        band_series_count,
+                                        dos_supported ? "available" : "missing in current source",
+                                        band_supported ? "available" : "missing in current source",
+                                        banddos_supported ? "available" : "missing in current source");
       gtk_label_set_text(tool->electronic_info_label, electronic_info);
     }
   if (tool->frequency_info_label)
     {
       g_autofree gchar *frequency_info = NULL;
 
-      frequency_info = g_strdup_printf("FREQs present: %u\nRAMAN present: %u\nVibrational: %s\nRaman: %s",
-                                       0u,
-                                       0u,
-                                       frequency_supported ? "available" : "unavailable in current model bridge",
-                                       raman_supported ? "available" : "unavailable in current model bridge");
+      frequency_info = g_strdup_printf("FREQ peaks: %u\nRAMAN peaks: %u\nVibrational: %s\nRaman: %s",
+                                       frequency_peak_count,
+                                       raman_peak_count,
+                                       frequency_supported ? "available" : "missing in current source",
+                                       raman_supported ? "available" : "missing in current source");
       gtk_label_set_text(tool->frequency_info_label, frequency_info);
     }
 
@@ -7840,6 +8511,7 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
                                      gdis_plot_mode_page_name(mode));
   tool->syncing_legacy_controls = FALSE;
 
+  gdis_plot_tool_set_busy(tool, TRUE, "Preparing plot data...");
   unavailable_reason = gdis_plot_mode_unavailable_reason(mode, energy_supported, volume_supported);
   if (unavailable_reason && unavailable_reason[0] != '\0')
     {
@@ -7853,6 +8525,61 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
         gdis_plot_mode_label(mode),
         unavailable_reason);
       gtk_label_set_text(tool->summary_label, summary);
+      gdis_plot_tool_set_busy(tool, FALSE, NULL);
+      if (tool->plot_area)
+        gtk_widget_queue_draw(tool->plot_area);
+      return;
+    }
+
+  if (gdis_plot_mode_has_direct_dataset(self->active_model, mode) &&
+      (mode != GDIS_PLOT_MODE_PRESSURE ||
+       source != GDIS_ANIMATION_SOURCE_SESSION_MODELS ||
+       sample_count <= 1u))
+    {
+      gdis_plot_tool_load_direct_dataset(tool, self->active_model, mode);
+
+      switch (mode)
+        {
+        case GDIS_PLOT_MODE_PRESSURE:
+          direct_detail = g_strdup_printf("Pressure points: %u", pressure_history_count);
+          break;
+        case GDIS_PLOT_MODE_DOS:
+          direct_detail = g_strdup_printf("DOS points: %u", dos_point_count);
+          break;
+        case GDIS_PLOT_MODE_BAND:
+          direct_detail = g_strdup_printf("Band k-points: %u\nBand branches: %u",
+                                          band_path_count,
+                                          band_series_count);
+          break;
+        case GDIS_PLOT_MODE_BANDOS:
+          direct_detail = g_strdup_printf("Band k-points: %u\nBand branches: %u\nDOS points: %u",
+                                          band_path_count,
+                                          band_series_count,
+                                          dos_point_count);
+          break;
+        case GDIS_PLOT_MODE_FREQUENCY:
+          direct_detail = g_strdup_printf("Vibrational peaks: %u", frequency_peak_count);
+          break;
+        case GDIS_PLOT_MODE_RAMAN:
+          direct_detail = g_strdup_printf("Raman peaks: %u", raman_peak_count);
+          break;
+        default:
+          direct_detail = g_strdup("Direct source dataset");
+          break;
+        }
+
+      summary = g_strdup_printf(
+        "Source: %s\n"
+        "Plot: %s\n"
+        "Valid points: %u\n"
+        "%s\n\n"
+        "This plot comes from parsed data inside the active source file.",
+        self->active_model->basename ? self->active_model->basename : source_label,
+        gdis_plot_mode_label(mode),
+        tool->valid_points,
+        direct_detail ? direct_detail : "");
+      gtk_label_set_text(tool->summary_label, summary);
+      gdis_plot_tool_set_busy(tool, FALSE, NULL);
       if (tool->plot_area)
         gtk_widget_queue_draw(tool->plot_area);
       return;
@@ -7876,6 +8603,7 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
                            source == GDIS_ANIMATION_SOURCE_SESSION_MODELS ? "Model" :
                            "Model");
   tool->y_title = g_strdup(gdis_plot_mode_y_label(mode));
+  tool->show_active_marker = TRUE;
 
   if (required_atoms > 0u && atom_count < required_atoms)
     {
@@ -7891,6 +8619,7 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
         required_atoms,
         required_atoms == 1u ? "" : "s");
       gtk_label_set_text(tool->summary_label, summary);
+      gdis_plot_tool_set_busy(tool, FALSE, NULL);
       if (tool->plot_area)
         gtk_widget_queue_draw(tool->plot_area);
       return;
@@ -7898,6 +8627,9 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
 
   if (source == GDIS_ANIMATION_SOURCE_MODEL_FRAMES)
     frame_probe = gdis_model_clone(self->active_model);
+
+  progress_message = g_strdup_printf("Generating plot... 0 / %u samples", sample_count);
+  gdis_plot_tool_set_busy(tool, TRUE, progress_message);
 
   for (guint i = 0; i < sample_count; i++)
     {
@@ -7938,6 +8670,15 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
       else
         tool->valid_points++;
       g_array_append_val(tool->y_values, y_value);
+
+      if (sample_count > 50u &&
+          ((i + 1u) == sample_count || ((i + 1u) % 25u) == 0u))
+        {
+          progress_message = g_strdup_printf("Generating plot... %u / %u samples",
+                                             i + 1u,
+                                             sample_count);
+          gdis_plot_tool_set_busy(tool, TRUE, progress_message);
+        }
     }
 
   summary = g_strdup_printf(
@@ -7956,6 +8697,7 @@ gdis_gtk4_window_refresh_plot_tool(GdisGtk4Window *self)
       ? "Use Animation... to scrub the same frame/model source while keeping this plot available."
       : "No valid scalar values were available for this source and plot combination.");
   gtk_label_set_text(tool->summary_label, summary);
+  gdis_plot_tool_set_busy(tool, FALSE, NULL);
   if (tool->plot_area)
     gtk_widget_queue_draw(tool->plot_area);
 }
@@ -8276,6 +9018,7 @@ gdis_gtk4_window_present_plot_tool(GdisGtk4Window *self)
   gtk_box_append(GTK_BOX(controls), tool->y_ticks_spin);
 
   button = gtk_button_new_with_label("Execute");
+  tool->execute_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(on_plot_refresh_clicked), self);
   gtk_box_append(GTK_BOX(controls), button);
 
@@ -8286,6 +9029,15 @@ gdis_gtk4_window_present_plot_tool(GdisGtk4Window *self)
   button = gtk_button_new_with_label("Close");
   g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_close), window);
   gtk_box_append(GTK_BOX(controls), button);
+
+  tool->busy_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_visible(tool->busy_box, FALSE);
+  gtk_box_append(GTK_BOX(root), tool->busy_box);
+  tool->busy_spinner = gtk_spinner_new();
+  gtk_box_append(GTK_BOX(tool->busy_box), tool->busy_spinner);
+  tool->busy_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_xalign(tool->busy_label, 0.0f);
+  gtk_box_append(GTK_BOX(tool->busy_box), GTK_WIDGET(tool->busy_label));
 
   frame = gtk_frame_new(NULL);
   gtk_widget_set_vexpand(frame, TRUE);
@@ -12183,6 +12935,557 @@ gdis_qbox_collect_unique_species(const GdisModel *model)
   return species;
 }
 
+static gdouble
+gdis_qbox_atom_effective_occupancy(const GdisAtom *atom)
+{
+  g_return_val_if_fail(atom != NULL, 1.0);
+
+  if (atom->occupancy > 0.0)
+    return atom->occupancy;
+  return 1.0;
+}
+
+typedef struct
+{
+  gchar *label;
+  gdouble occupancy;
+  gdouble coords[3];
+  gboolean fractional;
+} GdisQboxCifAtomRecord;
+
+static void
+gdis_qbox_cif_atom_record_free(gpointer data)
+{
+  GdisQboxCifAtomRecord *record;
+
+  record = data;
+  if (!record)
+    return;
+
+  g_free(record->label);
+  g_free(record);
+}
+
+static gdouble
+gdis_qbox_parse_cif_number(const gchar *text)
+{
+  g_autofree gchar *copy = NULL;
+  gchar *paren;
+
+  if (!text || !text[0] || g_strcmp0(text, ".") == 0 || g_strcmp0(text, "?") == 0)
+    return 0.0;
+
+  copy = g_strdup(text);
+  paren = strchr(copy, '(');
+  if (paren)
+    *paren = '\0';
+  g_strstrip(copy);
+  return g_ascii_strtod(copy, NULL);
+}
+
+static gboolean
+gdis_qbox_cif_control_line(const gchar *line)
+{
+  return (line == NULL ||
+          line[0] == '\0' ||
+          line[0] == '#' ||
+          g_str_has_prefix(line, "loop_") ||
+          g_str_has_prefix(line, "data_") ||
+          g_str_has_prefix(line, "save_") ||
+          g_str_has_prefix(line, "global_") ||
+          line[0] == '_');
+}
+
+static GPtrArray *
+gdis_qbox_tokenize_cif_line(const gchar *line)
+{
+  GPtrArray *tokens;
+  gchar **parts;
+
+  tokens = g_ptr_array_new_with_free_func(g_free);
+  if (!line)
+    return tokens;
+
+  parts = g_strsplit_set(line, " \t\r\n", -1);
+  for (guint i = 0; parts && parts[i] != NULL; i++)
+    {
+      if (parts[i][0] == '\0')
+        continue;
+      g_ptr_array_add(tokens, g_strdup(parts[i]));
+    }
+  g_strfreev(parts);
+  return tokens;
+}
+
+static gboolean
+gdis_qbox_cif_records_share_site(const GdisQboxCifAtomRecord *left,
+                                 const GdisQboxCifAtomRecord *right)
+{
+  const gdouble tolerance = 1.0e-6;
+  gdouble dx;
+  gdouble dy;
+  gdouble dz;
+
+  g_return_val_if_fail(left != NULL, FALSE);
+  g_return_val_if_fail(right != NULL, FALSE);
+
+  if (left->fractional != right->fractional)
+    return FALSE;
+
+  dx = left->coords[0] - right->coords[0];
+  dy = left->coords[1] - right->coords[1];
+  dz = left->coords[2] - right->coords[2];
+  return (dx * dx + dy * dy + dz * dz) <= tolerance * tolerance;
+}
+
+static GHashTable *
+gdis_qbox_collect_cif_skip_labels(const GdisModel *model,
+                                  GString *warnings)
+{
+  typedef struct
+  {
+    guint first_index;
+    guint best_index;
+    guint member_count;
+    gdouble best_occupancy;
+  } GdisQboxCifSite;
+
+  g_autofree gchar *contents = NULL;
+  g_auto(GStrv) lines = NULL;
+  GHashTable *skip_labels;
+  GPtrArray *records;
+  GArray *sites;
+  gsize length = 0u;
+  GError *error = NULL;
+
+  g_return_val_if_fail(model != NULL, NULL);
+
+  if (model->format != GDIS_MODEL_FORMAT_CIF ||
+      !model->path ||
+      model->path[0] == '\0')
+    return NULL;
+
+  if (!g_file_get_contents(model->path, &contents, &length, &error))
+    {
+      g_clear_error(&error);
+      return NULL;
+    }
+
+  skip_labels = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  records = g_ptr_array_new_with_free_func(gdis_qbox_cif_atom_record_free);
+  sites = g_array_new(FALSE, FALSE, sizeof(GdisQboxCifSite));
+  lines = g_strsplit(contents, "\n", -1);
+
+  for (guint i = 0; lines[i] != NULL; i++)
+    {
+      gchar *trimmed;
+
+      trimmed = g_strstrip(lines[i]);
+      if (!g_str_has_prefix(trimmed, "loop_"))
+        continue;
+
+      i++;
+      if (lines[i] == NULL)
+        break;
+
+      {
+        GPtrArray *headers;
+        gint label_pos;
+        gint occ_pos;
+        gint frac_x_pos;
+        gint frac_y_pos;
+        gint frac_z_pos;
+        gint cart_x_pos;
+        gint cart_y_pos;
+        gint cart_z_pos;
+
+        headers = g_ptr_array_new_with_free_func(g_free);
+        while (lines[i] != NULL)
+          {
+            gchar *header;
+
+            header = g_strstrip(lines[i]);
+            if (header[0] != '_')
+              break;
+            g_ptr_array_add(headers, g_ascii_strdown(header, -1));
+            i++;
+          }
+
+        label_pos = -1;
+        occ_pos = -1;
+        frac_x_pos = -1;
+        frac_y_pos = -1;
+        frac_z_pos = -1;
+        cart_x_pos = -1;
+        cart_y_pos = -1;
+        cart_z_pos = -1;
+
+        for (guint h = 0; h < headers->len; h++)
+          {
+            const gchar *header;
+
+            header = g_ptr_array_index(headers, h);
+            if (g_str_equal(header, "_atom_site_label"))
+              label_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_occupancy"))
+              occ_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_fract_x"))
+              frac_x_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_fract_y"))
+              frac_y_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_fract_z"))
+              frac_z_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_cartn_x") ||
+                     g_str_equal(header, "_atom_site_cart_x"))
+              cart_x_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_cartn_y") ||
+                     g_str_equal(header, "_atom_site_cart_y"))
+              cart_y_pos = (gint) h;
+            else if (g_str_equal(header, "_atom_site_cartn_z") ||
+                     g_str_equal(header, "_atom_site_cart_z"))
+              cart_z_pos = (gint) h;
+          }
+
+        if (label_pos >= 0 &&
+            ((frac_x_pos >= 0 && frac_y_pos >= 0 && frac_z_pos >= 0) ||
+             (cart_x_pos >= 0 && cart_y_pos >= 0 && cart_z_pos >= 0)))
+          {
+            while (lines[i] != NULL)
+              {
+                GPtrArray *tokens;
+                gchar *row;
+                gboolean fractional;
+                GdisQboxCifAtomRecord *record;
+
+                row = g_strstrip(lines[i]);
+                if (gdis_qbox_cif_control_line(row))
+                  break;
+
+                tokens = gdis_qbox_tokenize_cif_line(row);
+                fractional = (frac_x_pos >= 0 && frac_y_pos >= 0 && frac_z_pos >= 0);
+                if (tokens->len > (guint) label_pos &&
+                    ((fractional && tokens->len > (guint) frac_z_pos) ||
+                     (!fractional && tokens->len > (guint) cart_z_pos)))
+                  {
+                    record = g_new0(GdisQboxCifAtomRecord, 1);
+                    record->label = g_strdup(g_ptr_array_index(tokens, label_pos));
+                    record->occupancy = occ_pos >= 0 && tokens->len > (guint) occ_pos ?
+                                        gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, occ_pos)) :
+                                        1.0;
+                    record->fractional = fractional;
+                    if (fractional)
+                      {
+                        record->coords[0] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, frac_x_pos));
+                        record->coords[1] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, frac_y_pos));
+                        record->coords[2] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, frac_z_pos));
+                      }
+                    else
+                      {
+                        record->coords[0] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, cart_x_pos));
+                        record->coords[1] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, cart_y_pos));
+                        record->coords[2] = gdis_qbox_parse_cif_number(g_ptr_array_index(tokens, cart_z_pos));
+                      }
+                    g_ptr_array_add(records, record);
+                  }
+
+                g_ptr_array_free(tokens, TRUE);
+                i++;
+              }
+          }
+
+        g_ptr_array_unref(headers);
+        if (lines[i] == NULL)
+          break;
+        i--;
+      }
+    }
+
+  for (guint i = 0; i < records->len; i++)
+    {
+      const GdisQboxCifAtomRecord *record;
+      gboolean found_site = FALSE;
+
+      record = g_ptr_array_index(records, i);
+      if (!record->label || record->label[0] == '\0')
+        continue;
+
+      for (guint site_index = 0; site_index < sites->len; site_index++)
+        {
+          GdisQboxCifSite *site;
+          const GdisQboxCifAtomRecord *site_record;
+
+          site = &g_array_index(sites, GdisQboxCifSite, site_index);
+          site_record = g_ptr_array_index(records, site->first_index);
+          if (!gdis_qbox_cif_records_share_site(record, site_record))
+            continue;
+
+          site->member_count++;
+          if (record->occupancy > site->best_occupancy + 1.0e-9)
+            {
+              site->best_index = i;
+              site->best_occupancy = record->occupancy;
+            }
+          found_site = TRUE;
+          break;
+        }
+
+      if (!found_site)
+        {
+          GdisQboxCifSite site;
+
+          site.first_index = i;
+          site.best_index = i;
+          site.member_count = 1u;
+          site.best_occupancy = record->occupancy;
+          g_array_append_val(sites, site);
+        }
+    }
+
+  for (guint site_index = 0; site_index < sites->len; site_index++)
+    {
+      const GdisQboxCifSite *site;
+      const GdisQboxCifAtomRecord *site_record;
+      const GdisQboxCifAtomRecord *best_record;
+      GString *skipped;
+
+      site = &g_array_index(sites, GdisQboxCifSite, site_index);
+      if (site->member_count <= 1u)
+        continue;
+
+      site_record = g_ptr_array_index(records, site->first_index);
+      best_record = g_ptr_array_index(records, site->best_index);
+      skipped = g_string_new("");
+
+      for (guint record_index = 0; record_index < records->len; record_index++)
+        {
+          const GdisQboxCifAtomRecord *member_record;
+
+          if (record_index == site->best_index)
+            continue;
+
+          member_record = g_ptr_array_index(records, record_index);
+          if (!gdis_qbox_cif_records_share_site(member_record, site_record))
+            continue;
+          if (member_record->label && member_record->label[0] != '\0')
+            g_hash_table_add(skip_labels, g_strdup(member_record->label));
+          if (skipped->len > 0)
+            g_string_append(skipped, ", ");
+          g_string_append_printf(skipped,
+                                 "%s (occ %.3f)",
+                                 member_record->label ? member_record->label : "atom",
+                                 member_record->occupancy);
+        }
+
+      if (warnings && skipped->len > 0)
+        {
+          g_string_append_printf(warnings,
+                                 "CIF disorder handling: using %s (occ %.3f) for the site at %.5f %.5f %.5f and skipping %s.\n",
+                                 best_record->label ? best_record->label : "atom",
+                                 best_record->occupancy,
+                                 site_record->coords[0],
+                                 site_record->coords[1],
+                                 site_record->coords[2],
+                                 skipped->str);
+        }
+      g_string_free(skipped, TRUE);
+    }
+
+  g_array_free(sites, TRUE);
+  g_ptr_array_unref(records);
+  return skip_labels;
+}
+
+static gboolean
+gdis_qbox_atoms_share_site(const GdisAtom *atom_a,
+                           const GdisAtom *atom_b)
+{
+  const gdouble tolerance = 1.0e-4;
+  gdouble dx;
+  gdouble dy;
+  gdouble dz;
+
+  g_return_val_if_fail(atom_a != NULL, FALSE);
+  g_return_val_if_fail(atom_b != NULL, FALSE);
+
+  dx = atom_a->position[0] - atom_b->position[0];
+  dy = atom_a->position[1] - atom_b->position[1];
+  dz = atom_a->position[2] - atom_b->position[2];
+  return (dx * dx + dy * dy + dz * dz) <= tolerance * tolerance;
+}
+
+static GArray *
+gdis_qbox_collect_export_atom_indices(const GdisModel *model,
+                                      GString *warnings)
+{
+  typedef struct
+  {
+    guint first_index;
+    guint best_index;
+    guint member_count;
+    gdouble best_occupancy;
+  } GdisQboxExportSite;
+
+  g_autofree gboolean *keep_flags = NULL;
+  GHashTable *cif_skip_labels;
+  GArray *indices;
+  GArray *sites;
+  guint collapsed_site_count = 0u;
+  guint collapsed_atom_count = 0u;
+  guint partial_atom_count = 0u;
+
+  g_return_val_if_fail(model != NULL, NULL);
+
+  indices = g_array_new(FALSE, FALSE, sizeof(guint));
+  if (!model->atoms || model->atoms->len == 0u)
+    return indices;
+
+  cif_skip_labels = gdis_qbox_collect_cif_skip_labels(model, warnings);
+  keep_flags = g_new0(gboolean, model->atoms->len);
+  sites = g_array_new(FALSE, FALSE, sizeof(GdisQboxExportSite));
+
+  for (guint i = 0; i < model->atoms->len; i++)
+    {
+      const GdisAtom *atom;
+      gdouble occupancy;
+      gboolean found_site = FALSE;
+
+      atom = g_ptr_array_index(model->atoms, i);
+      occupancy = gdis_qbox_atom_effective_occupancy(atom);
+      if (fabs(occupancy - 1.0) > 1.0e-3)
+        partial_atom_count++;
+      if (cif_skip_labels &&
+          atom->label &&
+          atom->label[0] != '\0' &&
+          g_hash_table_contains(cif_skip_labels, atom->label))
+        continue;
+      if (occupancy <= 1.0e-6)
+        continue;
+
+      for (guint site_index = 0; site_index < sites->len; site_index++)
+        {
+          GdisQboxExportSite *site;
+          const GdisAtom *site_atom;
+
+          site = &g_array_index(sites, GdisQboxExportSite, site_index);
+          site_atom = g_ptr_array_index(model->atoms, site->first_index);
+          if (!gdis_qbox_atoms_share_site(atom, site_atom))
+            continue;
+
+          site->member_count++;
+          if (occupancy > site->best_occupancy + 1.0e-9)
+            {
+              site->best_index = i;
+              site->best_occupancy = occupancy;
+            }
+          found_site = TRUE;
+          break;
+        }
+
+      if (!found_site)
+        {
+          GdisQboxExportSite site;
+
+          site.first_index = i;
+          site.best_index = i;
+          site.member_count = 1u;
+          site.best_occupancy = occupancy;
+          g_array_append_val(sites, site);
+        }
+    }
+
+  for (guint site_index = 0; site_index < sites->len; site_index++)
+    {
+      const GdisQboxExportSite *site;
+
+      site = &g_array_index(sites, GdisQboxExportSite, site_index);
+      keep_flags[site->best_index] = TRUE;
+      if (site->member_count > 1u)
+        {
+          collapsed_site_count++;
+          collapsed_atom_count += site->member_count - 1u;
+        }
+    }
+
+  if (warnings && partial_atom_count > 0u)
+    {
+      g_string_append_printf(warnings,
+                             "This model contains %u partial-occupancy atom%s. "
+                             "The Qbox deck uses an ordered approximation because Qbox does not support fractional occupancies directly.\n",
+                             partial_atom_count,
+                             partial_atom_count == 1u ? "" : "s");
+    }
+
+  if (warnings && collapsed_site_count > 0u)
+    {
+      g_string_append_printf(warnings,
+                             "Collapsed %u overlapping alternative-site atom%s onto %u Qbox export site%s.\n",
+                             collapsed_atom_count,
+                             collapsed_atom_count == 1u ? "" : "s",
+                             collapsed_site_count,
+                             collapsed_site_count == 1u ? "" : "s");
+
+      for (guint site_index = 0; site_index < sites->len; site_index++)
+        {
+          const GdisQboxExportSite *site;
+          const GdisAtom *site_atom;
+          const GdisAtom *best_atom;
+          GString *skipped;
+
+          site = &g_array_index(sites, GdisQboxExportSite, site_index);
+          if (site->member_count <= 1u)
+            continue;
+
+          site_atom = g_ptr_array_index(model->atoms, site->first_index);
+          best_atom = g_ptr_array_index(model->atoms, site->best_index);
+          skipped = g_string_new("");
+
+          for (guint atom_index = 0; atom_index < model->atoms->len; atom_index++)
+            {
+              const GdisAtom *member_atom;
+              gdouble member_occupancy;
+
+              if (atom_index == site->best_index)
+                continue;
+
+              member_atom = g_ptr_array_index(model->atoms, atom_index);
+              if (!gdis_qbox_atoms_share_site(member_atom, site_atom))
+                continue;
+
+              member_occupancy = gdis_qbox_atom_effective_occupancy(member_atom);
+              if (skipped->len > 0)
+                g_string_append(skipped, ", ");
+              g_string_append_printf(skipped,
+                                     "%s (%s, occ %.3f)",
+                                     member_atom->label ? member_atom->label : "atom",
+                                     member_atom->element ? member_atom->element : "?",
+                                     member_occupancy);
+            }
+
+          g_string_append_printf(warnings,
+                                 "Using %s (%s, occ %.3f) for the site at %.5f %.5f %.5f A and skipping %s.\n",
+                                 best_atom->label ? best_atom->label : "atom",
+                                 best_atom->element ? best_atom->element : "?",
+                                 gdis_qbox_atom_effective_occupancy(best_atom),
+                                 best_atom->position[0],
+                                 best_atom->position[1],
+                                 best_atom->position[2],
+                                 skipped->len > 0 ? skipped->str : "the remaining alternatives");
+          g_string_free(skipped, TRUE);
+        }
+    }
+
+  for (guint i = 0; i < model->atoms->len; i++)
+    {
+      if (keep_flags[i])
+        g_array_append_val(indices, i);
+    }
+
+  g_array_free(sites, TRUE);
+  if (cif_skip_labels)
+    g_hash_table_unref(cif_skip_labels);
+  return indices;
+}
+
 static guint
 gdis_qbox_count_unique_species(const GdisModel *model)
 {
@@ -12409,6 +13712,7 @@ gdis_qbox_prepare_local_pseudo_library(GdisGtk4Window *self,
   g_autofree gchar *cache_dir = NULL;
   g_autofree gchar *pseudo_dir = NULL;
   g_autofree gchar *xc_name = NULL;
+  g_autofree gchar *progress_message = NULL;
   guint downloaded = 0u;
   guint relinked = 0u;
 
@@ -12440,6 +13744,11 @@ gdis_qbox_prepare_local_pseudo_library(GdisGtk4Window *self,
       gboolean linked = FALSE;
 
       row = g_ptr_array_index(tool->species_rows, i);
+      progress_message = g_strdup_printf("Preparing local Qbox pseudos... %u / %u (%s)",
+                                         i + 1u,
+                                         tool->species_rows->len,
+                                         row && row->element ? row->element : "species");
+      gdis_qbox_tool_set_busy(tool, TRUE, progress_message);
       current = gdis_qbox_entry_text(row->pseudo_entry);
       resolved = current[0] && !gdis_qbox_is_remote_uri(current) ?
         gdis_gtk4_window_resolve_path(current) : NULL;
@@ -12530,6 +13839,7 @@ gdis_qbox_prepare_all_element_pseudo_library(GdisGtk4Window *self,
   g_autofree gchar *cache_dir = NULL;
   g_autofree gchar *pseudo_dir = NULL;
   g_autofree gchar *xc_name = NULL;
+  g_autofree gchar *progress_message = NULL;
   guint available = 0u;
   guint downloaded = 0u;
   guint missing = 0u;
@@ -12563,6 +13873,12 @@ gdis_qbox_prepare_all_element_pseudo_library(GdisGtk4Window *self,
       element = gdis_element_lookup_atomic_number(atomic_number);
       if (!element || !element->symbol || !element->symbol[0])
         continue;
+
+      progress_message = g_strdup_printf("Caching Qbox pseudos... %u / %u (%s)",
+                                         atomic_number,
+                                         gdis_element_count(),
+                                         element->symbol);
+      gdis_qbox_tool_set_busy(tool, TRUE, progress_message);
 
       cached_path = gdis_qbox_guess_pseudo_path(cache_dir, element->symbol, xc_name);
       if (cached_path && cached_path[0])
@@ -12796,6 +14112,7 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
                            GdisQboxTool *tool,
                            gchar **deck_out,
                            gchar **cell_mode_out,
+                           GString *warnings,
                            GError **error)
 {
   g_autofree gchar *xc_name = NULL;
@@ -12803,6 +14120,7 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
   g_autofree gchar *atoms_dyn = NULL;
   g_autofree gchar *scf_tol = NULL;
   g_autofree gchar *restart_reference = NULL;
+  g_autoptr(GArray) export_atom_indices = NULL;
   gdouble cell_bohr[9];
   gdouble shift_angstrom[3];
   gdouble padding_angstrom;
@@ -12878,6 +14196,16 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
                                       error))
     return FALSE;
 
+  export_atom_indices = gdis_qbox_collect_export_atom_indices(self->active_model, warnings);
+  if (!export_atom_indices || export_atom_indices->len == 0u)
+    {
+      g_set_error(error,
+                  GDIS_MODEL_ERROR,
+                  GDIS_MODEL_ERROR_FAILED,
+                  "The active model does not contain any Qbox-exportable atoms after resolving occupancies.");
+      return FALSE;
+    }
+
   deck = g_string_new(
     "# Qbox deck generated by the GDIS GTK4 Qbox tool.\n"
     "# Coordinates and cell vectors are written in bohr.\n"
@@ -12903,33 +14231,41 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
                              cell_bohr[6], cell_bohr[7], cell_bohr[8]);
 
       written_species = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-      for (guint i = 0; tool->species_rows && i < tool->species_rows->len; i++)
+      for (guint i = 0; i < export_atom_indices->len; i++)
         {
+          const GdisAtom *atom;
+          g_autofree gchar *symbol = NULL;
           GdisQboxSpeciesRow *row;
           g_autofree gchar *alias = NULL;
           g_autofree gchar *reference = NULL;
+          guint atom_index;
 
-          row = g_ptr_array_index(tool->species_rows, i);
-          alias = gdis_qbox_entry_text(row->alias_entry);
+          atom_index = g_array_index(export_atom_indices, guint, i);
+          atom = g_ptr_array_index(self->active_model->atoms, atom_index);
+          symbol = gdis_qbox_normalize_symbol(atom->element && atom->element[0] ? atom->element : atom->label);
+          row = gdis_qbox_find_species_row(tool, symbol);
+          alias = row ? gdis_qbox_entry_text(row->alias_entry) : gdis_qbox_symbol_alias(symbol);
           if (!alias[0])
             {
               g_free(alias);
-              alias = gdis_qbox_symbol_alias(row->element);
-              gtk_editable_set_text(GTK_EDITABLE(row->alias_entry), alias);
+              alias = gdis_qbox_symbol_alias(symbol);
+              if (row)
+                gtk_editable_set_text(GTK_EDITABLE(row->alias_entry), alias);
             }
-          reference = gdis_qbox_species_reference(row);
+          reference = row ? gdis_qbox_species_reference(row) :
+            g_strdup_printf("<set-pseudo-for-%s>", symbol);
           if (reference[0] == '<')
             have_placeholders = TRUE;
-          if (!g_hash_table_contains(written_species, row->element))
+          if (!g_hash_table_contains(written_species, symbol))
             {
-              g_hash_table_add(written_species, g_strdup(row->element));
+              g_hash_table_add(written_species, g_strdup(symbol));
               g_string_append_printf(deck, "species %s %s\n", alias, reference);
             }
         }
       g_hash_table_unref(written_species);
 
       element_counts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-      for (guint i = 0; i < self->active_model->atoms->len; i++)
+      for (guint i = 0; i < export_atom_indices->len; i++)
         {
           const GdisAtom *atom;
           g_autofree gchar *symbol = NULL;
@@ -12939,8 +14275,10 @@ gdis_qbox_build_input_deck(GdisGtk4Window *self,
           gdouble x_bohr;
           gdouble y_bohr;
           gdouble z_bohr;
+          guint atom_index;
 
-          atom = g_ptr_array_index(self->active_model->atoms, i);
+          atom_index = g_array_index(export_atom_indices, guint, i);
+          atom = g_ptr_array_index(self->active_model->atoms, atom_index);
           symbol = gdis_qbox_normalize_symbol(atom->element && atom->element[0] ? atom->element : atom->label);
           row = gdis_qbox_find_species_row(tool, symbol);
           alias = row ? gdis_qbox_entry_text(row->alias_entry) : gdis_qbox_symbol_alias(symbol);
@@ -15266,7 +16604,7 @@ gdis_gtk4_window_refresh_qbox_tool(GdisGtk4Window *self)
       g_autofree gchar *cell_mode = NULL;
       GError *error = NULL;
 
-      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &error))
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, NULL, &error))
         gdis_qbox_tool_set_generated_text(tool, deck);
       g_clear_error(&error);
     }
@@ -15312,6 +16650,7 @@ on_qbox_regenerate_clicked(GtkButton *button, gpointer user_data)
   GdisQboxTool *tool;
   g_autofree gchar *deck = NULL;
   g_autofree gchar *cell_mode = NULL;
+  GString *warnings;
   GError *error;
   GString *report;
 
@@ -15322,12 +16661,16 @@ on_qbox_regenerate_clicked(GtkButton *button, gpointer user_data)
   if (!tool)
     return;
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Generating the Qbox starter deck...");
+  warnings = g_string_new("");
   error = NULL;
-  if (!gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &error))
+  if (!gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, warnings, &error))
     {
       gdis_qbox_set_report(tool->report_buffer, error ? error->message : "Qbox deck generation failed.");
       gdis_gtk4_window_log(self, "Qbox deck generation failed: %s\n",
                            error ? error->message : "unknown error");
+      gdis_qbox_tool_set_busy(tool, FALSE, NULL);
+      g_string_free(warnings, TRUE);
       g_clear_error(&error);
       return;
     }
@@ -15347,9 +16690,13 @@ on_qbox_regenerate_clicked(GtkButton *button, gpointer user_data)
                          gtk_editable_get_text(GTK_EDITABLE(tool->input_entry)),
                          gtk_editable_get_text(GTK_EDITABLE(tool->output_entry)),
                          gtk_editable_get_text(GTK_EDITABLE(tool->save_entry)));
+  if (warnings->len > 0)
+    g_string_append_printf(report, "\n\nNotes:\n%s", warnings->str);
   gdis_qbox_set_report(tool->report_buffer, report->str);
   g_string_free(report, TRUE);
+  g_string_free(warnings, TRUE);
   gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_qbox_tool_set_busy(tool, FALSE, NULL);
   gdis_gtk4_window_log(self, "Generated the Qbox deck for %s.\n",
                        self->active_model ? self->active_model->basename : "the active model");
 }
@@ -15461,8 +16808,35 @@ gdis_qbox_build_paths(GdisQboxTool *tool,
 }
 
 static void
+gdis_qbox_deck_atom_free(gpointer data)
+{
+  typedef struct
+  {
+    gchar *name;
+    gchar *species;
+    gdouble coords[3];
+  } GdisQboxDeckAtom;
+
+  GdisQboxDeckAtom *atom;
+
+  atom = data;
+  if (!atom)
+    return;
+  g_free(atom->name);
+  g_free(atom->species);
+  g_free(atom);
+}
+
+static void
 gdis_qbox_validate_run_buffer(const char *deck_text, GError **error)
 {
+  typedef struct
+  {
+    gchar *name;
+    gchar *species;
+    gdouble coords[3];
+  } GdisQboxDeckAtom;
+
   if (!deck_text || !deck_text[0])
     {
       g_set_error(error,
@@ -15480,6 +16854,72 @@ gdis_qbox_validate_run_buffer(const char *deck_text, GError **error)
                   GDIS_MODEL_ERROR,
                   GDIS_MODEL_ERROR_FAILED,
                   "The Qbox deck still contains unresolved placeholders. Fill the species table or edit the deck before executing.");
+      return;
+    }
+
+  {
+    g_auto(GStrv) lines = NULL;
+    GPtrArray *atoms;
+
+    lines = g_strsplit(deck_text, "\n", -1);
+    atoms = g_ptr_array_new_with_free_func(gdis_qbox_deck_atom_free);
+
+    for (guint i = 0; lines[i] != NULL; i++)
+      {
+        GPtrArray *tokens;
+        gchar *line;
+
+        line = g_strstrip(lines[i]);
+        if (!g_str_has_prefix(line, "atom "))
+          continue;
+
+        tokens = gdis_qbox_tokenize_cif_line(line);
+        if (tokens->len >= 6u)
+          {
+            GdisQboxDeckAtom *atom;
+
+            atom = g_new0(GdisQboxDeckAtom, 1);
+            atom->name = g_strdup(g_ptr_array_index(tokens, 1));
+            atom->species = g_strdup(g_ptr_array_index(tokens, 2));
+            atom->coords[0] = g_ascii_strtod(g_ptr_array_index(tokens, 3), NULL);
+            atom->coords[1] = g_ascii_strtod(g_ptr_array_index(tokens, 4), NULL);
+            atom->coords[2] = g_ascii_strtod(g_ptr_array_index(tokens, 5), NULL);
+            g_ptr_array_add(atoms, atom);
+          }
+        g_ptr_array_free(tokens, TRUE);
+      }
+
+    for (guint i = 0; i < atoms->len; i++)
+      {
+        const GdisQboxDeckAtom *left;
+
+        left = g_ptr_array_index(atoms, i);
+        for (guint j = i + 1; j < atoms->len; j++)
+          {
+            const GdisQboxDeckAtom *right;
+            gdouble dx;
+            gdouble dy;
+            gdouble dz;
+
+            right = g_ptr_array_index(atoms, j);
+            dx = left->coords[0] - right->coords[0];
+            dy = left->coords[1] - right->coords[1];
+            dz = left->coords[2] - right->coords[2];
+            if ((dx * dx + dy * dy + dz * dz) > 1.0e-10)
+              continue;
+
+            g_set_error(error,
+                        GDIS_MODEL_ERROR,
+                        GDIS_MODEL_ERROR_FAILED,
+                        "The Qbox deck contains overlapping atoms at the same coordinates (%s and %s). Regenerate the deck or resolve the disorder before executing.",
+                        left->name ? left->name : "atom",
+                        right->name ? right->name : "atom");
+            g_ptr_array_unref(atoms);
+            return;
+          }
+      }
+
+    g_ptr_array_unref(atoms);
     }
 }
 
@@ -15581,6 +17021,9 @@ gdis_qbox_write_prepared_input(GdisGtk4Window *self,
   g_return_val_if_fail(self != NULL, FALSE);
   g_return_val_if_fail(tool != NULL, FALSE);
 
+  gdis_qbox_tool_set_busy(tool, TRUE, validate_for_run
+                                        ? "Preparing the Qbox execution deck..."
+                                        : "Preparing the Qbox input deck...");
   if (!gdis_qbox_prepare_local_pseudo_library(self,
                                               tool,
                                               &localized_pseudos,
@@ -15597,7 +17040,7 @@ gdis_qbox_write_prepared_input(GdisGtk4Window *self,
       g_autofree gchar *deck = NULL;
       g_autofree gchar *cell_mode = NULL;
 
-      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &local_error))
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, warnings, &local_error))
         {
           gdis_qbox_tool_set_generated_text(tool, deck);
           g_clear_error(&local_error);
@@ -15610,7 +17053,7 @@ gdis_qbox_write_prepared_input(GdisGtk4Window *self,
       g_autofree gchar *deck = NULL;
       g_autofree gchar *cell_mode = NULL;
 
-      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, &local_error))
+      if (gdis_qbox_build_input_deck(self, tool, &deck, &cell_mode, warnings, &local_error))
         {
           gdis_qbox_tool_set_generated_text(tool, deck);
           g_clear_error(&local_error);
@@ -15661,6 +17104,10 @@ gdis_qbox_write_prepared_input(GdisGtk4Window *self,
       g_propagate_error(error, local_error);
       return FALSE;
     }
+
+  gdis_qbox_tool_set_busy(tool, TRUE, validate_for_run
+                                        ? "Writing the Qbox input deck and staged assets..."
+                                        : "Writing the Qbox input deck...");
 
   if (!g_file_set_contents(*input_path_out, deck_text, -1, &local_error))
     {
@@ -15813,6 +17260,15 @@ gdis_qbox_tail_text(const char *text, gsize max_chars)
   return g_strdup(text + (length - max_chars));
 }
 
+static gboolean
+gdis_qbox_output_has_invalid_values(const char *text)
+{
+  return g_regex_match_simple("(^|[^[:alpha:]])(nan|inf)([^[:alpha:]]|$)",
+                              text ? text : "",
+                              G_REGEX_CASELESS,
+                              0);
+}
+
 static void
 on_qbox_guess_pseudos_clicked(GtkButton *button, gpointer user_data)
 {
@@ -15892,6 +17348,7 @@ on_qbox_setup_local_pseudos_clicked(GtkButton *button, gpointer user_data)
   if (!tool)
     return;
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Preparing local Qbox pseudos for the active model...");
   warnings = g_string_new("");
   tool->suppress_control_signals = TRUE;
   if (!gdis_qbox_prepare_local_pseudo_library(self,
@@ -15906,6 +17363,7 @@ on_qbox_setup_local_pseudos_clicked(GtkButton *button, gpointer user_data)
                            error ? error->message : "Could not prepare the local Qbox pseudo library.");
       gdis_gtk4_window_log(self, "Qbox local pseudo setup failed: %s\n",
                            error ? error->message : "unknown error");
+      gdis_qbox_tool_set_busy(tool, FALSE, NULL);
       g_string_free(warnings, TRUE);
       g_clear_error(&error);
       return;
@@ -15931,6 +17389,7 @@ on_qbox_setup_local_pseudos_clicked(GtkButton *button, gpointer user_data)
   g_string_free(warnings, TRUE);
   gdis_qbox_set_last_summary(self, downloaded > 0u ? "local pseudos downloaded" : "local pseudos ready");
   gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_qbox_tool_set_busy(tool, FALSE, NULL);
   gdis_gtk4_window_log(self,
                        "Prepared the local Qbox pseudo library at %s (%u download%s).\n",
                        gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
@@ -15957,6 +17416,7 @@ on_qbox_setup_all_pseudos_clicked(GtkButton *button, gpointer user_data)
   if (!tool)
     return;
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Caching the wider Qbox pseudo library...");
   warnings = g_string_new("");
   tool->suppress_control_signals = TRUE;
   if (!gdis_qbox_prepare_all_element_pseudo_library(self,
@@ -15972,6 +17432,7 @@ on_qbox_setup_all_pseudos_clicked(GtkButton *button, gpointer user_data)
                            error ? error->message : "Could not prepare the all-element Qbox pseudo cache.");
       gdis_gtk4_window_log(self, "Qbox all-element pseudo setup failed: %s\n",
                            error ? error->message : "unknown error");
+      gdis_qbox_tool_set_busy(tool, FALSE, NULL);
       g_string_free(warnings, TRUE);
       g_clear_error(&error);
       return;
@@ -16004,6 +17465,7 @@ on_qbox_setup_all_pseudos_clicked(GtkButton *button, gpointer user_data)
   gdis_qbox_set_last_summary(self, missing > 0u ? "all-element pseudos cached with gaps"
                                                  : "all-element pseudos ready");
   gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_qbox_tool_set_busy(tool, FALSE, NULL);
   gdis_gtk4_window_log(self,
                        "Prepared the all-element Qbox pseudo cache at %s (%u XML%s available, %u download%s, %u missing).\n",
                        gtk_editable_get_text(GTK_EDITABLE(tool->pseudo_dir_entry)),
@@ -16038,6 +17500,7 @@ on_qbox_write_clicked(GtkButton *button, gpointer user_data)
   if (!tool)
     return;
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Writing the Qbox input deck...");
   if (gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))[0])
     g_hash_table_replace(self->executable_paths,
                          g_strdup("qbox"),
@@ -16061,6 +17524,7 @@ on_qbox_write_clicked(GtkButton *button, gpointer user_data)
                            error ? error->message : "Could not write the Qbox input deck.");
       gdis_gtk4_window_log(self, "Qbox input write failed: %s\n",
                            error ? error->message : "unknown error");
+      gdis_qbox_tool_set_busy(tool, FALSE, NULL);
       g_string_free(warnings, TRUE);
       g_clear_error(&error);
       return;
@@ -16101,6 +17565,7 @@ on_qbox_write_clicked(GtkButton *button, gpointer user_data)
   gdis_gtk4_window_refresh_qbox_tool(self);
   gdis_gtk4_window_refresh_executable_paths_tool(self);
   gdis_gtk4_window_refresh_task_manager_tool(self);
+  gdis_qbox_tool_set_busy(tool, FALSE, NULL);
   gdis_gtk4_window_log(self, "Wrote the Qbox input deck: %s\n", input_path);
 }
 
@@ -16290,6 +17755,7 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
   guint copied_files = 0u;
   guint localized_pseudos = 0u;
   gboolean success;
+  gboolean invalid_values = FALSE;
   GString *report;
 
   (void) button;
@@ -16306,6 +17772,10 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
       return;
     }
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Preparing the Qbox execution...");
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Qbox execution is in progress.\n"
+                       "Preparing the deck, local pseudos, and staged job directory now.");
   g_hash_table_replace(self->executable_paths,
                        g_strdup("qbox"),
                        g_strdup(gtk_editable_get_text(GTK_EDITABLE(tool->exec_entry))));
@@ -16328,6 +17798,7 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
                            error ? error->message : "Could not prepare the Qbox execution.");
       gdis_gtk4_window_log(self, "Qbox execution setup failed: %s\n",
                            error ? error->message : "unknown error");
+      gdis_qbox_tool_set_busy(tool, FALSE, NULL);
       g_string_free(warnings, TRUE);
       g_clear_error(&error);
       return;
@@ -16341,6 +17812,13 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
   else
     command = g_strdup_printf("%s %s", quoted_exec, quoted_input);
 
+  gdis_qbox_tool_set_busy(tool, TRUE, "Executing Qbox... this can take a while for larger jobs.");
+  gdis_qbox_set_last_summary(self, "execution in progress");
+  gdis_gtk4_window_refresh_qbox_tool(self);
+  gdis_qbox_set_report(tool->report_buffer,
+                       "Qbox execution is in progress.\n"
+                       "The current job is running now. Output files are being written in the job directory.");
+
   success = gdis_qbox_run_shell_capture(workdir,
                                         command,
                                         output_path,
@@ -16348,6 +17826,9 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
                                         &stdout_text,
                                         &stderr_text,
                                         &error);
+  if (success)
+    invalid_values = gdis_qbox_output_has_invalid_values(stdout_text) ||
+                     gdis_qbox_output_has_invalid_values(stderr_text);
 
   if (gtk_editable_get_text(GTK_EDITABLE(tool->save_entry))[0])
     save_path = g_build_filename(workdir,
@@ -16367,7 +17848,7 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
                          "Saved XML: %s\n"
                          "Staged local assets: %u\n"
                          "Localized pseudos: %u\n",
-                         success ? "Completed" : "Failed",
+                         success ? (invalid_values ? "Completed with invalid values" : "Completed") : "Failed",
                          command,
                          workdir,
                          input_path,
@@ -16385,6 +17866,10 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
     g_string_append_printf(report,
                            "\nFailure reason: %s\n",
                            error ? error->message : "unknown error");
+  else if (invalid_values)
+    g_string_append(report,
+                    "\nResult quality warning: Qbox produced invalid numeric values (nan/inf).\n"
+                    "This usually means the exported structure or run settings are not physically consistent for a direct Qbox run.\n");
   if (tail && tail[0])
     g_string_append_printf(report, "\nRecent output:\n%s", tail);
 
@@ -16395,7 +17880,7 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
                                stderr_path,
                                save_path);
 
-  if (success)
+  if (success && !invalid_values)
     {
       g_autofree gchar *used_import_path = NULL;
       GError *import_error = NULL;
@@ -16417,6 +17902,12 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
         }
       gdis_gtk4_window_log(self, "Qbox execution completed: %s\n", output_path);
     }
+  else if (invalid_values)
+    {
+      gdis_qbox_set_last_summary(self, "execution produced invalid values");
+      gdis_gtk4_window_log(self,
+                           "Qbox execution finished, but the output contains invalid numeric values.\n");
+    }
   else
     {
       gdis_qbox_set_last_summary(self, "execution failed");
@@ -16428,6 +17919,7 @@ on_qbox_run_clicked(GtkButton *button, gpointer user_data)
   gdis_qbox_set_report(tool->report_buffer, report->str);
   g_string_free(report, TRUE);
   g_string_free(warnings, TRUE);
+  gdis_qbox_tool_set_busy(tool, FALSE, NULL);
 
   gdis_gtk4_window_refresh_qbox_tool(self);
   gdis_gtk4_window_refresh_executable_paths_tool(self);
@@ -17135,23 +18627,36 @@ gdis_gtk4_window_present_qbox_tool(GdisGtk4Window *self)
   tool->report_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), text_view);
 
+  tool->busy_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_visible(tool->busy_box, FALSE);
+  gtk_box_append(GTK_BOX(root), tool->busy_box);
+  tool->busy_spinner = gtk_spinner_new();
+  gtk_box_append(GTK_BOX(tool->busy_box), tool->busy_spinner);
+  tool->busy_label = GTK_LABEL(gtk_label_new(""));
+  gtk_label_set_xalign(tool->busy_label, 0.0f);
+  gtk_box_append(GTK_BOX(tool->busy_box), GTK_WIDGET(tool->busy_label));
+
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   gtk_widget_set_halign(row, GTK_ALIGN_END);
   gtk_box_append(GTK_BOX(root), row);
 
   button = gtk_button_new_with_label("Regenerate");
+  tool->regenerate_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_regenerate_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   button = gtk_button_new_with_label("Write Input");
+  tool->write_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_write_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   button = gtk_button_new_with_label("Execute");
+  tool->run_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_run_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
   button = gtk_button_new_with_label("Import Result");
+  tool->import_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(on_qbox_import_result_clicked), self);
   gtk_box_append(GTK_BOX(row), button);
 
