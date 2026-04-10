@@ -261,20 +261,26 @@ def download_file(url: str, destination: Path) -> None:
     run(["curl", "-fL", url, "-o", str(destination)])
 
 
+def find_local_starter_pseudo(filename: str) -> Path | None:
+    candidates = [
+        APP_DIR / "qbox_jobs" / "water" / filename,
+        RELEASE_DIR / f"{APP_NAME}.app" / "Contents" / "Resources" / "qbox-pseudos" / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def prepare_starter_pseudos() -> None:
     if QBOX_PSEUDOS_DIR.exists():
         shutil.rmtree(QBOX_PSEUDOS_DIR)
     QBOX_PSEUDOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    local_sources = {
-        "H": APP_DIR / "qbox_jobs" / "water" / "H_ONCV_PBE-1.2.xml",
-        "O": APP_DIR / "qbox_jobs" / "water" / "O_ONCV_PBE-1.2.xml",
-    }
-
     for symbol, filename in STARTER_PSEUDOS.items():
         destination = QBOX_PSEUDOS_DIR / filename
-        local_source = local_sources.get(symbol)
-        if local_source and local_source.exists():
+        local_source = find_local_starter_pseudo(filename)
+        if local_source:
             copy_file(local_source, destination)
             continue
         download_file(f"{STARTER_PSEUDO_BASE_URL}/{filename}", destination)
