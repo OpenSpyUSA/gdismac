@@ -1,12 +1,15 @@
-GTK4 rebuild workspace
+# GTK4 Rebuild Workspace
 
-This folder is a parallel workspace for rebuilding the app with GTK4.
+This directory keeps the modern GTK4 restoration work separate from the historical GDIS tree.
 
-Structure:
+The goal is to make forward progress on modern macOS and Linux support without disturbing the original legacy source layout in the repository root.
+
+## Structure
+
 - `legacy_snapshot/`
-  A full copy of the current project tree at the time the GTK4 rebuild started.
-  This is reference material and a frozen backup of the current working state.
+  A frozen copy of the project tree from the point where the GTK4 rebuild began.
+  Use this as reference material when checking legacy behavior and old workflows.
 - `gtk4_app/`
-  The new workspace for the GTK4-based rebuild.
+  The active GTK4 application workspace, including the source code, build system, packaging scripts, and rebuild documentation.
 
-The original project files in the repo root remain in place and are not moved.
+The original project files at the repository root remain intact and are not moved or rewritten by this workspace.

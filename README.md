@@ -1,72 +1,105 @@
-## GDIS, Copyright (C) 2000-2015 by Sean Fleming, Andrew Rohl
+# GDIS
 
-<andrew.rohl@curtin.edu.au>
+GDIS is a long-running crystal and molecular structure viewer and builder originally developed by Sean Fleming and Andrew Rohl.
 
-GDIS comes with ABSOLUTELY NO WARRANTY.
+This repository now carries both:
 
-This is free software. You are welcome to redistribute copies provided the conditions of the Version 2 GPL (GNU Public License) are met.
+- the original legacy GDIS source tree
+- an actively restored GTK4 rebuild for modern macOS and Linux in [`gtk4_rebuild/gtk4_app`](./gtk4_rebuild/gtk4_app)
 
-Although you are not required to do so, the authors would consider it a courtesy if you submit to them any changes you consider to be worthwhile. The goal would be to keep the development of GDIS more
-or less centralized.
+GDIS comes with ABSOLUTELY NO WARRANTY. It remains free software under the GPLv2 terms distributed with this repository.
 
-### Installation
+## Project Status
 
-To install GDIS from source you need a working C compiler, [gtk+2](http://www.gtk.org) and [gtkglext](https://projects.gnome.org/gtkglext/index.html). You then simply type:
+The historical GTK2 application remains in the repository for reference and legacy workflows.
+
+The current macOS-focused work happens in the GTK4 rebuild:
+
+- native GTK4 application window and menus
+- restored model loading, viewing, editing, and analysis workflows
+- Apple Silicon portable app packaging in `dist/`
+- bundled GTK runtime for easier macOS distribution
+
+For current rebuild details, see:
+
+- [`gtk4_rebuild/README.md`](./gtk4_rebuild/README.md)
+- [`gtk4_rebuild/gtk4_app/README.md`](./gtk4_rebuild/gtk4_app/README.md)
+- [`gtk4_rebuild/RESTORATION_AUDIT.md`](./gtk4_rebuild/RESTORATION_AUDIT.md)
+
+## macOS Quick Start
+
+If you want the modern macOS build, the easiest path is the GTK4 rebuild and the packaged release assets.
+
+Prebuilt release assets are published on the [Releases page](https://github.com/OpenSpyUSA/gdismac/releases).
+
+To build the portable macOS release locally on Apple Silicon:
+
+```sh
+brew install gtk4 pkgconf
+make -C gtk4_rebuild/gtk4_app portable-release
 ```
+
+This produces:
+
+- `dist/GDIS.app`
+- `dist/GDIS-macos-arm64.zip`
+- `dist/GDIS-macos-arm64.dmg`
+- `dist/GDIS Portable/`
+- `dist/GDIS-Portable-macos-arm64.zip`
+- `dist/GDIS-Portable-macos-arm64.dmg`
+
+To launch the rebuilt app directly from the repo:
+
+```sh
+./gtk4_rebuild/gtk4_app/build/gdis-gtk4 ./models/deoxy.pdb
+./gtk4_rebuild/gtk4_app/build/gdis-gtk4 ./models/gibb.car
+```
+
+## Repository Layout
+
+- `src/`, `bin/`, and `install`
+  The original legacy codebase and build flow.
+- `gtk4_rebuild/legacy_snapshot/`
+  Frozen reference copy of the legacy tree at the start of the GTK4 rebuild.
+- `gtk4_rebuild/gtk4_app/`
+  The active GTK4 application, packaging scripts, and rebuild documentation.
+- `models/` and `examples/`
+  Sample structures and test inputs used by both the legacy and GTK4 apps.
+- `dist/`
+  Generated macOS release artifacts.
+
+## Legacy Source Build
+
+If you want the historical GTK2 build flow instead of the GTK4 rebuild, use the original installer:
+
+```sh
 ./install
 ```
-and follow the prompts. The script will check for the existence of gtk+2 and  gtkglext and then compile GDIS. If you don't specify an install directory, the GDIS executable will be in the `bin` directory.
- 
-### Notes
+
+This path expects a working C compiler plus GTK2-era dependencies such as `gtk+2` and `gtkglext`.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/arohl/gdis)
 
-If you are compiling on a Mac with Homebrew, install the GTK2 toolchain first:
-```
-brew install gtk+ gtkglext
-```
-Then use the standard build:
-```
-./install default
-```
-To create a portable macOS application bundle, disk image, and zip archive, run:
-```
-python3 scripts/build_macos_portable.py
-```
-Artifacts are written to the `dist/` directory.
+## Credits
 
-On macOS, `bin/gdis` is intended as the CLI launcher for the app bundle and
-`bin/gdis-bin` is the raw GTK binary. Use `bin/gdis` for normal interactive
-launches such as:
-```
-./bin/gdis ./models/deoxy.pdb
-./bin/gdis ./models/*
-```
+Some GDIS features depend on the following projects:
 
-Some cool features of GDIS are entirely due to the hard work that has gone into creating the following packages:
-
-1. [CDD](http://www.inf.ethz.ch/personal/fukudak/cdd_home/) for the computation of halfspace intersections (morphology display).
-	&copy;Komei Fukuda
-
-2. [GPeriodic](http://www.frantz.fi/software/gperiodic.php) for pretty Periodic Table display and editing.
-	&copy;1999 Kyle R. Burton 
-
-3. [SgInfo](http://cci.lbl.gov/sginfo/) for Space Group generator lookup.
-	&copy;1994-96 Ralf W. Grosse-Kunstleve
-
+1. [CDD](http://www.inf.ethz.ch/personal/fukudak/cdd_home/) for the computation of halfspace intersections.
+   Copyright Komei Fukuda
+2. [GPeriodic](http://www.frantz.fi/software/gperiodic.php) for periodic table display and editing.
+   Copyright 1999 Kyle R. Burton
+3. [SgInfo](http://cci.lbl.gov/sginfo/) for space group lookup support.
+   Copyright 1994-96 Ralf W. Grosse-Kunstleve
 4. [Brute force symmetry analyzer](http://www.cobalt.chem.ucalgary.ca/ps/symmetry/).
-	&copy;1996 S. Pachkovsky 
+   Copyright 1996 S. Pachkovsky
 
-There are a few optional packages that enhance the GDIS experience.
+Optional external tools that can enhance the broader legacy GDIS workflow include:
 
-1. For rendering (and subsequent image/movie viewing) you will need:
-	- [POVRay](http://www.povray.org)
-	- [ImageMagick](http://imagemagick.org)
-
-2. Although GDIS supports output files from a large number of codes, input files can be created and run within GDIS for:
-	- [GULP](http://nanochemistry.curtin.edu.au/gulp/)
-	- [GAMESS](http://www.msg.chem.iastate.edu/GAMESS/)
-	- [SIESTA](http://departments.icmab.es/leem/siesta/)
-	- [Monty](http://www.vsc.science.ru.nl/deij/monty.html)
-	- [VASP](http://www.vasp.at/)
-	- [USPEX](http://www.uspex-team.org/en/uspex/overview)
+- [POVRay](http://www.povray.org)
+- [ImageMagick](http://imagemagick.org)
+- [GULP](http://nanochemistry.curtin.edu.au/gulp/)
+- [GAMESS](http://www.msg.chem.iastate.edu/GAMESS/)
+- [SIESTA](http://departments.icmab.es/leem/siesta/)
+- [Monty](http://www.vsc.science.ru.nl/deij/monty.html)
+- [VASP](http://www.vasp.at/)
+- [USPEX](http://www.uspex-team.org/en/uspex/overview)

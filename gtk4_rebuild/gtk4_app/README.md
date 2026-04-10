@@ -203,6 +203,23 @@ This creates:
 dist/GDIS.app
 ```
 
+Create the full portable macOS release set:
+
+```sh
+make portable-release
+```
+
+This refreshes:
+
+```text
+dist/GDIS.app
+dist/GDIS-macos-arm64.zip
+dist/GDIS-macos-arm64.dmg
+dist/GDIS Portable/
+dist/GDIS-Portable-macos-arm64.zip
+dist/GDIS-Portable-macos-arm64.dmg
+```
+
 ## Typical Usage
 
 1. Launch the app with or without a startup structure.

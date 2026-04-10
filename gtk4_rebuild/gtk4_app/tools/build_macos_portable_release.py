@@ -428,43 +428,45 @@ Note:
 
     readme = f"""GDIS Portable for macOS
 
-This folder contains:
+Thank you for trying the modern GTK4 macOS build of GDIS.
+
+This package contains:
 {chr(10).join(contains_lines)}
 
-Quick start:
-1. Drag GDIS.app to Applications, or run it directly from this folder.
+Recommended first launch:
+1. Open GDIS.app directly from this folder, or move it to Applications first.
 {quick_start_line}
-3. If macOS blocks the app the first time, right-click GDIS.app and choose Open.
+3. If macOS blocks the app on first launch, right-click GDIS.app and choose Open.
 
-Important notes:
-- This build is for Apple Silicon (arm64) Macs.
-- The app is ad-hoc signed, not notarized.
-- The bundled app is packaged to be more self-contained than the thin dev build.
+Package notes:
+- This build is intended for Apple Silicon (arm64) Macs.
+- The app is ad-hoc signed for local distribution and is not notarized.
+- The included app bundle is self-contained and intended to be easier to run than the thin development build.
 - Qbox is bundled for local single-process use inside the app.
 {extra_readme}
 """
 
     qbox_notes = f"""Qbox Setup Instructions
 
-What is already bundled:
-- A bundled Qbox executable is included inside GDIS.app.
+What is already included:
+- GDIS.app contains a bundled Qbox executable.
 - Starter pseudopotentials for H, C, and O are included.
 {qbox_intro}
 
-How to use Qbox in GDIS:
+Quick Qbox workflow:
 1. Open GDIS.app.
 {qbox_model_line}
 3. Open Tools > Computation > Qbox...
 4. Click Detect if you want to confirm the bundled Qbox path.
-5. Click Regenerate, then Run.
+5. Click Regenerate to prepare the inputs, then click Run.
 
-For other elements:
+If your model uses other elements:
 - Use "Setup Local Pseudos" in the Qbox window.
-- That may need internet access the first time so GDIS can download missing pseudo XML files.
+- GDIS may need internet access the first time so it can download missing pseudo XML files.
 
-What is not fully turnkey:
+Current scope:
 - This package is aimed at local single-process Qbox use through the bundled executable.
-- Advanced multi-rank MPI launch setups may still need user-specific tuning.
+- More advanced MPI launch setups may still need machine-specific tuning.
 """
 
     write_text(destination / "README.txt", readme)
